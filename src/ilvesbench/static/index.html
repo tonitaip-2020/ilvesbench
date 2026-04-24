@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>IlvesBench</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="hero">
+        <p class="eyebrow">Automated Benchmarking</p>
+        <h1>IlvesBench</h1>
+        <p class="lead">
+          Planner-guided, tool-executed benchmarking with reproducible run records and explicit approval gates.
+        </p>
+      </section>
+
+      <section class="panel controls">
+        <label class="field">
+          <span>Config path</span>
+          <input id="configPath" type="text" value="ilvesbench.example.toml">
+        </label>
+        <label class="field">
+          <span>Workload file path (optional)</span>
+          <input id="workloadPath" type="text" placeholder="data/workload.sql">
+          <small class="field-help">Leave this blank to use the default workload file at <code>data/workload.sql</code>. The file should contain SQL statements separated by semicolons.</small>
+        </label>
+        <div class="actions">
+          <button id="runButton" class="primary">Start MVP run</button>
+          <button id="llmButton">Test LLM</button>
+          <button id="postgresButton">Check PostgreSQL</button>
+          <button id="refreshButton">Refresh runs</button>
+        </div>
+        <div id="postgresStatus" class="connection-status" hidden></div>
+        <pre id="statusBox" class="status-box">Waiting for input.</pre>
+      </section>
+
+      <section class="panel">
+        <div class="section-header">
+          <h2>Runs</h2>
+          <p>Showing the current run with its approval-gated next actions.</p>
+        </div>
+        <div id="runs" class="run-grid"></div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

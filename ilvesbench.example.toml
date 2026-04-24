@@ -1,0 +1,44 @@
+[llm]
+backend = "aviary"
+base_url = "https://aviary.fgl.rd.tuni.fi/api/chat/completions"
+api_key = ""
+api_key_file = "secrets/aviary_api_key"
+model = "phi4-14b"
+timeout_seconds = 60
+
+[postgres]
+host = "127.0.0.1"
+port = 5432
+user = "llm"
+password = "llm"
+original_database = "mvp_db"
+new_database = "mvp_db_new"
+admin_database = "postgres"
+schemas = ["public"]
+connect_timeout_seconds = 10
+
+[logs]
+path = "data/postgresql.log"
+max_lines = 5000
+
+[workload]
+path = "data/workload.sql"
+
+[docker]
+postgres_container_name = "ilvesbench-postgres"
+prefer_container_snapshot = true
+
+[pgbench]
+enabled = true
+command = "pgbench"
+duration_seconds = 30
+clients = 4
+jobs = 1
+
+[storage]
+sqlite_path = "data/ilvesbench_runs.sqlite3"
+artifact_dir = "data/artifacts"
+
+[web]
+host = "127.0.0.1"
+port = 8080

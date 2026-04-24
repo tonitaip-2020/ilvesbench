@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16-trixie
+    container_name: ilvesbench-postgres
+    environment:
+      POSTGRES_USER: llm
+      POSTGRES_PASSWORD: llm
+      POSTGRES_DB: mvp_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-config/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./postgres-config/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./init-db:/docker-entrypoint-initdb.d
+    command:
+      [
+        "postgres",
+        "-c", "config_file=/etc/postgresql/postgresql.conf",
+        "-c", "hba_file=/etc/postgresql/pg_hba.conf"
+      ]
+
+volumes:
+  postgres_data:
