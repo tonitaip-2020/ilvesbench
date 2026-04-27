@@ -1,4 +1,4 @@
-# IlvesBench PoC
+# IlvesBench 0.1
 
 IlvesBench is a system for automated PostgreSQL benchmarking and schema-evolution analysis.
 
