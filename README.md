@@ -2,7 +2,7 @@
 
 IlvesBench is a system for automated PostgreSQL benchmarking and schema-evolution analysis.
 
-The current implementation follows the architecture you described:
+The current implementation follows the following architecture:
 
 - `llm/`: interchangeable planner gateway clients
 - `agent/`: orchestration, run-state tracking, and policy enforcement
@@ -14,9 +14,9 @@ The current implementation follows the architecture you described:
 
 The LLM is intentionally constrained to planner/interpreter work. It never talks to PostgreSQL or the OS directly. All stateful actions go through typed Python tools.
 
-## Current MVP boundary
+## Current MVP
 
-This first slice is intentionally narrow and deterministic. It can:
+The current version is narrow and deterministic to a degree. It can:
 
 - load a TOML config
 - talk to an Aviary/OpenAI-compatible local LLM endpoint
@@ -38,7 +38,7 @@ The later steps are scaffolded in the pipeline but remain approval-gated placeho
 - PostgreSQL knob tuning
 - richer metrics such as I/O, cache hits, and energy use
 
-The current normalization step is now a conservative metadata-only first pass. It can:
+The current normalization step is currently a conservative metadata-only first pass. It can:
 
 - flag obvious repeating-group patterns such as numbered columns
 - flag duplicated descriptor columns next to foreign-key identifiers
@@ -151,7 +151,7 @@ jobs = 1
 
 Notes:
 
-- IlvesBench can run `pgbench` for 30 seconds against `db-original` when you press the benchmark button.
+- IlvesBench runs `pgbench` for 30 seconds against `db-original` when you press the benchmark button. This is too short timeframe for real benchmarking. This should be configurable by the user.
 - After approved schema creation, data migration, and workload rewriting, it can run `pgbench` against `db-new` from the UI.
 - The `db-original` run uses the workload SQL file passed in the UI, or `data/workload.sql` if the field is left blank.
 - The `db-new` run uses an LLM-rewritten workload artifact generated from the original workload and normalized target schema.
