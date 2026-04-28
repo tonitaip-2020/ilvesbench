@@ -172,8 +172,24 @@ python3 -m unittest discover -s tests
 
 ## TODOs
 
+- Normalization & DB structure transformation:
+- Query rewriting:
+  - Validation of queries, DB structure and data migration. Generate simple tests.
+- Data migrations:
+  - Collect metadata on how much the database takes disk space, indices included.
+- New index creation:
+  - Based on rewritten queries, suggest secondary indices. "Click to create".
+- New table recommendations (outside normalization):
+  - Based on rewritten queries and query logs, suggest summary tables.
+- OS/Hardware:
+  - Needs robust reading from Linux.
+- OS/query logs:
+  - Design log analysis. Logs can be very large, not feasible to send to LLM. Needs to be deterministic.
+- OS/postgresql.conf:
+  - Provide recommendations for the file based on hardware. "Click to apply changes".
 - Benchmarking:
   - Generating `pgbench` workloads with the LLM component.
   - Making `pgbench` easily replaceable.
   - Making `pgbench` configurable, and defaul configuration based on hardware.
 - UI redesign
+  - Visualizing results
