@@ -193,5 +193,6 @@ python3 -m unittest discover -s tests
   - Generating `pgbench` workloads with the LLM component.
   - Making `pgbench` easily replaceable.
   - Making `pgbench` configurable, and defaul configuration based on hardware.
-- UI redesign
+- GUI redesign
   - Visualizing results
+  - GUI is too heavy, clogs browser easily
