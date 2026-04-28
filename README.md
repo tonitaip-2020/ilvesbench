@@ -172,27 +172,27 @@ python3 -m unittest discover -s tests
 
 ## TODOs
 
-- Normalization & DB structure transformation:
-- Query rewriting:
+- **Normalization & DB structure transformation**:
+- **Query rewriting**:
   - Validation of queries, DB structure and data migration. Generate simple tests.
-- Data migrations:
+- **Data migrations**:
   - Collect metadata on how much the database takes disk space, indices included.
-- New index creation:
+- **New index creation**:
   - Based on rewritten queries, suggest secondary indices. "Click to create".
-- New table recommendations (outside normalization):
+- **New table recommendations (outside normalization)**:
   - Based on rewritten queries and query logs, suggest summary tables.
-- OS/Hardware:
-  - Needs robust reading from Linux.
-- OS/query logs:
+- **OS/Hardware**:
+  - Needs robust reading from Linux. Does not read from Windows.
+- **OS/query logs**:
   - Design log analysis. Logs can be very large, not feasible to send to LLM. Needs to be deterministic.
-- OS/postgresql.conf:
+- **OS/postgresql.conf**:
   - Provide recommendations for the file based on hardware. "Click to apply changes".
-- Architecture:
+- **Architecture**:
   - In the future, consider to change the architecture to use a more complex framework like LangChain to avoid growth problems. Right now, this risks accidentally drifting toward "LLM agent improvises actions", which is exactly what we want to avoid. Right now, LangChain will introduce more abstraction where we want to avoid abstractions, and makes debugging harder when SQL/schema generation fails.
-- Benchmarking:
+- **Benchmarking**:
   - Generating `pgbench` workloads with the LLM component.
   - Making `pgbench` easily replaceable.
   - Making `pgbench` configurable, and defaul configuration based on hardware.
-- GUI redesign
+- **GUI redesign**:
   - Visualizing results
   - GUI is too heavy, clogs browser easily
