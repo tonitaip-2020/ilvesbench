@@ -188,7 +188,7 @@ python3 -m unittest discover -s tests
 - OS/postgresql.conf:
   - Provide recommendations for the file based on hardware. "Click to apply changes".
 - Architecture:
-  - In the future, change the architecture to use a more complex framework like LangChain to avoid growth problems.
+  - In the future, consider to change the architecture to use a more complex framework like LangChain to avoid growth problems. Right now, this risks accidentally drifting toward "LLM agent improvises actions", which is exactly what we want to avoid. Right now, LangChain will introduce more abstraction where we want to avoid abstractions, and makes debugging harder when SQL/schema generation fails.
 - Benchmarking:
   - Generating `pgbench` workloads with the LLM component.
   - Making `pgbench` easily replaceable.
