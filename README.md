@@ -196,3 +196,4 @@ python3 -m unittest discover -s tests
 - **GUI redesign**:
   - Visualizing results
   - GUI is too heavy, clogs browser easily
+  - GUI re-design, perhaps a step-by-step, "tabs" approach?
