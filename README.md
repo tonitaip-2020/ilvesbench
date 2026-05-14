@@ -1,8 +1,8 @@
-# IlvesBench PoC
+# IlvesBench 0.1
 
 IlvesBench is a system for automated PostgreSQL benchmarking and schema-evolution analysis.
 
-The current implementation follows the architecture you described:
+The current implementation follows the following architecture:
 
 - `llm/`: interchangeable planner gateway clients
 - `agent/`: orchestration, run-state tracking, and policy enforcement
@@ -14,9 +14,9 @@ The current implementation follows the architecture you described:
 
 The LLM is intentionally constrained to planner/interpreter work. It never talks to PostgreSQL or the OS directly. All stateful actions go through typed Python tools.
 
-## Current MVP boundary
+## Current MVP
 
-This first slice is intentionally narrow and deterministic. It can:
+The current version is narrow and deterministic to a degree. It can:
 
 - load a TOML config
 - talk to an Aviary/OpenAI-compatible local LLM endpoint
@@ -30,7 +30,7 @@ This first slice is intentionally narrow and deterministic. It can:
 
 The higher-risk steps are still explicit and reviewable. Schema creation, data migration, and pgbench execution remain approval-gated actions, while index, tuning, metrics, energy, and comparison steps produce artifacts automatically for review.
 
-The current normalization step is now a conservative metadata-only first pass. It can:
+The current normalization step is currently a conservative metadata-only first pass. It can:
 
 - flag obvious repeating-group patterns such as numbered columns
 - flag duplicated descriptor columns next to foreign-key identifiers
@@ -151,7 +151,7 @@ jobs = 1
 
 Notes:
 
-- IlvesBench can run `pgbench` for 30 seconds against `db-original` when you press the benchmark button.
+- IlvesBench runs `pgbench` for 30 seconds against `db-original` when you press the benchmark button. This is too short timeframe for real benchmarking. This should be configurable by the user.
 - After approved schema creation, data migration, and workload rewriting, it can run `pgbench` against `db-new` from the UI.
 - The `db-original` run uses the workload SQL file passed in the UI, or `data/workload.sql` if the field is left blank.
 - The `db-new` run uses an LLM-rewritten workload artifact generated from the original workload and normalized target schema.
@@ -186,3 +186,33 @@ python3 -m unittest discover -s tests
 - Safety: destructive steps are present as explicit approval-gated pipeline stages instead of hidden side effects.
 - Determinism: the executed MVP path is a normal Python workflow that can run without the LLM.
 - Extensibility: the schema transformer, migrator, and richer metrics collectors already have module boundaries, so later work can fill them in without reshaping the whole codebase.
+
+## TODOs
+
+- **Normalization & DB structure transformation**:
+- **Query rewriting**:
+  - Validation of queries, DB structure and data migration. Generate simple tests.
+- **Data migrations**:
+  - Collect metadata on how much the database takes disk space, indices included.
+- **New index creation**:
+  - Based on rewritten queries, suggest secondary indices. "Click to create".
+- **New table recommendations (outside normalization)**:
+  - Based on rewritten queries and query logs, suggest summary tables.
+- **OS/Hardware**:
+  - Needs robust reading from Linux. Does not read from Windows.
+- **OS/query logs**:
+  - Design log analysis. Logs can be very large, not feasible to send to LLM. Needs to be deterministic.
+- **OS/postgresql.conf**:
+  - Provide recommendations for the file based on hardware. "Click to apply changes".
+- **Architecture**:
+  - In the future, consider to change the architecture to use a more complex framework like LangChain to avoid growth problems. Right now, this risks accidentally drifting toward "LLM agent improvises actions", which is exactly what we want to avoid. Right now, LangChain will introduce more abstraction where we want to avoid abstractions, and makes debugging harder when SQL/schema generation fails.
+- **Benchmarking**:
+  - Generating `pgbench` workloads with the LLM component.
+  - Making `pgbench` easily replaceable.
+  - Making `pgbench` configurable, and defaul configuration based on hardware.
+- **GUI redesign**:
+  - Visualizing results
+  - GUI is too heavy, clogs browser easily
+  - GUI re-design, perhaps a step-by-step, "tabs" approach?
+#   i l v e s b e n c h - v 2  
+ 
