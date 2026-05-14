@@ -1,0 +1,26 @@
+{
+  "backend": "aviary",
+  "model": "phi4-14b",
+  "response_text": "Hello!",
+  "raw_response": {
+    "id": "chatcmpl-35681c28-ed32-48c2-bc1f-14a5a5302b76",
+    "created": 1778324417,
+    "model": "ollama/phi4:14b",
+    "object": "chat.completion",
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "Hello!",
+          "role": "assistant"
+        }
+      }
+    ],
+    "usage": {
+      "completion_tokens": 3,
+      "prompt_tokens": 20,
+      "total_tokens": 23
+    }
+  }
+}

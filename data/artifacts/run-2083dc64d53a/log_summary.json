@@ -1,0 +1,29 @@
+{
+  "path": "C:\\Users\\manos\\ilvesbench\\data\\workload.sql",
+  "lines_processed": 11,
+  "statements_detected": 3,
+  "transactions_detected": 0,
+  "multi_statement_transactions": 0,
+  "top_queries": [
+    {
+      "fingerprint": "SELECT student_id, student_name FROM studentcourses WHERE student_id = ?",
+      "sample_sql": "SELECT student_id, student_name\nFROM studentcourses\nWHERE student_id = 1",
+      "count": 1,
+      "total_duration_ms": 0.0
+    },
+    {
+      "fingerprint": "SELECT course_name FROM studentcourses WHERE course_code = '?'",
+      "sample_sql": "SELECT course_name\nFROM studentcourses\nWHERE course_code = 'CS101'",
+      "count": 1,
+      "total_duration_ms": 0.0
+    },
+    {
+      "fingerprint": "SELECT student_name, course_name FROM studentcourses WHERE student_id = ?",
+      "sample_sql": "SELECT student_name, course_name\nFROM studentcourses\nWHERE student_id = 1",
+      "count": 1,
+      "total_duration_ms": 0.0
+    }
+  ],
+  "sampled_transactions": [],
+  "source_kind": "workload_file"
+}

@@ -1,0 +1,299 @@
+{
+  "status": "candidate_normalization",
+  "summary": "Normalized from 6 tables to 5 tables.",
+  "rationale": [
+    "Course information is repeated in multiple tables.",
+    "Instructor details are duplicated across different tables.",
+    "Student information appears more than once, suggesting normalization opportunities."
+  ],
+  "table_findings": [
+    "The 'public.course' table includes instructor information, which should be separate for clarity and normalization.",
+    "'public.enrollment_flat' contains redundant student and course data that can be decomposed into distinct tables.",
+    "Instructor details in both 'public.course' and 'public.enrollment_flat' indicate a need for separation.",
+    "Student information is duplicated between 'public.enrollment_flat' and 'public.studentcourses', suggesting normalization.",
+    "'public.studentcourses' should not contain student names as it's redundant with the 'student_id'."
+  ],
+  "functional_dependencies": [
+    {
+      "table": "public.course",
+      "determinant": [
+        "course_id"
+      ],
+      "dependent": [
+        "course_name",
+        "department_name",
+        "instructor_id"
+      ],
+      "confidence": "high",
+      "reason": "Course ID uniquely determines course details including the instructor."
+    },
+    {
+      "table": "public.enrollment_flat",
+      "determinant": [
+        "enrollment_id"
+      ],
+      "dependent": [
+        "student_id",
+        "course_id",
+        "semester",
+        "grade"
+      ],
+      "confidence": "high",
+      "reason": "Each enrollment is uniquely identified by the enrollment ID."
+    },
+    {
+      "table": "public.enrollment_flat",
+      "determinant": [
+        "student_id"
+      ],
+      "dependent": [
+        "student_name",
+        "student_email"
+      ],
+      "confidence": "medium",
+      "reason": "Assumed that a student has a unique name and email, but this should be verified."
+    },
+    {
+      "table": "public.enrollment_flat",
+      "determinant": [
+        "course_id"
+      ],
+      "dependent": [
+        "course_name",
+        "department_name"
+      ],
+      "confidence": "medium",
+      "reason": "Assumed that each course has a unique name and department, but this should be verified."
+    },
+    {
+      "table": "public.instructor",
+      "determinant": [
+        "instructor_id"
+      ],
+      "dependent": [
+        "instructor_name"
+      ],
+      "confidence": "high",
+      "reason": "Instructor ID uniquely determines instructor details."
+    }
+  ],
+  "target_tables": [
+    {
+      "name": "course",
+      "purpose": "Store course information without redundancy.",
+      "source_tables": [
+        "public.course",
+        "public.enrollment_flat"
+      ],
+      "columns": [
+        {
+          "source_table": "public.course",
+          "source_column": "course_id",
+          "name": "course_id"
+        },
+        {
+          "source_table": "public.course",
+          "source_column": "course_name",
+          "name": "course_name"
+        },
+        {
+          "source_table": "public.course",
+          "source_column": "department_name",
+          "name": "department_name"
+        }
+      ],
+      "primary_key": [
+        "course_id"
+      ],
+      "uniques": [
+        [
+          "course_id"
+        ]
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "instructor",
+      "purpose": "Store instructor details to remove redundancy.",
+      "source_tables": [
+        "public.instructor",
+        "public.course"
+      ],
+      "columns": [
+        {
+          "source_table": "public.instructor",
+          "source_column": "instructor_id",
+          "name": "instructor_id"
+        },
+        {
+          "source_table": "public.instructor",
+          "source_column": "instructor_name",
+          "name": "instructor_name"
+        }
+      ],
+      "primary_key": [
+        "instructor_id"
+      ],
+      "uniques": [
+        [
+          "instructor_id"
+        ]
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "enrollment",
+      "purpose": "Store enrollment records in a normalized form.",
+      "source_tables": [
+        "public.enrollment",
+        "public.enrollment_flat"
+      ],
+      "columns": [
+        {
+          "source_table": "public.enrollment",
+          "source_column": "enrollment_id",
+          "name": "enrollment_id"
+        },
+        {
+          "source_table": "public.enrollment",
+          "source_column": "student_id",
+          "name": "student_id"
+        },
+        {
+          "source_table": "public.enrollment_flat",
+          "source_column": "course_id",
+          "name": "course_id"
+        },
+        {
+          "source_table": "public.enrollment_flat",
+          "source_column": "semester",
+          "name": "semester"
+        },
+        {
+          "source_table": "public.enrollment_flat",
+          "source_column": "grade",
+          "name": "grade"
+        }
+      ],
+      "primary_key": [
+        "enrollment_id"
+      ],
+      "uniques": [
+        [
+          "enrollment_id"
+        ]
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "student_id"
+          ],
+          "references_table": "student",
+          "references_columns": [
+            "student_id"
+          ]
+        },
+        {
+          "columns": [
+            "course_id"
+          ],
+          "references_table": "course",
+          "references_columns": [
+            "course_id"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "student",
+      "purpose": "Store student information to eliminate redundancy.",
+      "source_tables": [
+        "public.student",
+        "public.enrollment_flat"
+      ],
+      "columns": [
+        {
+          "source_table": "public.student",
+          "source_column": "student_id",
+          "name": "student_id"
+        },
+        {
+          "source_table": "public.student",
+          "source_column": "student_name",
+          "name": "student_name"
+        },
+        {
+          "source_table": "public.student",
+          "source_column": "student_email",
+          "name": "student_email"
+        }
+      ],
+      "primary_key": [
+        "student_id"
+      ],
+      "uniques": [
+        [
+          "student_id"
+        ]
+      ],
+      "foreign_keys": []
+    },
+    {
+      "name": "course_instructor",
+      "purpose": "Link courses with their respective instructors.",
+      "source_tables": [
+        "public.course",
+        "public.enrollment_flat"
+      ],
+      "columns": [
+        {
+          "source_table": "public.course",
+          "source_column": "course_id",
+          "name": "course_id"
+        },
+        {
+          "source_table": "public.enrollment_flat",
+          "source_column": "instructor_id",
+          "name": "instructor_id"
+        }
+      ],
+      "primary_key": [
+        "course_id"
+      ],
+      "uniques": [
+        [
+          "course_id"
+        ]
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "course_id"
+          ],
+          "references_table": "course",
+          "references_columns": [
+            "course_id"
+          ]
+        },
+        {
+          "columns": [
+            "instructor_id"
+          ],
+          "references_table": "instructor",
+          "references_columns": [
+            "instructor_id"
+          ]
+        }
+      ]
+    }
+  ],
+  "sql_statements": [
+    "CREATE TABLE IF NOT EXISTS \"course\" (\n  \"course_id\" INTEGER NOT NULL,\n  \"course_name\" TEXT NOT NULL,\n  \"department_name\" TEXT NOT NULL,\n  PRIMARY KEY (\"course_id\"),\n  UNIQUE (\"course_id\")\n);",
+    "CREATE TABLE IF NOT EXISTS \"instructor\" (\n  \"instructor_id\" INTEGER NOT NULL,\n  \"instructor_name\" TEXT NOT NULL,\n  PRIMARY KEY (\"instructor_id\"),\n  UNIQUE (\"instructor_id\")\n);",
+    "CREATE TABLE IF NOT EXISTS \"student\" (\n  \"student_id\" INTEGER NOT NULL,\n  \"student_name\" TEXT NOT NULL,\n  \"student_email\" TEXT NOT NULL,\n  PRIMARY KEY (\"student_id\"),\n  UNIQUE (\"student_id\")\n);",
+    "CREATE TABLE IF NOT EXISTS \"course_instructor\" (\n  \"course_id\" INTEGER NOT NULL,\n  \"instructor_id\" INTEGER NOT NULL,\n  PRIMARY KEY (\"course_id\"),\n  UNIQUE (\"course_id\"),\n  FOREIGN KEY (\"course_id\") REFERENCES \"course\" (\"course_id\"),\n  FOREIGN KEY (\"instructor_id\") REFERENCES \"instructor\" (\"instructor_id\")\n);",
+    "CREATE TABLE IF NOT EXISTS \"enrollment\" (\n  \"enrollment_id\" INTEGER NOT NULL,\n  \"student_id\" INTEGER NOT NULL,\n  \"course_id\" INTEGER NOT NULL,\n  \"semester\" TEXT NOT NULL,\n  \"grade\" TEXT,\n  PRIMARY KEY (\"enrollment_id\"),\n  UNIQUE (\"enrollment_id\"),\n  FOREIGN KEY (\"student_id\") REFERENCES \"student\" (\"student_id\"),\n  FOREIGN KEY (\"course_id\") REFERENCES \"course\" (\"course_id\")\n);"
+  ],
+  "source": "llm",
+  "raw_response_text": "```json\n{\n  \"assessment\": {\n    \"status\": \"candidate_normalization\",\n    \"summary\": \"The schema exhibits redundancy and potential violations of the Third Normal Form (3NF).\",\n    \"reasoning\": [\n      \"Course information is repeated in multiple tables.\",\n      \"Instructor details are duplicated across different tables.\",\n      \"Student information appears more than once, suggesting normalization opportunities.\"\n    ]\n  },\n  \"table_findings\": [\n    \"The 'public.course' table includes instructor information, which should be separate for clarity and normalization.\",\n    \"'public.enrollment_flat' contains redundant student and course data that can be decomposed into distinct tables.\",\n    \"Instructor details in both 'public.course' and 'public.enrollment_flat' indicate a need for separation.\",\n    \"Student information is duplicated between 'public.enrollment_flat' and 'public.studentcourses', suggesting normalization.\",\n    \"'public.studentcourses' should not contain student names as it's redundant with the 'student_id'.\"\n  ],\n  \"functional_dependencies\": [\n    {\n      \"table\": \"public.course\",\n      \"determinant\": [\"course_id\"],\n      \"dependent\": [\"course_name\", \"department_name\", \"instructor_id\"],\n      \"confidence\": \"high\",\n      \"reason\": \"Course ID uniquely determines course details including the instructor.\"\n    },\n    {\n      \"table\": \"public.enrollment_flat\",\n      \"determinant\": [\"enrollment_id\"],\n      \"dependent\": [\n        \"student_id\", \"course_id\", \"semester\", \"grade\"\n      ],\n      \"confidence\": \"high\",\n      \"reason\": \"Each enrollment is uniquely identified by the enrollment ID.\"\n    },\n    {\n      \"table\": \"public.enrollment_flat\",\n      \"determinant\": [\"student_id\"],\n      \"dependent\": [\n        \"student_name\", \"student_email\"\n      ],\n      \"confidence\": \"medium\",\n      \"reason\": \"Assumed that a student has a unique name and email, but this should be verified.\"\n    },\n    {\n      \"table\": \"public.enrollment_flat\",\n      \"determinant\": [\"course_id\"],\n      \"dependent\": [\n        \"course_name\", \"department_name\"\n      ],\n      \"confidence\": \"medium\",\n      \"reason\": \"Assumed that each course has a unique name and department, but this should be verified.\"\n    },\n    {\n      \"table\": \"public.instructor\",\n      \"determinant\": [\"instructor_id\"],\n      \"dependent\": [\"instructor_name\"],\n      \"confidence\": \"high\",\n      \"reason\": \"Instructor ID uniquely determines instructor details.\"\n    }\n  ],\n  \"target_tables\": [\n    {\n      \"name\": \"course\",\n      \"purpose\": \"Store course information without redundancy.\",\n      \"source_tables\": [\"public.course\", \"public.enrollment_flat\"],\n      \"columns\": [\n        {\"source_table\": \"public.course\", \"source_column\": \"course_id\", \"name\": \"course_id\"},\n        {\"source_table\": \"public.course\", \"source_column\": \"course_name\", \"name\": \"course_name\"},\n        {\"source_table\": \"public.course\", \"source_column\": \"department_name\", \"name\": \"department_name\"}\n      ],\n      \"primary_key\": [\"course_id\"],\n      \"uniques\": [[\"course_id\"]],\n      \"foreign_keys\": []\n    },\n    {\n      \"name\": \"instructor\",\n      \"purpose\": \"Store instructor details to remove redundancy.\",\n      \"source_tables\": [\"public.instructor\", \"public.course\"],\n      \"columns\": [\n        {\"source_table\": \"public.instructor\", \"source_column\": \"instructor_id\", \"name\": \"instructor_id\"},\n        {\"source_table\": \"public.instructor\", \"source_column\": \"instructor_name\", \"name\": \"instructor_name\"}\n      ],\n      \"primary_key\": [\"instructor_id\"],\n      \"uniques\": [[\"instructor_id\"]],\n      \"foreign_keys\": []\n    },\n    {\n      \"name\": \"enrollment\",\n      \"purpose\": \"Store enrollment records in a normalized form.\",\n      \"source_tables\": [\"public.enrollment\", \"public.enrollment_flat\"],\n      \"columns\": [\n        {\"source_table\": \"public.enrollment\", \"source_column\": \"enrollment_id\", \"name\": \"enrollment_id\"},\n        {\"source_table\": \"public.enrollment\", \"source_column\": \"student_id\", \"name\": \"student_id\"},\n        {\"source_table\": \"public.enrollment_flat\", \"source_column\": \"course_id\", \"name\": \"course_id\"},\n        {\"source_table\": \"public.enrollment_flat\", \"source_column\": \"semester\", \"name\": \"semester\"},\n        {\"source_table\": \"public.enrollment_flat\", \"source_column\": \"grade\", \"name\": \"grade\"}\n      ],\n      \"primary_key\": [\"enrollment_id\"],\n      \"uniques\": [[\"enrollment_id\"]],\n      \"foreign_keys\": [\n        {\n          \"columns\": [\"student_id\"],\n          \"references_table\": \"student\",\n          \"references_columns\": [\"student_id\"]\n        },\n        {\n          \"columns\": [\"course_id\"],\n          \"references_table\": \"course\",\n          \"references_columns\": [\"course_id\"]\n        }\n      ]\n    },\n    {\n      \"name\": \"student\",\n      \"purpose\": \"Store student information to eliminate redundancy.\",\n      \"source_tables\": [\"public.student\", \"public.enrollment_flat\"],\n      \"columns\": [\n        {\"source_table\": \"public.student\", \"source_column\": \"student_id\", \"name\": \"student_id\"},\n        {\"source_table\": \"public.student\", \"source_column\": \"student_name\", \"name\": \"student_name\"},\n        {\"source_table\": \"public.student\", \"source_column\": \"student_email\", \"name\": \"student_email\"}\n      ],\n      \"primary_key\": [\"student_id\"],\n      \"uniques\": [[\"student_id\"]],\n      \"foreign_keys\": []\n    },\n    {\n      \"name\": \"course_instructor\",\n      \"purpose\": \"Link courses with their respective instructors.\",\n      \"source_tables\": [\"public.course\", \"public.enrollment_flat\"],\n      \"columns\": [\n        {\"source_table\": \"public.course\", \"source_column\": \"course_id\", \"name\": \"course_id\"},\n        {\"source_table\": \"public.enrollment_flat\", \"source_column\": \"instructor_id\", \"name\": \"instructor_id\"}\n      ],\n      \"primary_key\": [\"course_id\"],\n      \"uniques\": [[\"course_id\"]],\n      \"foreign_keys\": [\n        {\n          \"columns\": [\"course_id\"],\n          \"references_table\": \"course\",\n          \"references_columns\": [\"course_id\"]\n        },\n        {\n          \"columns\": [\"instructor_id\"],\n          \"references_table\": \"instructor\",\n          \"references_columns\": [\"instructor_id\"]\n        }\n      ]\n    }\n  ],\n  \"decomposition_summary\": \"Normalized from 6 tables to 5 tables.\"\n}\n```"
+}

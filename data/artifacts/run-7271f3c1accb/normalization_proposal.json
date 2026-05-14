@@ -1,0 +1,22 @@
+{
+  "status": "insufficient_evidence",
+  "summary": "LLM normalization proposal could not be validated, so IlvesBench fell back to metadata-only analysis.",
+  "rationale": [
+    "LLM proposal fallback reason: <urlopen error [WinError 10060] A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond>",
+    "Metadata-only analysis depends on primary-key and unique-constraint evidence.",
+    "Add missing constraints or provide domain guidance before automatic normalization planning."
+  ],
+  "table_findings": [
+    "public.course has no primary-key or unique constraint evidence.",
+    "public.enrollment has no primary-key or unique constraint evidence.",
+    "public.enrollment_flat has no primary-key or unique constraint evidence.",
+    "public.instructor has no primary-key or unique constraint evidence.",
+    "public.student has no primary-key or unique constraint evidence.",
+    "public.studentcourses has no primary-key or unique constraint evidence."
+  ],
+  "functional_dependencies": [],
+  "target_tables": [],
+  "sql_statements": [],
+  "source": "metadata_fallback",
+  "raw_response_text": null
+}

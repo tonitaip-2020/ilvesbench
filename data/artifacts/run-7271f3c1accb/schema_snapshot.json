@@ -1,0 +1,282 @@
+{
+  "database": "mvp_db",
+  "collected_at": "2026-05-14T14:34:31.983372+00:00",
+  "tables": [
+    {
+      "schema": "public",
+      "name": "course",
+      "columns": [
+        {
+          "name": "course_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "course_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "department_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "instructor_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "course_pkey",
+          "definition": "CREATE UNIQUE INDEX course_pkey ON public.course USING btree (course_id)",
+          "is_unique": true
+        }
+      ],
+      "foreign_keys": [],
+      "unique_constraints": []
+    },
+    {
+      "schema": "public",
+      "name": "enrollment",
+      "columns": [
+        {
+          "name": "enrollment_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "course_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "semester",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "grade",
+          "data_type": "text",
+          "is_nullable": true,
+          "default": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "enrollment_pkey",
+          "definition": "CREATE UNIQUE INDEX enrollment_pkey ON public.enrollment USING btree (enrollment_id)",
+          "is_unique": true
+        }
+      ],
+      "foreign_keys": [],
+      "unique_constraints": []
+    },
+    {
+      "schema": "public",
+      "name": "enrollment_flat",
+      "columns": [
+        {
+          "name": "enrollment_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_email",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "course_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "course_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "department_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "instructor_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "instructor_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "semester",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "grade",
+          "data_type": "text",
+          "is_nullable": true,
+          "default": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "enrollment_flat_pkey",
+          "definition": "CREATE UNIQUE INDEX enrollment_flat_pkey ON public.enrollment_flat USING btree (enrollment_id)",
+          "is_unique": true
+        }
+      ],
+      "foreign_keys": [],
+      "unique_constraints": []
+    },
+    {
+      "schema": "public",
+      "name": "instructor",
+      "columns": [
+        {
+          "name": "instructor_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "instructor_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "instructor_pkey",
+          "definition": "CREATE UNIQUE INDEX instructor_pkey ON public.instructor USING btree (instructor_id)",
+          "is_unique": true
+        }
+      ],
+      "foreign_keys": [],
+      "unique_constraints": []
+    },
+    {
+      "schema": "public",
+      "name": "student",
+      "columns": [
+        {
+          "name": "student_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_name",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_email",
+          "data_type": "text",
+          "is_nullable": false,
+          "default": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "student_pkey",
+          "definition": "CREATE UNIQUE INDEX student_pkey ON public.student USING btree (student_id)",
+          "is_unique": true
+        },
+        {
+          "name": "student_student_email_key",
+          "definition": "CREATE UNIQUE INDEX student_student_email_key ON public.student USING btree (student_email)",
+          "is_unique": true
+        }
+      ],
+      "foreign_keys": [],
+      "unique_constraints": []
+    },
+    {
+      "schema": "public",
+      "name": "studentcourses",
+      "columns": [
+        {
+          "name": "student_id",
+          "data_type": "integer",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "student_name",
+          "data_type": "text",
+          "is_nullable": true,
+          "default": null
+        },
+        {
+          "name": "course_code",
+          "data_type": "character varying(10)",
+          "is_nullable": false,
+          "default": null
+        },
+        {
+          "name": "course_name",
+          "data_type": "text",
+          "is_nullable": true,
+          "default": null
+        },
+        {
+          "name": "department_name",
+          "data_type": "text",
+          "is_nullable": true,
+          "default": null
+        }
+      ],
+      "indexes": [
+        {
+          "name": "studentcourses_pkey",
+          "definition": "CREATE UNIQUE INDEX studentcourses_pkey ON public.studentcourses USING btree (student_id, course_code)",
+          "is_unique": true
+        }
+      ],
+      "foreign_keys": [],
+      "unique_constraints": []
+    }
+  ],
+  "database_size_bytes": 8615615
+}

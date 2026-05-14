@@ -1,0 +1,14 @@
+{
+  "collected_at": "2026-05-09T10:59:00.284750+00:00",
+  "scope": "host",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "cpu_count": 12,
+  "architecture": "AMD64",
+  "memory_total_bytes": null,
+  "disk_total_bytes": 510234267648,
+  "disk_free_bytes": 51708387328,
+  "container_name": null,
+  "raw": {
+    "host_snapshot": {}
+  }
+}

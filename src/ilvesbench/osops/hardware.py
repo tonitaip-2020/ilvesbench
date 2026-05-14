@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from datetime import UTC, datetime
 import json
 import os
@@ -134,6 +135,24 @@ class HardwareInspector:
             output = self._safe_run(["sysctl", "-n", "hw.memsize"])
             if output and output.strip().isdigit():
                 return int(output.strip())
+        if system == "windows":
+            class MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
         return None
 
     def _safe_run(self, args: list[str]) -> str | None:

@@ -1,0 +1,14 @@
+{
+  "status": "no_rewrite_needed",
+  "summary": "No normalized target tables were proposed, so no db-new workload rewrite was generated.",
+  "reasoning": [],
+  "statement_count": 3,
+  "statements": [
+    "SELECT student_id, student_name\nFROM studentcourses\nWHERE student_id = 1;",
+    "SELECT course_name\nFROM studentcourses\nWHERE course_code = 'CS101';",
+    "SELECT student_name, course_name\nFROM studentcourses\nWHERE student_id = 1;"
+  ],
+  "source": "fallback",
+  "workload_path": "C:\\Users\\manos\\Documents\\Codex\\ilvesbench\\data\\artifacts\\run-a2e7fd104977\\rewritten_workload_db_new.sql",
+  "raw_response_text": null
+}

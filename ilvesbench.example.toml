@@ -35,10 +35,18 @@ duration_seconds = 30
 clients = 4
 jobs = 1
 
+[energy]
+enabled = true
+# Optional: set a measured host/container wattage for better estimates.
+# If omitted, IlvesBench estimates from detected CPU count.
+estimated_cpu_watts = 45.0
+estimated_watts_per_cpu = 12.0
+co2_grams_per_kwh = 110.0
+
 [storage]
 sqlite_path = "data/ilvesbench_runs.sqlite3"
 artifact_dir = "data/artifacts"
 
 [web]
 host = "127.0.0.1"
-port = 8080
+port = 8081

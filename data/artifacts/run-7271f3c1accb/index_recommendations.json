@@ -1,0 +1,32 @@
+{
+  "status": "recommended",
+  "summary": "Recommended 2 workload-aware index(es).",
+  "source": "heuristic",
+  "recommendation_count": 2,
+  "recommendations": [
+    {
+      "table": "studentcourses",
+      "columns": [
+        "student_id"
+      ],
+      "name": "idx_studentcourses_student_id",
+      "sql": "CREATE INDEX IF NOT EXISTS \"idx_studentcourses_student_id\" ON \"studentcourses\" (\"student_id\");",
+      "reason": "filter predicate across 2 workload statement(s).",
+      "confidence": 0.75
+    },
+    {
+      "table": "studentcourses",
+      "columns": [
+        "course_code"
+      ],
+      "name": "idx_studentcourses_course_code",
+      "sql": "CREATE INDEX IF NOT EXISTS \"idx_studentcourses_course_code\" ON \"studentcourses\" (\"course_code\");",
+      "reason": "filter predicate across 1 workload statement(s).",
+      "confidence": 0.65
+    }
+  ],
+  "sql_statements": [
+    "CREATE INDEX IF NOT EXISTS \"idx_studentcourses_student_id\" ON \"studentcourses\" (\"student_id\");",
+    "CREATE INDEX IF NOT EXISTS \"idx_studentcourses_course_code\" ON \"studentcourses\" (\"course_code\");"
+  ]
+}

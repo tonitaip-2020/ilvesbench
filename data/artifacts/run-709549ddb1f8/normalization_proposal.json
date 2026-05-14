@@ -1,0 +1,11 @@
+{
+  "status": "no_tables",
+  "summary": "No user tables were found in the inspected schemas.",
+  "rationale": [],
+  "table_findings": [],
+  "functional_dependencies": [],
+  "target_tables": [],
+  "sql_statements": [],
+  "source": "metadata_fallback",
+  "raw_response_text": null
+}

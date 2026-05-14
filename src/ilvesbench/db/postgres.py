@@ -173,6 +173,20 @@ class PostgresInspector:
             database_size_bytes=size_bytes,
         )
 
+    def collect_database_metrics(self, database: str) -> dict:
+        conn = self._connect(database)
+        try:
+            return {
+                "database": database,
+                "collected_at": datetime.now(UTC).isoformat(),
+                "database_size_bytes": self._load_database_size(conn),
+                "table_metrics": self._load_table_metrics(conn),
+                "database_activity": self._load_database_activity(conn),
+                "statement_metrics": self._load_statement_metrics(conn),
+            }
+        finally:
+            conn.close()
+
     def create_database_if_missing(self, database: str) -> str:
         if self.database_exists(database):
             return "exists"
@@ -350,11 +364,14 @@ class PostgresInspector:
 
     def _load_tables(self, conn) -> list[dict]:
         query = """
-            SELECT table_schema, table_name
-            FROM information_schema.tables
-            WHERE table_type = 'BASE TABLE'
-              AND table_schema = ANY(%s)
-            ORDER BY table_schema, table_name
+            SELECT
+                n.nspname AS table_schema,
+                c.relname AS table_name
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p')
+              AND n.nspname = ANY(%s)
+            ORDER BY n.nspname, c.relname
         """
         with conn.cursor() as cur:
             cur.execute(query, (self._config.schemas,))
@@ -362,10 +379,22 @@ class PostgresInspector:
 
     def _load_columns(self, conn) -> list[dict]:
         query = """
-            SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default
-            FROM information_schema.columns
-            WHERE table_schema = ANY(%s)
-            ORDER BY table_schema, table_name, ordinal_position
+            SELECT
+                n.nspname AS table_schema,
+                c.relname AS table_name,
+                a.attname AS column_name,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable,
+                pg_get_expr(ad.adbin, ad.adrelid) AS column_default
+            FROM pg_attribute AS a
+            JOIN pg_class AS c ON c.oid = a.attrelid
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            LEFT JOIN pg_attrdef AS ad ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+            WHERE c.relkind IN ('r', 'p')
+              AND n.nspname = ANY(%s)
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY n.nspname, c.relname, a.attnum
         """
         with conn.cursor() as cur:
             cur.execute(query, (self._config.schemas,))
@@ -438,3 +467,79 @@ class PostgresInspector:
             cur.execute(query)
             row = cur.fetchone()
         return row["size_bytes"] if row else None
+
+    def _load_table_metrics(self, conn) -> list[dict]:
+        query = """
+            SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
+                pg_total_relation_size(c.oid) AS total_bytes,
+                pg_relation_size(c.oid) AS heap_bytes,
+                pg_indexes_size(c.oid) AS index_bytes,
+                COALESCE(s.seq_scan, 0) AS seq_scan,
+                COALESCE(s.idx_scan, 0) AS idx_scan,
+                COALESCE(s.n_live_tup, 0) AS n_live_tup,
+                COALESCE(s.n_dead_tup, 0) AS n_dead_tup
+            FROM pg_class AS c
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+            WHERE c.relkind = 'r'
+              AND n.nspname = ANY(%s)
+            ORDER BY pg_total_relation_size(c.oid) DESC, n.nspname, c.relname
+        """
+        with conn.cursor() as cur:
+            cur.execute(query, (self._config.schemas,))
+            return [dict(row) for row in cur.fetchall()]
+
+    def _load_database_activity(self, conn) -> dict:
+        query = """
+            SELECT
+                numbackends,
+                xact_commit,
+                xact_rollback,
+                blks_read,
+                blks_hit,
+                tup_returned,
+                tup_fetched,
+                tup_inserted,
+                tup_updated,
+                tup_deleted,
+                temp_bytes,
+                deadlocks
+            FROM pg_stat_database
+            WHERE datname = current_database()
+        """
+        with conn.cursor() as cur:
+            cur.execute(query)
+            row = cur.fetchone()
+        payload = dict(row) if row else {}
+        blocks_read = int(payload.get("blks_read") or 0)
+        blocks_hit = int(payload.get("blks_hit") or 0)
+        total_blocks = blocks_read + blocks_hit
+        payload["cache_hit_ratio"] = round(blocks_hit / total_blocks, 6) if total_blocks else None
+        return payload
+
+    def _load_statement_metrics(self, conn) -> dict:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements') AS enabled")
+                enabled = bool(cur.fetchone()["enabled"])
+                if not enabled:
+                    return {"available": False, "reason": "pg_stat_statements extension is not enabled."}
+                cur.execute(
+                    """
+                    SELECT
+                        query,
+                        calls,
+                        total_exec_time,
+                        mean_exec_time,
+                        rows
+                    FROM pg_stat_statements
+                    WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                    ORDER BY total_exec_time DESC
+                    LIMIT 10
+                    """
+                )
+                return {"available": True, "top_statements": [dict(row) for row in cur.fetchall()]}
+        except Exception as exc:
+            return {"available": False, "error": str(exc)}

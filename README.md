@@ -28,15 +28,7 @@ This first slice is intentionally narrow and deterministic. It can:
 - persist benchmark run records and artifacts
 - expose the results in a minimal browser UI
 
-The later steps are scaffolded in the pipeline but remain approval-gated placeholders:
-
-- 3NF normalization proposals
-- target schema creation in `db-new`
-- data migration
-- query rewriting from `db-original` to `db-new`
-- index synthesis for the new schema
-- PostgreSQL knob tuning
-- richer metrics such as I/O, cache hits, and energy use
+The higher-risk steps are still explicit and reviewable. Schema creation, data migration, and pgbench execution remain approval-gated actions, while index, tuning, metrics, energy, and comparison steps produce artifacts automatically for review.
 
 The current normalization step is now a conservative metadata-only first pass. It can:
 
@@ -44,6 +36,14 @@ The current normalization step is now a conservative metadata-only first pass. I
 - flag duplicated descriptor columns next to foreign-key identifiers
 - report when the schema appears keyed and has no obvious warning signs
 - report when metadata is insufficient for a confident 3NF assessment
+
+Recent feature additions make the MVP path more complete. IlvesBench now also emits:
+
+- workload-aware index recommendations with `CREATE INDEX IF NOT EXISTS` statements
+- conservative `postgresql.conf` tuning recommendations and equivalent `ALTER SYSTEM` statements
+- extended PostgreSQL metrics such as table size, heap/index size, table scan counters, database activity, and cache-hit ratio
+- energy estimates for completed `pgbench` runs based on configured or CPU-derived wattage
+- before/after comparison artifacts for db-original versus db-new normalized rewritten workload benchmarks
 
 ## Project layout
 
@@ -156,6 +156,23 @@ Notes:
 - The `db-original` run uses the workload SQL file passed in the UI, or `data/workload.sql` if the field is left blank.
 - The `db-new` run uses an LLM-rewritten workload artifact generated from the original workload and normalized target schema.
 - `pgbench` must be installed on the host machine because IlvesBench runs on the host.
+
+## Benchmark comparison flow
+
+1. Start an MVP run from the CLI or UI.
+2. Review the generated normalization, migration, rewritten workload, index, tuning, and metrics artifacts.
+3. In the UI, run the approval actions in order: create db-new schema, migrate data, run pgbench on db-original, then run pgbench on db-new.
+4. IlvesBench writes a `benchmark_comparison.json` artifact comparing throughput, latency, storage size, and energy-per-transaction when both pgbench runs complete.
+
+Energy estimates are controlled by the `[energy]` section:
+
+```toml
+[energy]
+enabled = true
+estimated_cpu_watts = 45.0
+estimated_watts_per_cpu = 12.0
+co2_grams_per_kwh = 110.0
+```
 
 ## Run tests
 

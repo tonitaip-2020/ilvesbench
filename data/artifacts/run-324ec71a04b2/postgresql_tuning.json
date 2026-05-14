@@ -1,0 +1,76 @@
+{
+  "status": "recommended",
+  "summary": "Generated 8 conservative PostgreSQL knob recommendation(s).",
+  "source": "heuristic",
+  "recommendation_count": 8,
+  "recommendations": [
+    {
+      "setting": "shared_buffers",
+      "recommended_value": "3902MB",
+      "reason": "About 25% of available memory is a conservative starting point for PostgreSQL buffer cache.",
+      "risk": "review"
+    },
+    {
+      "setting": "effective_cache_size",
+      "recommended_value": "11708MB",
+      "reason": "Planner hint set near 75% of memory so index plans reflect likely OS plus PostgreSQL cache capacity.",
+      "risk": "review"
+    },
+    {
+      "setting": "maintenance_work_mem",
+      "recommended_value": "975MB",
+      "reason": "Improves CREATE INDEX and maintenance operations during schema experiments without overcommitting memory.",
+      "risk": "review"
+    },
+    {
+      "setting": "work_mem",
+      "recommended_value": "243MB",
+      "reason": "Balances per-operation memory against the configured pgbench client count (4).",
+      "risk": "review"
+    },
+    {
+      "setting": "max_worker_processes",
+      "recommended_value": "24",
+      "reason": "Keeps enough workers available for parallel query and maintenance on the detected CPU count.",
+      "risk": "review"
+    },
+    {
+      "setting": "max_parallel_workers",
+      "recommended_value": "12",
+      "reason": "Allows PostgreSQL to use available cores for larger scans and joins.",
+      "risk": "review"
+    },
+    {
+      "setting": "max_parallel_workers_per_gather",
+      "recommended_value": "6",
+      "reason": "Caps per-query parallelism so one benchmark query does not monopolize all workers.",
+      "risk": "review"
+    },
+    {
+      "setting": "track_io_timing",
+      "recommended_value": "on",
+      "reason": "Enables richer I/O timing metrics for benchmark comparisons.",
+      "risk": "low"
+    }
+  ],
+  "postgresql_conf_lines": [
+    "shared_buffers = '3902MB'",
+    "effective_cache_size = '11708MB'",
+    "maintenance_work_mem = '975MB'",
+    "work_mem = '243MB'",
+    "max_worker_processes = '24'",
+    "max_parallel_workers = '12'",
+    "max_parallel_workers_per_gather = '6'",
+    "track_io_timing = 'on'"
+  ],
+  "alter_system_statements": [
+    "ALTER SYSTEM SET shared_buffers = '3902MB';",
+    "ALTER SYSTEM SET effective_cache_size = '11708MB';",
+    "ALTER SYSTEM SET maintenance_work_mem = '975MB';",
+    "ALTER SYSTEM SET work_mem = '243MB';",
+    "ALTER SYSTEM SET max_worker_processes = '24';",
+    "ALTER SYSTEM SET max_parallel_workers = '12';",
+    "ALTER SYSTEM SET max_parallel_workers_per_gather = '6';",
+    "ALTER SYSTEM SET track_io_timing = 'on';"
+  ]
+}

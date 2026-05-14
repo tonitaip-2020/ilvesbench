@@ -57,6 +57,14 @@ class PgBenchConfig:
 
 
 @dataclass(slots=True)
+class EnergyConfig:
+    enabled: bool = True
+    estimated_cpu_watts: float | None = None
+    estimated_watts_per_cpu: float = 12.0
+    co2_grams_per_kwh: float = 110.0
+
+
+@dataclass(slots=True)
 class StorageConfig:
     sqlite_path: str = "data/ilvesbench_runs.sqlite3"
     artifact_dir: str = "data/artifacts"
@@ -76,6 +84,7 @@ class IlvesBenchConfig:
     workload: WorkloadConfig = field(default_factory=WorkloadConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     pgbench: PgBenchConfig = field(default_factory=PgBenchConfig)
+    energy: EnergyConfig = field(default_factory=EnergyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     web: WebConfig = field(default_factory=WebConfig)
     config_path: str = ""
@@ -93,6 +102,7 @@ class IlvesBenchConfig:
             workload=WorkloadConfig(**data.get("workload", {})),
             docker=DockerConfig(**data.get("docker", {})),
             pgbench=PgBenchConfig(**data.get("pgbench", {})),
+            energy=EnergyConfig(**data.get("energy", {})),
             storage=StorageConfig(**data.get("storage", {})),
             web=WebConfig(**data.get("web", {})),
             config_path=str(config_path),

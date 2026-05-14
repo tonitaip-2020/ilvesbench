@@ -7,9 +7,12 @@ from pathlib import Path
 import traceback
 import uuid
 
+from ilvesbench.benchmark.energy import BenchmarkComparator, EnergyEstimator
+from ilvesbench.benchmark.index_advisor import IndexAdvisor
 from ilvesbench.benchmark.migration_planner import MigrationPlanner
 from ilvesbench.benchmark.pgbench import PgBenchRunner
 from ilvesbench.benchmark.schema_transformer import SchemaTransformer
+from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
 from ilvesbench.benchmark.workload import WorkloadPlanner
 from ilvesbench.config import IlvesBenchConfig
 from ilvesbench.db.postgres import PostgresInspector
@@ -51,6 +54,10 @@ class PipelineOrchestrator:
             llm=self._llm,
             target_database=self._config.postgres.new_database,
         )
+        self._index_advisor = IndexAdvisor()
+        self._tuning_advisor = PostgresTuningAdvisor()
+        self._energy_estimator = EnergyEstimator()
+        self._benchmark_comparator = BenchmarkComparator()
 
     @property
     def store(self) -> RunRepository:
@@ -133,27 +140,11 @@ class PipelineOrchestrator:
             record = self._plan_target_schema_step(record)
             record = self._plan_migration_step(record, schema)
             record = self._plan_rewrite_queries_step(record, log_summary)
-            record = self._mark_planned(
-                record,
-                "optimize_indexes",
-                {"summary": "Planned: synthesize indexes for db-new from workload evidence."},
-            )
-            record = self._mark_planned(
-                record,
-                "tune_postgresql_conf",
-                {"summary": "Approval-gated: emit recommended knob changes from hardware and workload snapshots."},
-            )
+            record = self._plan_index_recommendations_step(record, schema, log_summary)
+            record = self._run_tuning_step(record, log_summary)
             record = self._plan_pgbench_new_step(record)
-            record = self._mark_planned(
-                record,
-                "compare_disk_usage",
-                {"summary": "Planned: compare db-original and db-new storage footprints after migration."},
-            )
-            record = self._mark_planned(
-                record,
-                "collect_extended_metrics",
-                {"summary": "Placeholder for I/O, cache-hit, and energy metrics integrations."},
-            )
+            record = self._run_extended_metrics_step(record, [self._config.postgres.original_database])
+            record = self._update_benchmark_comparison_step(record)
 
             record.summary.update(
                 self._summary_counts(record)
@@ -284,6 +275,11 @@ class PipelineOrchestrator:
             )
             record.summary["migration_completed"] = True
             record = self._plan_pgbench_new_step(record)
+            record = self._run_extended_metrics_step(
+                record,
+                [self._config.postgres.original_database, self._config.postgres.new_database],
+            )
+            record = self._update_benchmark_comparison_step(record)
             record.summary.update(self._summary_counts(record))
             record.status = self._overall_status(record)
         except Exception as exc:
@@ -316,7 +312,9 @@ class PipelineOrchestrator:
         record = self.load_run_record(run_id)
         try:
             log_summary = self._load_log_summary_artifact(record)
+            schema = self._load_schema_artifact(record)
             record = self._plan_rewrite_queries_step(record, log_summary)
+            record = self._plan_index_recommendations_step(record, schema, log_summary)
             record = self._plan_pgbench_new_step(record)
             record.summary.pop("error", None)
         except Exception as exc:
@@ -438,6 +436,7 @@ class PipelineOrchestrator:
             record = self._plan_target_schema_step(record)
             record = self._plan_migration_step(record, schema)
             record = self._plan_rewrite_queries_step(record, None)
+            record = self._plan_index_recommendations_step(record, schema, None)
             record = self._plan_pgbench_new_step(record)
             record.summary.pop("error", None)
             record.summary.update(self._summary_counts(record))
@@ -633,6 +632,7 @@ class PipelineOrchestrator:
         record = self.load_run_record(run_id)
         try:
             record = self._run_pgbench_original_step(record)
+            record = self._update_benchmark_comparison_step(record)
         except Exception as exc:
             record = self._replace_step(
                 record,
@@ -678,6 +678,11 @@ class PipelineOrchestrator:
             if rewrite_step.status != "completed" or not rewrite_step.details.get("workload_path"):
                 raise ValueError("Rewritten db-new workload must be completed before benchmarking db-new.")
             record = self._run_pgbench_new_step(record)
+            record = self._run_extended_metrics_step(
+                record,
+                [self._config.postgres.original_database, self._config.postgres.new_database],
+            )
+            record = self._update_benchmark_comparison_step(record)
         except Exception as exc:
             record = self._replace_step(
                 record,
@@ -708,6 +713,7 @@ class PipelineOrchestrator:
             artifact_name,
             benchmark_dict,
         )
+        energy_dict = self._store_energy_estimate(record, step_name, benchmark)
         details = {
             "benchmark_status": benchmark.status,
             "database": benchmark.database,
@@ -717,6 +723,9 @@ class PipelineOrchestrator:
             "workload_path": str(workload_path) if workload_path is not None else "",
             "throughput_tps": benchmark.throughput_tps,
             "average_latency_ms": benchmark.average_latency_ms,
+            "energy_status": energy_dict.get("status"),
+            "energy_joules": energy_dict.get("energy_joules"),
+            "joules_per_transaction": energy_dict.get("joules_per_transaction"),
         }
         if benchmark.status == "completed":
             details["summary"] = (
@@ -740,6 +749,38 @@ class PipelineOrchestrator:
             error=fatal_error or "pgbench did not run.",
             planned_only=False,
         )
+
+    def _store_energy_estimate(self, record: BenchmarkRunRecord, step_name: str, benchmark) -> dict:
+        hardware = self._load_optional_artifact(record, "capture_hardware") or {}
+        energy = self._energy_estimator.estimate(benchmark, hardware, self._config.energy)
+        energy_dict = to_dict(energy)
+        record.artifacts[f"{step_name}_energy"] = self._store.write_artifact(
+            record.run_id,
+            f"{step_name}_energy",
+            energy_dict,
+        )
+        return energy_dict
+
+    def _update_benchmark_comparison_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        original = self._load_optional_artifact(record, "run_pgbench_original")
+        normalized = self._load_optional_artifact(record, "run_pgbench_new")
+        original_energy = self._load_optional_artifact(record, "run_pgbench_original_energy")
+        normalized_energy = self._load_optional_artifact(record, "run_pgbench_new_energy")
+        comparison = self._benchmark_comparator.compare(
+            original=original,
+            normalized=normalized,
+            original_energy=original_energy,
+            normalized_energy=normalized_energy,
+            storage=self._storage_comparison(record),
+        )
+        record.artifacts["compare_disk_usage"] = self._store.write_artifact(
+            record.run_id,
+            "benchmark_comparison",
+            comparison,
+        )
+        if comparison.get("status") == "completed":
+            return self._complete_step(record, "compare_disk_usage", comparison)
+        return self._mark_planned(record, "compare_disk_usage", comparison)
 
     def _plan_target_schema_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
@@ -843,6 +884,123 @@ class PipelineOrchestrator:
         except Exception as exc:
             return self._fail_step(record, "rewrite_queries", str(exc))
 
+    def _plan_index_recommendations_step(
+        self,
+        record: BenchmarkRunRecord,
+        schema: SchemaSnapshot | None,
+        log_summary: LogSummary | None,
+    ) -> BenchmarkRunRecord:
+        normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
+        target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
+        try:
+            workload_sql = self._load_rewritten_or_source_workload_text(record, log_summary)
+            plan = self._index_advisor.recommend(
+                schema=schema,
+                target_tables=target_tables,
+                workload_sql=workload_sql,
+                log_summary=log_summary,
+            )
+            recommendations = [to_dict(item) for item in plan.recommendations]
+            plan_dict = {
+                "status": plan.status,
+                "summary": plan.summary,
+                "source": plan.source,
+                "recommendation_count": len(recommendations),
+                "recommendations": recommendations,
+                "sql_statements": [item["sql"] for item in recommendations],
+            }
+            record.artifacts["optimize_indexes"] = self._store.write_artifact(
+                record.run_id,
+                "index_recommendations",
+                plan_dict,
+            )
+            return self._complete_step(record, "optimize_indexes", plan_dict)
+        except Exception as exc:
+            return self._fail_step(record, "optimize_indexes", str(exc))
+
+    def _run_tuning_step(
+        self,
+        record: BenchmarkRunRecord,
+        log_summary: LogSummary | None,
+    ) -> BenchmarkRunRecord:
+        try:
+            hardware = self._load_optional_artifact(record, "capture_hardware") or {}
+            plan = self._tuning_advisor.recommend(
+                hardware=hardware,
+                log_summary=log_summary,
+                pgbench=self._config.pgbench,
+            )
+            recommendations = [to_dict(item) for item in plan.recommendations]
+            plan_dict = {
+                "status": plan.status,
+                "summary": plan.summary,
+                "source": plan.source,
+                "recommendation_count": len(recommendations),
+                "recommendations": recommendations,
+                "postgresql_conf_lines": [
+                    f"{item['setting']} = '{item['recommended_value']}'"
+                    for item in recommendations
+                ],
+                "alter_system_statements": [
+                    f"ALTER SYSTEM SET {item['setting']} = '{item['recommended_value']}';"
+                    for item in recommendations
+                ],
+            }
+            record.artifacts["tune_postgresql_conf"] = self._store.write_artifact(
+                record.run_id,
+                "postgresql_tuning",
+                plan_dict,
+            )
+            return self._complete_step(record, "tune_postgresql_conf", plan_dict)
+        except Exception as exc:
+            return self._fail_step(record, "tune_postgresql_conf", str(exc))
+
+    def _run_extended_metrics_step(
+        self,
+        record: BenchmarkRunRecord,
+        databases: list[str],
+    ) -> BenchmarkRunRecord:
+        unique_databases = list(dict.fromkeys(database for database in databases if database))
+        metrics: dict[str, dict] = {}
+        if not hasattr(self._postgres, "collect_database_metrics"):
+            payload = {
+                "status": "unavailable",
+                "summary": "The configured PostgreSQL tool does not expose advanced metrics collection.",
+                "databases": metrics,
+            }
+            record.artifacts["collect_extended_metrics"] = self._store.write_artifact(
+                record.run_id,
+                "extended_metrics",
+                payload,
+            )
+            return self._complete_step(record, "collect_extended_metrics", payload)
+
+        for database in unique_databases:
+            try:
+                metrics[database] = self._postgres.collect_database_metrics(database)
+                metrics[database]["status"] = "completed"
+            except Exception as exc:
+                metrics[database] = {
+                    "database": database,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+
+        completed = sum(1 for item in metrics.values() if item.get("status") == "completed")
+        failed = sum(1 for item in metrics.values() if item.get("status") == "failed")
+        status = "completed" if completed and not failed else "partial" if completed else "unavailable"
+        payload = {
+            "status": status,
+            "summary": f"Collected advanced metrics for {completed} database(s); {failed} collection attempt(s) failed.",
+            "databases": metrics,
+        }
+        record.artifacts["collect_extended_metrics"] = self._store.write_artifact(
+            record.run_id,
+            "extended_metrics",
+            payload,
+        )
+        return self._complete_step(record, "collect_extended_metrics", payload)
+
     def _plan_pgbench_original_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         workload_path = self._resolve_workload_path()
         workload_exists = workload_path is not None and workload_path.exists()
@@ -893,13 +1051,13 @@ class PipelineOrchestrator:
             StepResult(name="suggest_summary_tables", title="Suggest summary tables", status="pending"),
             StepResult(name="extract_workload_logs", title="Extract workload from PostgreSQL logs or workload file", status="pending"),
             StepResult(name="rewrite_queries", title="Rewrites queries for db-new", status="pending"),
-            StepResult(name="optimize_indexes", title="Create workload-aware indexes", status="pending"),
+            StepResult(name="optimize_indexes", title="Recommend workload-aware indexes", status="pending"),
             StepResult(name="capture_hardware", title="Capture hardware snapshot", status="pending"),
-            StepResult(name="tune_postgresql_conf", title="Tune postgresql.conf", status="pending", requires_approval=True),
+            StepResult(name="tune_postgresql_conf", title="Recommend postgresql.conf tuning", status="pending"),
             StepResult(name="run_pgbench_original", title="Run pgbench against db-original", status="pending", requires_approval=True),
             StepResult(name="run_pgbench_new", title="Run pgbench against db-new", status="pending", requires_approval=True),
-            StepResult(name="compare_disk_usage", title="Compare database disk usage", status="pending"),
-            StepResult(name="collect_extended_metrics", title="Collect I/O, cache, and energy placeholders", status="pending"),
+            StepResult(name="compare_disk_usage", title="Compare before/after benchmark results", status="pending"),
+            StepResult(name="collect_extended_metrics", title="Collect advanced PostgreSQL metrics", status="pending"),
         ]
 
     def _complete_step(self, record: BenchmarkRunRecord, name: str, details: dict) -> BenchmarkRunRecord:
@@ -949,6 +1107,15 @@ class PipelineOrchestrator:
             raise ValueError("Schema artifact is missing from the run.")
         payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
         return self._schema_snapshot_from_payload(payload)
+
+    def _load_optional_artifact(self, record: BenchmarkRunRecord, name: str) -> dict | None:
+        artifact_path = record.artifacts.get(name)
+        if not artifact_path:
+            return None
+        target = Path(artifact_path)
+        if not target.exists():
+            return None
+        return json.loads(target.read_text(encoding="utf-8"))
 
     def _load_log_summary_artifact(self, record: BenchmarkRunRecord) -> LogSummary | None:
         artifact_path = record.artifacts.get("extract_workload_logs")
@@ -1067,6 +1234,12 @@ class PipelineOrchestrator:
             raise ValueError("No executable SQL statements were available to rewrite for db-new.")
         return "\n\n".join(statements) + "\n"
 
+    def _load_rewritten_or_source_workload_text(self, record: BenchmarkRunRecord, log_summary) -> str:
+        rewritten_path = self._rewritten_workload_path(record)
+        if rewritten_path is not None and rewritten_path.exists():
+            return rewritten_path.read_text(encoding="utf-8", errors="replace")
+        return self._load_source_workload_text(log_summary)
+
     def _rewritten_workload_path(self, record: BenchmarkRunRecord) -> Path | None:
         rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
         if rewrite_step is None:
@@ -1075,6 +1248,29 @@ class PipelineOrchestrator:
         if not workload_path:
             return None
         return Path(workload_path).resolve()
+
+    def _storage_comparison(self, record: BenchmarkRunRecord) -> dict | None:
+        metrics = self._load_optional_artifact(record, "collect_extended_metrics") or {}
+        databases = metrics.get("databases", {})
+        original = databases.get(self._config.postgres.original_database, {})
+        normalized = databases.get(self._config.postgres.new_database, {})
+        original_size = original.get("database_size_bytes")
+        normalized_size = normalized.get("database_size_bytes")
+        if original_size is None or normalized_size is None:
+            return None
+        try:
+            original_size_int = int(original_size)
+            normalized_size_int = int(normalized_size)
+        except (TypeError, ValueError):
+            return None
+        delta = normalized_size_int - original_size_int
+        percent = round((delta / original_size_int) * 100, 3) if original_size_int else None
+        return {
+            "original_database_size_bytes": original_size_int,
+            "normalized_database_size_bytes": normalized_size_int,
+            "size_delta_bytes": delta,
+            "size_change_percent": percent,
+        }
 
     def _pgbench_error_summary(self, text: str) -> str:
         lines = [line.strip() for line in text.splitlines() if line.strip()]

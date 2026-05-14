@@ -14,6 +14,7 @@ src/ilvesbench/agent/orchestrator.py
 src/ilvesbench/api/__init__.py
 src/ilvesbench/api/server.py
 src/ilvesbench/benchmark/__init__.py
+src/ilvesbench/benchmark/migration_planner.py
 src/ilvesbench/benchmark/pgbench.py
 src/ilvesbench/benchmark/schema_transformer.py
 src/ilvesbench/benchmark/workload.py
@@ -25,10 +26,17 @@ src/ilvesbench/osops/__init__.py
 src/ilvesbench/osops/hardware.py
 src/ilvesbench/osops/logs.py
 src/ilvesbench/osops/subprocesses.py
+src/ilvesbench/osops/workload_files.py
 src/ilvesbench/static/app.js
 src/ilvesbench/static/index.html
 src/ilvesbench/static/styles.css
 src/ilvesbench/store/__init__.py
 src/ilvesbench/store/repository.py
+tests/test_config.py
 tests/test_logs.py
+tests/test_migration_planner.py
 tests/test_orchestrator.py
+tests/test_pgbench.py
+tests/test_postgres_diagnostics.py
+tests/test_schema_transformer.py
+tests/test_workload_planner.py

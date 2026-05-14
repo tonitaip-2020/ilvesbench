@@ -1,0 +1,4 @@
+{
+  "status": "awaiting_benchmarks",
+  "summary": "Run pgbench for both db-original and db-new before comparison."
+}
