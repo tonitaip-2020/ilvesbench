@@ -187,30 +187,156 @@ python3 -m unittest discover -s tests
 - Determinism: the executed MVP path is a normal Python workflow that can run without the LLM.
 - Extensibility: the schema transformer, migrator, and richer metrics collectors already have module boundaries, so later work can fill them in without reshaping the whole codebase.
 
-## TODOs
+## ROADMAP for 1.0 PoC:
 
-- **Normalization & DB structure transformation**:
-- **Query rewriting**:
-  - Validation of queries, DB structure and data migration. Generate simple tests.
-- **Data migrations**:
-  - Collect metadata on how much the database takes disk space, indices included.
-- **New index creation**:
-  - Based on rewritten queries, suggest secondary indices. "Click to create".
-- **New table recommendations (outside normalization)**:
-  - Based on rewritten queries and query logs, suggest summary tables.
-- **OS/Hardware**:
-  - Needs robust reading from Linux. Does not read from Windows.
-- **OS/query logs**:
-  - Design log analysis. Logs can be very large, not feasible to send to LLM. Needs to be deterministic.
-- **OS/postgresql.conf**:
-  - Provide recommendations for the file based on hardware. "Click to apply changes".
-- **Architecture**:
-  - In the future, consider to change the architecture to use a more complex framework like LangChain to avoid growth problems. Right now, this risks accidentally drifting toward "LLM agent improvises actions", which is exactly what we want to avoid. Right now, LangChain will introduce more abstraction where we want to avoid abstractions, and makes debugging harder when SQL/schema generation fails.
-- **Benchmarking**:
-  - Generating `pgbench` workloads with the LLM component.
-  - Making `pgbench` easily replaceable.
-  - Making `pgbench` configurable, and defaul configuration based on hardware.
-- **GUI redesign**:
-  - Visualizing results
-  - GUI is too heavy, clogs browser easily
-  - GUI re-design, perhaps a step-by-step, "tabs" approach?
+* Implemented / Mostly Implemented
+
+  * Orchestrator
+
+    * Real pipeline orchestration exists in `orchestrator.py`, passing state between LLM, PostgreSQL inspection, OSOps, benchmark, storage, and UI/API.
+  * LLM gateway
+
+    * Configurable LLM client exists and is used for schema normalization, migration planning, workload rewrite, and schema repair.
+  * DBOps-style PostgreSQL inspection
+
+    * Schema metadata is collected: tables, columns, indexes, foreign keys, unique constraints, database size.
+  * Abstract database profiling
+
+    * Row estimates, table counts, size buckets, relationship clusters, key-gap/wide-table signals.
+  * OSOps hardware inspection
+
+    * Host/container CPU, memory, disk, Docker stats/inspect support.
+  * PostgreSQL tuning recommendations
+
+    * Heuristic `postgresql.conf` lines and `ALTER SYSTEM` statements are generated.
+  * Query log/workload extraction
+
+    * PostgreSQL logs are parsed into fingerprints, counts, durations, sampled transactions.
+    * Workload `.sql` files are supported as fallback.
+  * Query profile proportions
+
+    * The note says “NOT IMPLEMENTED”, but basic prominence is implemented via query count and top-query ordering.
+    * It is not a rich statistical profile.
+  * 3NF proposal
+
+    * LLM-assisted schema analysis can propose target tables and generated `CREATE TABLE` SQL, with deterministic validation/fallback heuristics.
+  * Migration SQL generation
+
+    * LLM-generated `INSERT INTO ... SELECT ...` migration plans exist.
+    * Execution via FDW from `db-original` into `db-new` is implemented.
+  * Query rewriting for `db-new`
+
+    * LLM rewrite exists and writes a `db-new` workload SQL artifact.
+  * Query validation
+
+    * The note says “NOT IMPLEMENTED”, but limited validation exists.
+    * Rewritten statements are checked with `EXPLAIN` against `db-new` when the target DB exists.
+  * pgbench execution
+
+    * Implemented for both `db-original` and `db-new`, using configured duration/clients/jobs/transactions and workload files.
+  * Benchmark result parsing
+
+    * TPS and average latency are parsed from `pgbench` output.
+  * Energy estimates
+
+    * The note says “NOT IMPLEMENTED”, but post-run estimated energy and joules/transaction exist.
+  * Benchmark comparison
+
+    * Compares TPS, latency, storage size, and energy-per-transaction when both benchmark artifacts exist.
+  * Machine-readable logs/artifacts
+
+    * Run records go to SQLite.
+    * JSON artifacts are written per run.
+  * Browser GUI
+
+    * Implemented with workflow tabs, run polling, database state overview, metrics, actions, and artifact-derived displays.
+  * Gated intensive actions
+
+    * Schema creation, migration, index creation, and `pgbench` runs are approval-button actions in the UI.
+  * Reset target DB
+
+    * Implemented as a gated action.
+    * It is not a full arbitrary step-revert system.
+
+* Partially Implemented
+
+  * Functional dependency discovery
+
+    * Exists only through LLM semantic inference from schema metadata plus simple heuristics.
+    * Does not inspect actual data values to prove FDs.
+  * Metadata analysis for cardinalities/row counts
+
+    * Row estimates and database/table metrics exist.
+    * Column cardinalities specifically do not appear implemented.
+  * Query profile generation
+
+    * Implemented as top fingerprints/counts from logs or workload files.
+    * Not a full workload model with parameter distributions, think time, transaction mix, or temporal behavior.
+  * Workload generation for `pgbench`
+
+    * `pgbench` uses source/re-written SQL files.
+    * Does not synthesize a rich `pgbench` workload from the query profile beyond repeated/top-query handling.
+  * `postgresql.conf` recommendations
+
+    * Recommendations are generated.
+    * No UI action exists to apply them.
+  * `pgbench` hardware-suitable parameters
+
+    * Config exists.
+    * Tuning recommendations consider hardware.
+    * `pgbench` parameters are not automatically derived from hardware and are not tunable in the web UI.
+  * Secondary index recommendations
+
+    * Implemented with heuristics for single-column workload-aware indexes and a create action.
+    * Not LLM-based or deeply cost/model aware.
+  * Visualizer
+
+    * Shows summary benchmark metrics, state, comparison, and actions.
+    * Not a polished live “during benchmark” visualizer.
+  * Database state overview
+
+    * Present, but target DB profile can be approximate/stale unless `/api/postgres/profile` refreshes successfully.
+  * Step revert
+
+    * Only target DB reset and schema repair/regenerate flows exist.
+    * No general workflow undo/revert per step.
+
+* Not Implemented / Still Placeholder
+
+  * Summary tables/materialized views for long-running queries
+
+    * Candidate detection exists for aggregate `GROUP BY`.
+    * Actual SQL generation and creation are placeholder-only.
+  * Full semantic FD validation against data
+
+    * No deterministic data profiling for FDs, duplicates, transitive dependencies, or column cardinalities.
+  * Full equivalence validation between `db-original` and `db-new`
+
+    * Rewritten query validation uses `EXPLAIN`.
+    * Does not execute original/new query pairs and compare result sets.
+  * Full benchmark-time live telemetry
+
+    * No continuous streaming of TPS/latency/energy during `pgbench`.
+    * Only post-run parsed output exists.
+  * User-tunable `pgbench` parameters in GUI
+
+    * Not present.
+    * TOML config only.
+  * Applying PostgreSQL tuning from UI
+
+    * Not present.
+  * General rollback/revert of each workflow step
+
+    * Not present.
+  * Robust large-log analysis
+
+    * Parser is deterministic and capped by `max_lines`.
+    * Large-scale log ingestion/profile building is still basic.
+  * Cross-platform OSOps completeness
+
+    * Linux/macOS/Windows memory paths exist.
+    * README still flags OS/hardware robustness as unfinished.
+  * A mature visual dashboard
+
+    * The UI is functional and tabbed.
+    * Still prototype-level and artifact-summary oriented.
