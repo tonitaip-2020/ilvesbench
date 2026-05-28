@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime
 
+from ilvesbench.benchmark.normal_form import FirstNormalFormFinding, FirstNormalFormScanner
 from ilvesbench.config import PostgresConfig
 from ilvesbench.models import (
     ColumnMetadata,
@@ -266,6 +267,56 @@ class PostgresInspector:
             database_size_bytes=size_bytes,
         )
 
+    def scan_first_normal_form_warnings(
+        self,
+        schema: SchemaSnapshot,
+        sample_limit: int = 250,
+    ) -> dict:
+        scanner = FirstNormalFormScanner()
+        findings = scanner.schema_findings(schema)
+        conn = self._connect(schema.database)
+        try:
+            for table in schema.tables:
+                for column in table.columns:
+                    if not scanner.should_sample_column(column.data_type):
+                        continue
+                    values = self._sample_column_values(conn, table.schema, table.name, column.name, sample_limit)
+                    finding = scanner.analyze_column_values(
+                        f"{table.schema}.{table.name}",
+                        column.name,
+                        column.data_type,
+                        values,
+                    )
+                    if finding is None:
+                        continue
+                    self._attach_candidate_reference(conn, schema, scanner, finding)
+                    findings.append(finding)
+        finally:
+            conn.close()
+
+        scan = scanner.build_scan(findings)
+        return {
+            "status": scan.status,
+            "summary": scan.summary,
+            "source": scan.source,
+            "sample_limit": sample_limit,
+            "finding_count": len(scan.findings),
+            "findings": [
+                {
+                    "table": finding.table,
+                    "column": finding.column,
+                    "severity": finding.severity,
+                    "confidence": finding.confidence,
+                    "pattern": finding.pattern,
+                    "summary": finding.summary,
+                    "recommendation": finding.recommendation,
+                    "evidence": finding.evidence,
+                    "candidate_reference": finding.candidate_reference,
+                }
+                for finding in scan.findings
+            ],
+        }
+
     def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
         conn = self._connect(database)
         errors: list[dict] = []
@@ -286,6 +337,101 @@ class PostgresInspector:
         finally:
             conn.close()
         return errors
+
+    def _sample_column_values(
+        self,
+        conn,
+        schema_name: str,
+        table_name: str,
+        column_name: str,
+        sample_limit: int,
+    ) -> list[str]:
+        query = sql.SQL(
+            """
+            SELECT {column_name}::text AS value
+            FROM {schema_name}.{table_name}
+            WHERE {column_name} IS NOT NULL
+              AND length({column_name}::text) > 0
+            LIMIT {sample_limit}
+            """
+        ).format(
+            column_name=sql.Identifier(column_name),
+            schema_name=sql.Identifier(schema_name),
+            table_name=sql.Identifier(table_name),
+            sample_limit=sql.Literal(sample_limit),
+        )
+        with conn.cursor() as cur:
+            cur.execute(query)
+            return [str(row["value"]) for row in cur.fetchall()]
+
+    def _attach_candidate_reference(
+        self,
+        conn,
+        schema: SchemaSnapshot,
+        scanner: FirstNormalFormScanner,
+        finding: FirstNormalFormFinding,
+    ) -> None:
+        tokens = finding.evidence.get("token_samples", [])
+        if not tokens:
+            return
+        token_sample = [str(token) for token in tokens[:80] if str(token)]
+        if len(token_sample) < 2:
+            return
+
+        best_reference: dict | None = None
+        for table, column_name in scanner.candidate_key_columns(schema):
+            candidate_table = f"{table.schema}.{table.name}"
+            if candidate_table == finding.table and column_name == finding.column:
+                continue
+            try:
+                match_count = self._count_matching_tokens(conn, table.schema, table.name, column_name, token_sample)
+            except Exception:
+                continue
+            match_ratio = match_count / len(token_sample)
+            if match_count < 2 or match_ratio < 0.25:
+                continue
+            candidate = {
+                "table": candidate_table,
+                "column": column_name,
+                "matched_sample_tokens": match_count,
+                "sample_token_count": len(token_sample),
+                "match_ratio": round(match_ratio, 4),
+            }
+            if best_reference is None or candidate["match_ratio"] > best_reference["match_ratio"]:
+                best_reference = candidate
+
+        if best_reference is not None:
+            finding.candidate_reference = best_reference
+            finding.confidence = round(min(0.98, finding.confidence + 0.08), 2)
+            finding.evidence["candidate_reference_detected"] = True
+            finding.recommendation = (
+                f"Consider a child relation from {finding.table} to "
+                f"{best_reference['table']}.{best_reference['column']} with one row per extracted token."
+            )
+
+    def _count_matching_tokens(
+        self,
+        conn,
+        schema_name: str,
+        table_name: str,
+        column_name: str,
+        tokens: list[str],
+    ) -> int:
+        query = sql.SQL(
+            """
+            SELECT COUNT(DISTINCT {column_name}) AS match_count
+            FROM {schema_name}.{table_name}
+            WHERE {column_name} = ANY(%s)
+            """
+        ).format(
+            column_name=sql.Identifier(column_name),
+            schema_name=sql.Identifier(schema_name),
+            table_name=sql.Identifier(table_name),
+        )
+        with conn.cursor() as cur:
+            cur.execute(query, (tokens,))
+            row = cur.fetchone()
+        return int(row["match_count"] or 0) if row else 0
 
     def collect_database_metrics(self, database: str) -> dict:
         conn = self._connect(database)
@@ -328,6 +474,38 @@ class PostgresInspector:
         finally:
             conn.close()
         return "dropped"
+
+    def truncate_user_tables(self, database: str) -> list[str]:
+        conn = self._connect(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT table_schema, table_name
+                    FROM information_schema.tables
+                    WHERE table_type = 'BASE TABLE'
+                      AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                      AND table_schema NOT LIKE 'pg_%'
+                    ORDER BY table_schema, table_name
+                    """
+                )
+                tables = [(str(row["table_schema"]), str(row["table_name"])) for row in cur.fetchall()]
+                if not tables:
+                    return []
+                table_sql = sql.SQL(", ").join(
+                    sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier(table_name))
+                    for schema_name, table_name in tables
+                )
+                cur.execute(
+                    sql.SQL("TRUNCATE TABLE {} RESTART IDENTITY CASCADE").format(table_sql)
+                )
+            conn.commit()
+            return [f"{schema_name}.{table_name}" for schema_name, table_name in tables]
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def database_exists(self, database: str) -> bool:
         conn = self._connect(self._config.admin_database)

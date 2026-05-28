@@ -10,7 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from ilvesbench.config import IlvesBenchConfig
+from ilvesbench.config import DEFAULT_LLM_MODEL, IlvesBenchConfig
 
 
 class ConfigTests(unittest.TestCase):
@@ -72,6 +72,22 @@ class ConfigTests(unittest.TestCase):
             config = IlvesBenchConfig.from_toml(config_path)
 
             self.assertEqual(config.llm.api_key, "literal-key")
+
+    def test_llm_model_is_defined_only_in_code(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+                [llm]
+                model = "phi4-14b"
+                """,
+                encoding="utf-8",
+            )
+
+            config = IlvesBenchConfig.from_toml(config_path)
+
+            self.assertEqual(config.llm.model, DEFAULT_LLM_MODEL)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,58 @@ class StaticGateway:
 
 
 class MigrationPlannerTests(unittest.TestCase):
+    def test_generates_deterministic_1nf_split_migration(self) -> None:
+        proposal = MigrationPlanner().plan(
+            schema=None,
+            target_tables=[
+                {
+                    "name": "title_crew",
+                    "source_tables": ["public.title_crew"],
+                    "columns": [
+                        {"source_column": "tconst", "name": "tconst"},
+                    ],
+                    "migration_strategy": "copy_distinct",
+                },
+                {
+                    "name": "title_crew_directors",
+                    "source_tables": ["public.title_crew"],
+                    "columns": [
+                        {"source_column": "tconst", "name": "tconst"},
+                        {"source_column": "directors", "name": "nconst"},
+                    ],
+                    "migration_strategy": "split_delimited",
+                    "split_source_column": "directors",
+                    "split_value_column": "nconst",
+                    "split_delimiter": ",",
+                },
+            ],
+        )
+
+        self.assertEqual(proposal.source, "deterministic_1nf")
+        self.assertEqual(len(proposal.statements), 2)
+        self.assertIn('string_to_array("directors", \',\')', proposal.statements[1]["sql"])
+        self.assertIn("trim(extracted_value)", proposal.statements[1]["sql"])
+
+    def test_deterministic_1nf_migration_quotes_mixed_case_source_columns(self) -> None:
+        proposal = MigrationPlanner().plan(
+            schema=None,
+            target_tables=[
+                {
+                    "name": "title_basics",
+                    "source_tables": ["public.title_basics"],
+                    "columns": [
+                        {"source_column": "tconst", "name": "tconst"},
+                        {"source_column": "titleSearchCol", "name": "titlesearchcol"},
+                    ],
+                    "migration_strategy": "copy_distinct",
+                },
+            ],
+        )
+
+        self.assertEqual(proposal.source, "deterministic_1nf")
+        self.assertIn('"titleSearchCol"', proposal.statements[0]["sql"])
+        self.assertIn('"titlesearchcol"', proposal.statements[0]["sql"])
+
     def test_normalizes_source_schema_reference_shape(self) -> None:
         planner = MigrationPlanner(
             llm=StaticGateway(

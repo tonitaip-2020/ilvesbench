@@ -92,7 +92,18 @@ class PipelineOrchestrator:
         record = self._store.get_run_record(run_id)
         if record is None:
             raise ValueError(f"Run not found: {run_id}")
+        self._apply_run_database_context(record)
         return record
+
+    def _apply_run_database_context(self, record: BenchmarkRunRecord) -> None:
+        original_database = str(record.summary.get("original_database") or "").strip()
+        new_database = str(record.summary.get("new_database") or "").strip()
+        if not original_database and not new_database:
+            return
+        if original_database:
+            self._config.postgres.original_database = original_database
+        if new_database:
+            self._config.postgres.new_database = new_database
 
     def create_mvp_record(self) -> BenchmarkRunRecord:
         now = datetime.now(UTC).isoformat()
@@ -103,7 +114,12 @@ class PipelineOrchestrator:
             status="running",
             config_path=self._config.config_path,
             steps=self._pipeline_template(),
-            summary={"mode": "mvp_collection"},
+            summary={
+                "mode": "mvp_collection",
+                "original_database": self._config.postgres.original_database,
+                "new_database": self._config.postgres.new_database,
+                "schemas": list(self._config.postgres.schemas),
+            },
         )
         self._store.upsert_run(record)
         return record
@@ -112,18 +128,25 @@ class PipelineOrchestrator:
         try:
             record = self._run_llm_step(record)
             schema = self._run_schema_step(record)
+            first_normal_form_scan = self._run_first_normal_form_step(record, schema)
             record = self._run_hardware_step(record)
             log_summary = self._run_logs_step(record)
             record = self._plan_pgbench_original_step(record)
 
             if schema is not None:
-                proposal = self._schema_transformer.analyze(schema)
+                first_normal_form_findings = (
+                    first_normal_form_scan.get("findings", [])
+                    if first_normal_form_scan is not None
+                    else []
+                )
+                proposal = self._schema_transformer.analyze(schema, first_normal_form_findings)
                 proposal_dict = {
                     "status": proposal.status,
                     "summary": proposal.summary,
                     "rationale": proposal.rationale,
                     "table_findings": proposal.table_findings,
                     "functional_dependencies": proposal.functional_dependencies,
+                    "first_normal_form_findings": first_normal_form_findings,
                     "target_tables": proposal.target_tables,
                     "sql_statements": proposal.sql_statements,
                     "source": proposal.source,
@@ -271,11 +294,37 @@ class PipelineOrchestrator:
                 raise ValueError(f"Create {self._config.postgres.new_database} schema must be completed before data migration.")
 
             migrate_step = next(step for step in record.steps if step.name == "migrate_data")
+            schema = self._load_schema_artifact(record)
+            if migrate_step.details.get("source") == "deterministic_1nf":
+                refreshed = self._migration_planner.plan(schema, migrate_step.details.get("target_tables", []))
+                if refreshed.statements:
+                    migration_sql = "\n\n".join(statement["sql"] for statement in refreshed.statements) + "\n"
+                    migration_path = self._store.write_text_artifact(
+                        record.run_id,
+                        "migration_plan",
+                        migration_sql,
+                        suffix=".sql",
+                    )
+                    migrate_step.details.update(
+                        {
+                            "status": refreshed.status,
+                            "summary": refreshed.summary,
+                            "reasoning": refreshed.rationale,
+                            "statements": refreshed.statements,
+                            "source": refreshed.source,
+                            "sql_path": migration_path,
+                        }
+                    )
+                    record.artifacts["migration_plan_sql"] = migration_path
+                    record.artifacts["migrate_data"] = self._store.write_artifact(
+                        record.run_id,
+                        "migration_plan",
+                        migrate_step.details,
+                    )
             statements = [statement["sql"] for statement in migrate_step.details.get("statements", [])]
             if not statements:
                 raise ValueError("No migration SQL is available for this run.")
 
-            schema = self._load_schema_artifact(record)
             source_alias = f"ilvesbench_src_{record.run_id[-6:]}"
             referenced_tables = self._source_tables_for_migration(schema, migrate_step.details.get("target_tables", []))
             fdw_tables = self._postgres.ensure_source_fdw(
@@ -416,6 +465,66 @@ class PipelineOrchestrator:
             self._store.upsert_run(record)
         return record
 
+    def begin_truncate_target_data(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        record.status = "running"
+        record.summary.update(self._summary_counts(record))
+        self._store.upsert_run(record)
+        return record
+
+    def execute_truncate_target_data(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        try:
+            if not self._postgres.database_exists(self._config.postgres.new_database):
+                raise ValueError(f"{self._config.postgres.new_database} does not exist yet.")
+
+            truncated_tables = self._postgres.truncate_user_tables(self._config.postgres.new_database)
+            migrate_step = next(step for step in record.steps if step.name == "migrate_data")
+            migrate_status = "planned" if migrate_step.details.get("statements") else migrate_step.status
+            record = self._replace_step(
+                record,
+                "migrate_data",
+                status=migrate_status,
+                details={
+                    **migrate_step.details,
+                    "truncated_table_count": len(truncated_tables),
+                    "truncated_tables": truncated_tables[:80],
+                    "summary": (
+                        f"Truncated {len(truncated_tables)} table(s) in {self._config.postgres.new_database}. "
+                        "Structure remains; data migration can be rerun."
+                    ),
+                },
+                error=None,
+                planned_only=migrate_status == "planned",
+            )
+            run_pgbench_new_step = next(step for step in record.steps if step.name == "run_pgbench_new")
+            record = self._replace_step(
+                record,
+                "run_pgbench_new",
+                status="planned",
+                details={
+                    **run_pgbench_new_step.details,
+                    "summary": (
+                        f"{self._config.postgres.new_database} data was truncated. Rerun migration before benchmarking."
+                    ),
+                },
+                error=None,
+                planned_only=True,
+            )
+            record.summary.pop("error", None)
+            record.summary["target_schema_created"] = True
+            record.summary["migration_completed"] = False
+            record.summary["target_data_truncated"] = True
+            record.summary.update(self._summary_counts(record))
+            record.status = self._overall_status(record)
+        except Exception as exc:
+            record.status = "failed"
+            record.summary["error"] = str(exc)
+        finally:
+            record.updated_at = datetime.now(UTC).isoformat()
+            self._store.upsert_run(record)
+        return record
+
     def begin_repair_target_schema(self, run_id: str) -> BenchmarkRunRecord:
         record = self.load_run_record(run_id)
         record.status = "running"
@@ -518,6 +627,44 @@ class PipelineOrchestrator:
             return schema
         except Exception as exc:
             self._fail_step(record, "inspect_source_schema", str(exc))
+            return None
+
+    def _run_first_normal_form_step(self, record: BenchmarkRunRecord, schema: SchemaSnapshot | None) -> dict | None:
+        if schema is None:
+            self._fail_step(record, "scan_first_normal_form", "1NF scanning is blocked until schema inspection succeeds.")
+            return None
+        try:
+            scan = self._postgres.scan_first_normal_form_warnings(schema)
+            record.artifacts["scan_first_normal_form"] = self._store.write_artifact(
+                record.run_id,
+                "first_normal_form_scan",
+                scan,
+            )
+            self._complete_step(
+                record,
+                "scan_first_normal_form",
+                {
+                    "status": scan.get("status"),
+                    "summary": scan.get("summary"),
+                    "finding_count": scan.get("finding_count", 0),
+                    "findings": scan.get("findings", [])[:12],
+                },
+            )
+            return scan
+        except Exception as exc:
+            self._replace_step(
+                record,
+                "scan_first_normal_form",
+                status="completed",
+                details={
+                    "status": "unavailable",
+                    "summary": f"1NF warning scan could not run: {exc}",
+                    "finding_count": 0,
+                    "findings": [],
+                },
+                error=None,
+                planned_only=False,
+            )
             return None
 
     def _run_hardware_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
@@ -951,6 +1098,13 @@ class PipelineOrchestrator:
         summary = normalization_step.details.get("summary", "")
 
         if sql_statements:
+            ddl_path = self._store.write_text_artifact(
+                record.run_id,
+                "create_target_schema",
+                "\n\n".join(sql_statements) + "\n",
+                suffix=".sql",
+            )
+            record.artifacts["create_target_schema_sql"] = ddl_path
             return self._mark_planned(
                 record,
                 "create_target_schema",
@@ -960,6 +1114,7 @@ class PipelineOrchestrator:
                     "target_table_count": len(target_tables),
                     "sql_statement_count": len(sql_statements),
                     "sql_statements": sql_statements,
+                    "sql_path": ddl_path,
                 },
             )
 
@@ -988,6 +1143,16 @@ class PipelineOrchestrator:
                 "target_tables": target_tables,
                 "source": proposal.source,
             }
+            if proposal.statements:
+                migration_sql = "\n\n".join(statement["sql"] for statement in proposal.statements) + "\n"
+                migration_path = self._store.write_text_artifact(
+                    record.run_id,
+                    "migration_plan",
+                    migration_sql,
+                    suffix=".sql",
+                )
+                proposal_dict["sql_path"] = migration_path
+                record.artifacts["migration_plan_sql"] = migration_path
             record.artifacts["migrate_data"] = self._store.write_artifact(
                 record.run_id,
                 "migration_plan",
@@ -1302,6 +1467,7 @@ class PipelineOrchestrator:
         return [
             StepResult(name="llm_gateway", title="Test LLM gateway", status="pending"),
             StepResult(name="inspect_source_schema", title="Inspect source PostgreSQL schema", status="pending"),
+            StepResult(name="scan_first_normal_form", title="Scan sampled data for 1NF warnings", status="pending"),
             StepResult(name="extract_workload_logs", title="Extract workload from PostgreSQL logs or workload file", status="pending"),
             StepResult(name="propose_3nf_schema", title="Propose 3NF normalization plan", status="pending"),
             StepResult(name="create_target_schema", title=f"Create {self._config.postgres.new_database} schema", status="pending", requires_approval=True),

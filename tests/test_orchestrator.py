@@ -45,6 +45,7 @@ class FailingPostgres:
 class RecordingPostgres:
     def __init__(self) -> None:
         self.executed: list[str] = []
+        self.truncated = False
 
     def database_exists(self, database: str) -> bool:
         return True
@@ -52,6 +53,10 @@ class RecordingPostgres:
     def execute_statements(self, database: str, statements: list[str]) -> list[dict]:
         self.executed.extend(statements)
         return [{"statement": statement} for statement in statements]
+
+    def truncate_user_tables(self, database: str) -> list[str]:
+        self.truncated = True
+        return ["public.items", "public.items_lookup"]
 
     def collect_database_metrics(self, database: str) -> dict:
         return {
@@ -561,6 +566,66 @@ class OrchestratorTests(unittest.TestCase):
             create_step = next(step for step in updated.steps if step.name == "create_secondary_indexes")
             self.assertEqual(create_step.status, "completed")
             self.assertEqual(postgres.executed, ['CREATE INDEX IF NOT EXISTS "idx_items_name" ON "items" ("name");'])
+
+    def test_truncate_target_data_keeps_structure_and_replans_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            postgres = RecordingPostgres()
+            orchestrator._postgres = postgres
+            record = orchestrator.create_mvp_record()
+            record = orchestrator._replace_step(
+                record,
+                "create_target_schema",
+                status="completed",
+                details={"sql_statements": ["CREATE TABLE items_lookup (id integer);"]},
+                error=None,
+                planned_only=False,
+            )
+            record = orchestrator._replace_step(
+                record,
+                "migrate_data",
+                status="completed",
+                details={
+                    "statements": [
+                        {"target_table": "items_lookup", "sql": "INSERT INTO items_lookup SELECT id FROM __SOURCE_SCHEMA__.items;"}
+                    ],
+                },
+                error=None,
+                planned_only=False,
+            )
+            orchestrator.store.upsert_run(record)
+
+            orchestrator.begin_truncate_target_data(record.run_id)
+            updated = orchestrator.execute_truncate_target_data(record.run_id)
+
+            migrate_step = next(step for step in updated.steps if step.name == "migrate_data")
+            pgbench_new_step = next(step for step in updated.steps if step.name == "run_pgbench_new")
+            self.assertTrue(postgres.truncated)
+            self.assertEqual(updated.summary["target_schema_created"], True)
+            self.assertEqual(updated.summary["migration_completed"], False)
+            self.assertEqual(migrate_step.status, "planned")
+            self.assertEqual(migrate_step.details["truncated_table_count"], 2)
+            self.assertEqual(pgbench_new_step.status, "planned")
 
 
 if __name__ == "__main__":

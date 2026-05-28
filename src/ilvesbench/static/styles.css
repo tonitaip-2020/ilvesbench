@@ -436,6 +436,12 @@ code {
   background: var(--accent-soft);
 }
 
+.action-button.danger {
+  color: var(--red);
+  border-color: #e7b9b9;
+  background: #fdeeee;
+}
+
 .action-button small {
   color: inherit;
   font-size: 0.75rem;
@@ -692,6 +698,51 @@ code {
   margin-top: 10px;
   padding: 12px;
   text-align: left;
+}
+
+.raw-sql {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.raw-sql summary {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.raw-sql summary span {
+  min-width: 0;
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.76rem;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.raw-sql textarea {
+  display: block;
+  width: 100%;
+  min-height: 240px;
+  padding: 14px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  background: #0f172a;
+  color: #e5edf6;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  resize: vertical;
+  white-space: pre;
+  overflow: auto;
 }
 
 @media (max-width: 1000px) {

@@ -145,6 +145,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             thread.start()
             self._send_json({"status": "accepted", "run_id": run_id, "action": "reset-target-db"}, status=HTTPStatus.ACCEPTED)
             return
+        if parsed.path.endswith("/actions/truncate-target-data"):
+            run_id = parsed.path.split("/")[-3]
+            self.server.orchestrator.begin_truncate_target_data(run_id)
+            thread = threading.Thread(
+                target=self.server.orchestrator.execute_truncate_target_data,
+                args=(run_id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"status": "accepted", "run_id": run_id, "action": "truncate-target-data"}, status=HTTPStatus.ACCEPTED)
+            return
         if parsed.path.endswith("/actions/repair-schema"):
             run_id = parsed.path.split("/")[-3]
             self.server.orchestrator.begin_repair_target_schema(run_id)

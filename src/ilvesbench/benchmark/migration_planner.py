@@ -30,6 +30,9 @@ class MigrationPlanner:
                 rationale=["Migration planning requires a target-table decomposition."],
                 source="fallback",
             )
+        deterministic = self._deterministic_first_normal_form_plan(target_tables)
+        if deterministic is not None:
+            return deterministic
         if self._llm is None:
             return MigrationProposal(
                 status="unavailable",
@@ -114,6 +117,91 @@ class MigrationPlanner:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _deterministic_first_normal_form_plan(self, target_tables: list[dict]) -> MigrationProposal | None:
+        if not any(table.get("migration_strategy") for table in target_tables):
+            return None
+
+        statements: list[dict] = []
+        copy_tables = [table for table in target_tables if table.get("migration_strategy") == "copy_distinct"]
+        split_tables = [table for table in target_tables if table.get("migration_strategy") == "split_delimited"]
+        for table in copy_tables:
+            source_table = self._single_source_table(table)
+            if not source_table:
+                continue
+            target_columns = [str(column.get("name", "")) for column in table.get("columns", []) if column.get("name")]
+            source_columns = [str(column.get("source_column", "")) for column in table.get("columns", []) if column.get("source_column")]
+            if not target_columns or len(target_columns) != len(source_columns):
+                continue
+            target_column_sql = ", ".join(self._quote_identifier(column) for column in target_columns)
+            source_column_sql = ", ".join(self._quote_identifier(column) for column in source_columns)
+            statements.append(
+                {
+                    "target_table": table["name"],
+                    "purpose": f"Copy source rows from {source_table}.",
+                    "sql": (
+                        f"INSERT INTO {self._quote_identifier(table['name'])} ({target_column_sql}) "
+                        f"SELECT DISTINCT {source_column_sql} "
+                        f"FROM __SOURCE_SCHEMA__.{self._quote_identifier(self._source_table_name(source_table))};"
+                    ),
+                }
+            )
+
+        for table in split_tables:
+            source_table = self._single_source_table(table)
+            source_column = str(table.get("split_source_column", "")).strip()
+            value_column = str(table.get("split_value_column", "")).strip()
+            delimiter = str(table.get("split_delimiter", ","))
+            if not source_table or not source_column or not value_column:
+                continue
+            target_columns = [str(column.get("name", "")) for column in table.get("columns", []) if column.get("name")]
+            parent_columns = [column for column in target_columns if column != value_column]
+            if not parent_columns:
+                continue
+            target_column_sql = ", ".join(self._quote_identifier(column) for column in target_columns)
+            selected_columns = ", ".join(
+                [self._quote_identifier(column) for column in parent_columns] + ["trim(extracted_value)"]
+            )
+            source_column_sql = self._quote_identifier(source_column)
+            statements.append(
+                {
+                    "target_table": table["name"],
+                    "purpose": f"Split delimited values from {source_table}.{source_column}.",
+                    "sql": (
+                        f"INSERT INTO {self._quote_identifier(table['name'])} ({target_column_sql}) "
+                        f"SELECT DISTINCT {selected_columns} "
+                        f"FROM __SOURCE_SCHEMA__.{self._quote_identifier(self._source_table_name(source_table))} "
+                        f"CROSS JOIN LATERAL unnest(string_to_array({source_column_sql}, {self._sql_literal(delimiter)})) AS extracted_value "
+                        f"WHERE {source_column_sql} IS NOT NULL AND trim(extracted_value) <> '';"
+                    ),
+                }
+            )
+
+        if not statements:
+            return None
+        return MigrationProposal(
+            status="planned",
+            summary=f"Generated {len(statements)} deterministic migration statement(s) for 1NF decomposition.",
+            rationale=[
+                "Copied regular tables from the source database.",
+                "Populated child tables by splitting detected delimited multi-value columns.",
+            ],
+            statements=statements,
+            source="deterministic_1nf",
+        )
+
+    def _single_source_table(self, target_table: dict) -> str:
+        source_tables = [str(item) for item in target_table.get("source_tables", []) if str(item).strip()]
+        return source_tables[0] if len(source_tables) == 1 else ""
+
+    def _source_table_name(self, source_table: str) -> str:
+        return source_table.split(".")[-1]
+
+    def _sql_literal(self, value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    def _quote_identifier(self, value: str) -> str:
+        return '"' + str(value).replace('"', '""') + '"'
 
     def _extract_json_object(self, text: str) -> dict:
         match = re.search(r"\{.*\}", text, re.DOTALL)

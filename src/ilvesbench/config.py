@@ -6,13 +6,16 @@ from pathlib import Path
 import tomllib
 
 
+DEFAULT_LLM_MODEL = "Qwen3.6-35B-A3B"
+
+
 @dataclass(slots=True)
 class LLMConfig:
     backend: str = "aviary"
     base_url: str = ""
     api_key: str | None = None
     api_key_file: str | None = None
-    model: str = "llama2-7b"
+    model: str = DEFAULT_LLM_MODEL
     timeout_seconds: int = 60
 
 
@@ -93,7 +96,9 @@ class IlvesBenchConfig:
     def from_toml(cls, path: str | Path) -> "IlvesBenchConfig":
         config_path = Path(path).expanduser().resolve()
         data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        llm_config = LLMConfig(**data.get("llm", {}))
+        llm_data = dict(data.get("llm", {}))
+        llm_data.pop("model", None)
+        llm_config = LLMConfig(**llm_data)
         llm_config.api_key = _resolve_llm_api_key(llm_config, config_path.parent)
         config = cls(
             llm=llm_config,

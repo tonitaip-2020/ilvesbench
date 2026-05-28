@@ -21,8 +21,8 @@ let latestProfilesContext = "";
 
 const WORKSPACE_TABS = [
   { id: "setup", label: "Setup", steps: ["llm_gateway", "inspect_source_schema", "extract_workload_logs"] },
-  { id: "profile", label: "Profile", steps: ["inspect_source_schema", "collect_extended_metrics"] },
-  { id: "normalize", label: "Normalize", steps: ["propose_3nf_schema"] },
+  { id: "profile", label: "Profile", steps: ["inspect_source_schema", "scan_first_normal_form", "collect_extended_metrics"] },
+  { id: "normalize", label: "Normalize", steps: ["scan_first_normal_form", "propose_3nf_schema"] },
   { id: "migrate", label: "Migrate", steps: ["create_target_schema", "migrate_data"] },
   { id: "workload", label: "Workload", steps: ["rewrite_queries", "suggest_summary_tables"] },
   { id: "physical", label: "Physical design", steps: ["optimize_indexes", "create_secondary_indexes", "tune_postgresql_conf"] },
@@ -75,10 +75,12 @@ function requestContextKey() {
 }
 
 function selectedOriginalDatabase(run = null) {
+  if (run && !run.selectionOnly && run.summary?.original_database) return run.summary.original_database;
   return originalDatabaseSelect.value.trim() || latestPostgresStatus?.original_database || run?.summary?.original_database || "";
 }
 
 function selectedTargetDatabase(run = null) {
+  if (run && !run.selectionOnly && run.summary?.new_database) return run.summary.new_database;
   return newDatabaseInput.value.trim() || latestPostgresStatus?.new_database || run?.summary?.new_database || "";
 }
 
@@ -126,6 +128,17 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function rawSqlBlock(title, statements, path = "") {
+  const sql = Array.isArray(statements) ? statements.filter(Boolean).join("\n\n") : String(statements || "");
+  if (!sql.trim()) return "";
+  return `
+    <details class="raw-sql">
+      <summary>${escapeHtml(title)}${path ? `<span>${escapeHtml(path)}</span>` : ""}</summary>
+      <textarea readonly spellcheck="false">${escapeHtml(sql)}</textarea>
+    </details>
+  `;
 }
 
 function step(run, name) {
@@ -436,6 +449,7 @@ function databaseFigure(kind, run, profile) {
   const rewriteStep = step(run, "rewrite_queries");
   const indexStep = step(run, "optimize_indexes");
   const indexCreateStep = step(run, "create_secondary_indexes");
+  const summaryStep = step(run, "suggest_summary_tables");
   const workloadStep = step(run, "extract_workload_logs");
   const originalBench = step(run, "run_pgbench_original");
   const newBench = step(run, "run_pgbench_new");
@@ -448,6 +462,8 @@ function databaseFigure(kind, run, profile) {
   const targetWorkloadReady = hasMatchingRun && rewriteStep.status === "completed" && Boolean(rewriteStep.details?.workload_path);
   const noIndexWorkNeeded = indexStep.status === "completed" && Number(indexStep.details?.recommendation_count || 0) === 0;
   const targetIndexesReady = indexCreateStep.status === "completed" || noIndexWorkNeeded;
+  const summaryTableStatus = summaryStep.details?.creation_status || "not implemented";
+  const summaryTablesReady = summaryTableStatus === "created" || summaryTableStatus === "not needed";
 
   if (kind === "original") {
     const ready = exists && sourceWorkloadReady && Boolean(originalBench.details?.workload_path);
@@ -486,8 +502,9 @@ function databaseFigure(kind, run, profile) {
       { label: "Database", value: profiling ? "profiling" : exists ? "exists" : "not created", status: profiling ? "pending" : exists ? "ok" : "missing" },
       { label: "Structure", value: profiling ? "checking..." : readiness.structureReady ? "created" : "not created", status: profiling ? "pending" : readiness.structureReady ? "ok" : "pending" },
       { label: "Data", value: profiling ? "estimating..." : readiness.dataReady ? "populated" : "not populated", status: profiling ? "pending" : readiness.dataReady ? "ok" : "pending" },
-      { label: "Indexes", value: targetIndexesReady ? "created" : indexCreateStep.status === "planned" ? "planned" : "not created", status: targetIndexesReady ? "ok" : "pending" },
-      { label: "Workload", value: targetWorkloadReady ? "created" : hasMatchingRun ? "not created" : "start a run", status: targetWorkloadReady ? "ok" : "pending" },
+      { label: "Query rewrite", value: targetWorkloadReady ? "created" : hasMatchingRun ? "not created" : "start a run", status: targetWorkloadReady ? "ok" : "pending" },
+      { label: "Secondary indexes", value: targetIndexesReady ? "created" : indexCreateStep.status === "planned" ? "planned" : "not created", status: targetIndexesReady ? "ok" : "pending" },
+      { label: "Summary tables", value: summaryTableStatus, status: summaryTablesReady ? "ok" : "pending" },
       { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
     ],
   };
@@ -530,7 +547,7 @@ function targetReadiness(run, profile) {
   return {
     exists,
     hasRows,
-    structureReady: exists || createStep.status === "completed",
+    structureReady: (exists && Number(counts.tables || 0) > 0) || createStep.status === "completed",
     dataReady: hasRows || migrateStep.status === "completed",
   };
 }
@@ -628,6 +645,7 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const hasIndexSql = indexSqlCount > 0;
   const readiness = targetReadiness(run, profile);
   const selectionOnlyReason = run.selectionOnly ? `Start a run for ${selectedOriginalDatabase(run) || "the selected source database"} first.` : "";
+  const noTargetReason = !readiness.exists && createStep.status !== "completed" ? `${targetName} does not exist yet.` : "";
 
   actions.push(actionButton(
     run,
@@ -639,6 +657,20 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   if (createStep.status === "failed" && hasCreateSql) {
     actions.push(actionButton(run, "repair-schema", "Repair schema SQL"));
   }
+  actions.push(actionButton(
+    run,
+    "truncate-target-data",
+    `Truncate ${targetName} data`,
+    "danger",
+    selectionOnlyReason || noTargetReason || (!readiness.structureReady ? `Create ${targetName} structure first.` : ""),
+  ));
+  actions.push(actionButton(
+    run,
+    "reset-target-db",
+    `Drop ${targetName}`,
+    "danger",
+    selectionOnlyReason || noTargetReason,
+  ));
   actions.push(actionButton(
     run,
     "migrate-data",
@@ -752,8 +784,11 @@ function renderProfile(run, sourceProfile, targetProfile) {
 }
 
 function renderNormalize(run) {
+  const firstNormalForm = step(run, "scan_first_normal_form");
   const normalize = step(run, "propose_3nf_schema");
   const details = normalize.details || {};
+  const firstNormalFormDetails = firstNormalForm.details || {};
+  const firstNormalFormFindings = firstNormalFormDetails.findings || details.first_normal_form_findings || [];
   const targetTables = details.target_tables || [];
   const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
   return `
@@ -763,13 +798,26 @@ function renderNormalize(run) {
         <div class="metric-grid">
           ${metricCard("Status", details.status || normalize.status || "pending")}
           ${metricCard("Findings", formatNumber((details.table_findings || []).length))}
+          ${metricCard("1NF warnings", formatNumber(firstNormalFormDetails.finding_count || firstNormalFormFindings.length || 0))}
           ${metricCard("Dependencies", formatNumber((details.functional_dependencies || []).length))}
           ${metricCard("Target tables", formatNumber(targetTables.length))}
           ${metricCard("Target columns", formatNumber(targetColumns))}
           ${metricCard("DDL statements", formatNumber((details.sql_statements || []).length))}
         </div>
         <p class="summary-text">${escapeHtml(details.summary || "No normalization result yet.")}</p>
-        ${renderStepCards(run, ["propose_3nf_schema"])}
+        ${firstNormalFormFindings.length ? `
+          <div class="candidate-list">
+            ${firstNormalFormFindings.map((finding) => `
+              <article class="candidate-card">
+                <strong>${escapeHtml(`${finding.table || ""}.${finding.column || ""}`)}</strong>
+                <span>${escapeHtml(`${finding.pattern || "1NF warning"} | confidence ${finding.confidence ?? "n/a"}`)}</span>
+                <p>${escapeHtml(finding.summary || "")}</p>
+              </article>
+            `).join("")}
+          </div>
+        ` : ""}
+        ${rawSqlBlock("Raw CREATE TABLE SQL", details.sql_statements || [], step(run, "create_target_schema").details?.sql_path || "")}
+        ${renderStepCards(run, ["scan_first_normal_form", "propose_3nf_schema"])}
       </article>
     </section>
   `;
@@ -778,12 +826,17 @@ function renderNormalize(run) {
 function renderMigrate(run, targetProfile) {
   const targetActionHtml = targetActions(run, targetProfile);
   const targetName = selectedTargetDatabase(run) || "target database";
+  const createStep = step(run, "create_target_schema");
+  const migrateStep = step(run, "migrate_data");
+  const migrationSql = (migrateStep.details?.statements || []).map((statement) => statement.sql);
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
         <article class="workspace-panel">
           <h2>Target Database</h2>
           ${renderStepCards(run, ["create_target_schema", "migrate_data"])}
+          ${rawSqlBlock("Raw CREATE TABLE SQL", createStep.details?.sql_statements || [], createStep.details?.sql_path || "")}
+          ${rawSqlBlock("Raw INSERT ... SELECT SQL", migrationSql, migrateStep.details?.sql_path || "")}
         </article>
         <article class="workspace-panel">
           <h2>${escapeHtml(targetName)} Actions</h2>
@@ -799,6 +852,7 @@ function renderWorkload(run, artifacts) {
   const rewrite = step(run, "rewrite_queries");
   const summaryTables = step(run, "suggest_summary_tables");
   const candidates = summaryTables.details?.candidates || [];
+  const rewrittenStatements = rewrite.details?.statements || [];
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
@@ -811,6 +865,7 @@ function renderWorkload(run, artifacts) {
             ${metricCard("Rewrite statements", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
           </div>
           ${renderStepCards(run, ["extract_workload_logs", "rewrite_queries"])}
+          ${rawSqlBlock(`Raw rewritten SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
         </article>
         <article class="workspace-panel">
           <h2>Summary Tables</h2>
@@ -852,6 +907,7 @@ function renderPhysical(run) {
           </div>
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("create-secondary-indexes")).join("")}</div>
           ${renderStepCards(run, ["optimize_indexes", "create_secondary_indexes"])}
+          ${rawSqlBlock("Raw CREATE INDEX SQL", indexSql)}
         </article>
         <article class="workspace-panel">
           <h2>PostgreSQL Tuning</h2>
@@ -1107,7 +1163,8 @@ async function triggerRunAction(runId, action) {
   const labels = {
     "create-schema": `Creating ${targetName} schema...`,
     "repair-schema": "Repairing schema SQL...",
-    "reset-target-db": `Resetting ${targetName}...`,
+    "reset-target-db": `Dropping ${targetName}...`,
+    "truncate-target-data": `Truncating ${targetName} data...`,
     "migrate-data": "Migrating data...",
     "regenerate-rewrite": "Regenerating workload...",
     "create-secondary-indexes": "Creating secondary indexes...",

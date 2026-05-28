@@ -29,7 +29,12 @@ class SchemaTransformer:
         self._llm = llm
         self._target_database = target_database
 
-    def analyze(self, schema: SchemaSnapshot) -> NormalizationProposal:
+    def analyze(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict] | None = None,
+    ) -> NormalizationProposal:
+        first_normal_form_findings = first_normal_form_findings or []
         if not schema.tables:
             return NormalizationProposal(
                 status="no_tables",
@@ -39,21 +44,28 @@ class SchemaTransformer:
         if self._llm is not None:
             try:
                 llm_result = self._llm.generate(
-                    self._build_messages(schema),
+                    self._build_messages(schema, first_normal_form_findings),
                     max_tokens=1800,
                 )
                 proposal = self._proposal_from_llm_response(schema, llm_result.response_text)
                 proposal.raw_response_text = llm_result.response_text
+                if first_normal_form_findings and not proposal.target_tables:
+                    fallback = self._first_normal_form_decomposition(schema, first_normal_form_findings)
+                    if fallback is not None:
+                        fallback.raw_response_text = llm_result.response_text
+                        fallback.rationale.insert(0, "LLM returned no target tables despite deterministic 1NF warnings.")
+                        fallback.source = "deterministic_1nf_fallback_after_llm"
+                        return fallback
                 return proposal
             except Exception as exc:
-                fallback = self._metadata_fallback(schema)
+                fallback = self._metadata_fallback(schema, first_normal_form_findings)
                 fallback.summary = (
                     "LLM normalization proposal could not be validated, so IlvesBench fell back to metadata-only analysis."
                 )
                 fallback.rationale.insert(0, f"LLM proposal fallback reason: {exc}")
                 return fallback
 
-        return self._metadata_fallback(schema)
+        return self._metadata_fallback(schema, first_normal_form_findings)
 
     def repair(
         self,
@@ -114,10 +126,18 @@ class SchemaTransformer:
             source="llm",
         )
 
-    def _metadata_fallback(self, schema: SchemaSnapshot) -> NormalizationProposal:
-        return self._metadata_only_pass(schema)
+    def _metadata_fallback(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict] | None = None,
+    ) -> NormalizationProposal:
+        return self._metadata_only_pass(schema, first_normal_form_findings or [])
 
-    def _metadata_only_pass(self, schema: SchemaSnapshot) -> NormalizationProposal:
+    def _metadata_only_pass(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+    ) -> NormalizationProposal:
         """Metadata-only first pass. This is intentionally conservative."""
 
         findings: list[str] = []
@@ -155,16 +175,38 @@ class SchemaTransformer:
 
         findings.extend(repeating_groups)
         findings.extend(descriptor_overlap)
+        findings.extend(
+            str(item.get("summary", ""))
+            for item in first_normal_form_findings
+            if str(item.get("summary", "")).strip()
+        )
 
         if findings:
+            first_normal_form_decomposition = self._first_normal_form_decomposition(schema, first_normal_form_findings)
+            if first_normal_form_decomposition is not None:
+                first_normal_form_decomposition.table_findings = findings
+                return first_normal_form_decomposition
+
             return NormalizationProposal(
                 status="candidate_normalization",
-                summary="Metadata suggests at least one table may benefit from normalization review.",
+                summary="Schema metadata or sampled data suggests at least one table may benefit from normalization review.",
                 rationale=[
                     f"Analyzed {len(schema.tables)} tables using schema metadata only.",
-                    "This is a heuristic pass; confirming real 3NF violations still needs data- or workload-aware review.",
+                    "This is a heuristic pass; confirming real normal-form violations still needs data- or workload-aware review.",
                 ],
                 table_findings=findings,
+                functional_dependencies=[
+                    {
+                        "table": str(item.get("table", "")),
+                        "determinant": [str(item.get("column", ""))],
+                        "dependent": [str(item.get("column", ""))],
+                        "confidence": "medium" if float(item.get("confidence", 0.0) or 0.0) >= 0.65 else "low",
+                        "reason": str(item.get("summary", "")),
+                        "normal_form": "1NF",
+                    }
+                    for item in first_normal_form_findings
+                    if str(item.get("column", "")).strip()
+                ],
                 source="metadata_fallback",
             )
 
@@ -190,7 +232,11 @@ class SchemaTransformer:
             source="metadata_fallback",
         )
 
-    def _build_messages(self, schema: SchemaSnapshot) -> list[dict[str, str]]:
+    def _build_messages(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+    ) -> list[dict[str, str]]:
         schema_payload = {
             "database": schema.database,
             "target_database": self._target_database,
@@ -226,7 +272,7 @@ class SchemaTransformer:
         )
         user_prompt = (
             "Analyze the PostgreSQL schema package below. "
-            "If the schema appears already in 3NF or there is not enough evidence, say so. "
+            "If the schema appears already in 1NF/3NF or there is not enough evidence, say so. "
             "If normalization is appropriate, propose a decomposition into target tables.\n\n"
             "Rules:\n"
             "1. Use only source columns that already exist in the schema package.\n"
@@ -234,8 +280,11 @@ class SchemaTransformer:
             "3. Preserve source data types by default. Do not change a column's effective data type unless absolutely necessary.\n"
             "4. Foreign-key columns must stay type-compatible with the referenced target columns.\n"
             "5. Keep the proposal deterministic and practical for SQL generation.\n"
-            "6. Be explicit about candidate functional dependencies and confidence.\n"
+            "6. Be explicit about candidate functional dependencies, 1NF warnings, and confidence.\n"
             "7. Prefer concise table names in snake_case.\n\n"
+            "8. Treat deterministic 1NF findings as evidence that a column may contain repeated values inside a single cell. "
+            "For delimited multi-value columns, prefer a child relation with the parent key plus one extracted value per row. "
+            "When a candidate reference is supplied, use it as a likely foreign-key target if type-compatible.\n\n"
             "Return JSON with this shape:\n"
             "{\n"
             '  "assessment": {\n'
@@ -278,7 +327,8 @@ class SchemaTransformer:
             "  ],\n"
             '  "decomposition_summary": "e.g. normalized from 2 tables to 4 tables"\n'
             "}\n\n"
-            f"Schema package:\n{json.dumps(schema_payload, ensure_ascii=True, indent=2)}"
+            f"Schema package:\n{json.dumps(schema_payload, ensure_ascii=True, indent=2)}\n\n"
+            f"Deterministic 1NF findings from sampled data:\n{json.dumps(first_normal_form_findings, ensure_ascii=True, indent=2)}"
         )
         return [
             {"role": "system", "content": system_prompt},
@@ -487,6 +537,191 @@ class SchemaTransformer:
         self._validate_type_preservation(schema, target_tables, known_columns)
         return target_tables
 
+    def _first_normal_form_decomposition(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+    ) -> NormalizationProposal | None:
+        split_findings = [
+            finding
+            for finding in first_normal_form_findings
+            if finding.get("pattern") == "delimited_multi_value_column"
+            and finding.get("table")
+            and finding.get("column")
+            and finding.get("evidence", {}).get("delimiter")
+        ]
+        if not split_findings:
+            return None
+
+        source_tables = {f"{table.schema}.{table.name}": table for table in schema.tables}
+        table_name_map = self._target_table_name_map(schema.tables)
+        split_columns_by_table: dict[str, set[str]] = {}
+        for finding in split_findings:
+            split_columns_by_table.setdefault(str(finding["table"]), set()).add(str(finding["column"]))
+
+        target_tables: list[dict] = []
+        declared_primary_keys: dict[str, list[str]] = {}
+        for source_table_name, table in source_tables.items():
+            excluded_columns = split_columns_by_table.get(source_table_name, set())
+            columns = [
+                {
+                    "source_table": source_table_name,
+                    "source_column": column.name,
+                    "name": self._sanitize_identifier(column.name),
+                }
+                for column in table.columns
+                if column.name not in excluded_columns
+            ]
+            if not columns:
+                continue
+            valid_column_names = {column["name"] for column in columns}
+            primary_key = self._first_unique_constraint(table, valid_column_names)
+            if primary_key:
+                declared_primary_keys[source_table_name] = primary_key
+            uniques = [
+                self._sanitize_identifier_list(constraint.columns)
+                for constraint in table.unique_constraints[1:]
+            ]
+            target_tables.append(
+                {
+                    "name": table_name_map[source_table_name],
+                    "purpose": f"Copied from {source_table_name}, excluding detected multi-value columns.",
+                    "source_tables": [source_table_name],
+                    "columns": columns,
+                    "primary_key": primary_key,
+                    "uniques": [
+                        unique
+                        for unique in uniques
+                        if unique and set(unique).issubset(valid_column_names) and unique != primary_key
+                    ],
+                    "foreign_keys": [],
+                    "migration_strategy": "copy_distinct",
+                }
+            )
+
+        for index, finding in enumerate(split_findings, start=1):
+            source_table_name = str(finding["table"])
+            source_column_name = str(finding["column"])
+            source_table = source_tables.get(source_table_name)
+            if source_table is None:
+                continue
+            source_target_name = table_name_map.get(source_table_name)
+            parent_key = self._parent_key_columns(source_table)
+            if not source_target_name or not parent_key:
+                continue
+
+            evidence = finding.get("evidence", {})
+            candidate_reference = finding.get("candidate_reference") or {}
+            reference_table_name = str(candidate_reference.get("table", "")).strip()
+            reference_column_name = str(candidate_reference.get("column", "")).strip()
+            value_column_name = (
+                self._sanitize_identifier(reference_column_name)
+                if reference_column_name
+                else self._singular_identifier(source_column_name)
+            )
+            if not value_column_name:
+                value_column_name = "value"
+
+            child_table_name = self._unique_target_name(
+                f"{source_target_name}_{self._sanitize_identifier(source_column_name)}",
+                {table["name"] for table in target_tables},
+            )
+            columns = [
+                {
+                    "source_table": source_table_name,
+                    "source_column": column_name,
+                    "name": self._sanitize_identifier(column_name),
+                }
+                for column_name in parent_key
+            ]
+            columns.append(
+                {
+                    "source_table": source_table_name,
+                    "source_column": source_column_name,
+                    "name": value_column_name,
+                }
+            )
+            foreign_keys = []
+            sanitized_parent_key = [self._sanitize_identifier(column_name) for column_name in parent_key]
+            if declared_primary_keys.get(source_table_name) == sanitized_parent_key:
+                foreign_keys.append(
+                    {
+                        "columns": sanitized_parent_key,
+                        "references_table": source_target_name,
+                        "references_columns": sanitized_parent_key,
+                    }
+                )
+            referenced_target_name = table_name_map.get(reference_table_name)
+            if (
+                referenced_target_name
+                and reference_column_name
+                and self._target_has_unique_columns(
+                    target_tables,
+                    referenced_target_name,
+                    [self._sanitize_identifier(reference_column_name)],
+                )
+            ):
+                foreign_keys.append(
+                    {
+                        "columns": [value_column_name],
+                        "references_table": referenced_target_name,
+                        "references_columns": [self._sanitize_identifier(reference_column_name)],
+                    }
+                )
+
+            target_tables.append(
+                {
+                    "name": child_table_name,
+                    "purpose": f"One row per value extracted from {source_table_name}.{source_column_name}.",
+                    "source_tables": [source_table_name],
+                    "columns": columns,
+                    "primary_key": [self._sanitize_identifier(column_name) for column_name in parent_key] + [value_column_name],
+                    "uniques": [],
+                    "foreign_keys": foreign_keys,
+                    "migration_strategy": "split_delimited",
+                    "split_source_column": source_column_name,
+                    "split_value_column": value_column_name,
+                    "split_delimiter": str(evidence.get("delimiter", ",")),
+                    "normal_form_finding_index": index,
+                }
+            )
+
+        if not target_tables:
+            return None
+        sql_statements = self._generate_sql(target_tables, schema)
+        finding_summaries = [
+            str(finding.get("summary", ""))
+            for finding in split_findings
+            if str(finding.get("summary", "")).strip()
+        ]
+        return NormalizationProposal(
+            status="candidate_normalization",
+            summary=(
+                f"Generated deterministic 1NF decomposition with {len(target_tables)} target table(s), "
+                f"including {len(split_findings)} child table(s) for delimited multi-value columns."
+            ),
+            target_database=self._target_database,
+            rationale=[
+                "Generated a conservative schema path from deterministic 1NF warning findings.",
+                "Original tables are copied with detected multi-value columns removed; child tables hold one extracted value per row.",
+            ],
+            table_findings=finding_summaries,
+            functional_dependencies=[
+                {
+                    "table": str(finding.get("table", "")),
+                    "determinant": [str(finding.get("column", ""))],
+                    "dependent": [str(finding.get("column", ""))],
+                    "confidence": "medium" if float(finding.get("confidence", 0.0) or 0.0) >= 0.65 else "low",
+                    "reason": str(finding.get("summary", "")),
+                    "normal_form": "1NF",
+                }
+                for finding in split_findings
+            ],
+            target_tables=target_tables,
+            sql_statements=sql_statements,
+            source="deterministic_1nf_fallback",
+        )
+
     def _generate_sql(self, target_tables: list[dict], schema: SchemaSnapshot) -> list[str]:
         if not target_tables:
             return []
@@ -549,6 +784,67 @@ class SchemaTransformer:
 
     def _sanitize_identifier_list(self, items: list) -> list[str]:
         return [identifier for identifier in (self._sanitize_identifier(str(item)) for item in items) if identifier]
+
+    def _target_table_name_map(self, tables) -> dict[str, str]:
+        raw_names = [table.name for table in tables]
+        duplicate_names = {name for name in raw_names if raw_names.count(name) > 1}
+        used: set[str] = set()
+        result: dict[str, str] = {}
+        for table in tables:
+            source_table_name = f"{table.schema}.{table.name}"
+            base_name = f"{table.schema}_{table.name}" if table.name in duplicate_names else table.name
+            result[source_table_name] = self._unique_target_name(base_name, used)
+        return result
+
+    def _unique_target_name(self, value: str, used: set[str]) -> str:
+        base = self._sanitize_identifier(value)[:58] or "table"
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            suffix_text = f"_{suffix}"
+            candidate = f"{base[:63 - len(suffix_text)]}{suffix_text}"
+            suffix += 1
+        used.add(candidate)
+        return candidate
+
+    def _first_unique_constraint(self, table, valid_column_names: set[str]) -> list[str]:
+        for constraint in table.unique_constraints:
+            columns = self._sanitize_identifier_list(constraint.columns)
+            if columns and set(columns).issubset(valid_column_names):
+                return columns
+        return []
+
+    def _parent_key_columns(self, table) -> list[str]:
+        for constraint in table.unique_constraints:
+            if constraint.columns:
+                return list(constraint.columns)
+        likely_columns = [
+            column.name
+            for column in table.columns
+            if re.search(r"(^id$|_id$|const$|code$|key$)", column.name, re.IGNORECASE)
+        ]
+        if likely_columns:
+            return [likely_columns[0]]
+        if table.columns:
+            return [table.columns[0].name]
+        return []
+
+    def _singular_identifier(self, value: str) -> str:
+        identifier = self._sanitize_identifier(value)
+        if identifier.endswith("ies") and len(identifier) > 3:
+            return identifier[:-3] + "y"
+        if identifier.endswith("s") and len(identifier) > 1:
+            return identifier[:-1]
+        return identifier
+
+    def _target_has_unique_columns(self, target_tables: list[dict], table_name: str, columns: list[str]) -> bool:
+        for table in target_tables:
+            if table.get("name") != table_name:
+                continue
+            if table.get("primary_key") == columns:
+                return True
+            return any(unique == columns for unique in table.get("uniques", []))
+        return False
 
     def _validate_type_preservation(
         self,
