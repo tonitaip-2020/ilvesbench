@@ -21,11 +21,27 @@ class IlvesBenchServer(ThreadingHTTPServer):
         self.config_path = str(Path(config_path).resolve())
         self.orchestrator = PipelineOrchestrator(self._load_config(config_path))
 
-    def reload_config(self, config_path: str, workload_path: str | None = None) -> None:
+    def reload_config(
+        self,
+        config_path: str,
+        workload_path: str | None = None,
+        original_database: str | None = None,
+        new_database: str | None = None,
+        schemas: list[str] | str | None = None,
+    ) -> None:
         self.config_path = str(Path(config_path).resolve())
         config = self._load_config(config_path)
         if workload_path is not None:
             config.workload.path = workload_path.strip() or None
+        if original_database is not None and original_database.strip():
+            config.postgres.original_database = original_database.strip()
+        if new_database is not None and new_database.strip():
+            config.postgres.new_database = new_database.strip()
+        if schemas is not None:
+            schema_values = schemas.split(",") if isinstance(schemas, str) else schemas
+            selected_schemas = [schema.strip() for schema in schema_values if schema.strip()]
+            if selected_schemas:
+                config.postgres.schemas = selected_schemas
         self.orchestrator = PipelineOrchestrator(config)
 
     def _load_config(self, config_path: str) -> IlvesBenchConfig:
@@ -84,8 +100,13 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         if parsed.path == "/api/runs":
             config_path = body.get("config_path", self.server.config_path)
-            workload_path = body.get("workload_path")
-            self.server.reload_config(config_path, workload_path=workload_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
             record = self.server.orchestrator.create_mvp_record()
             thread = threading.Thread(
                 target=self.server.orchestrator.execute_mvp_collection,
@@ -196,17 +217,39 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             result = self.server.orchestrator.test_llm()
             self._send_json(result)
             return
+        if parsed.path == "/api/postgres/discover":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
+            result = self.server.orchestrator.discover_postgres_databases()
+            self._send_json(result)
+            return
         if parsed.path == "/api/postgres/status":
             config_path = body.get("config_path", self.server.config_path)
-            workload_path = body.get("workload_path")
-            self.server.reload_config(config_path, workload_path=workload_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
             result = self.server.orchestrator.check_postgres_connection()
             self._send_json(result)
             return
         if parsed.path == "/api/postgres/profile":
             config_path = body.get("config_path", self.server.config_path)
-            workload_path = body.get("workload_path")
-            self.server.reload_config(config_path, workload_path=workload_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
             profiles = self.server.orchestrator.profile_databases()
             self._send_json({"status": "ok", "profiles": profiles})
             return

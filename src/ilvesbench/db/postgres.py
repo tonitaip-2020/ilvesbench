@@ -31,6 +31,54 @@ class PostgresInspector:
     def __init__(self, config: PostgresConfig) -> None:
         self._config = config
 
+    def discover_databases(self) -> list[dict]:
+        conn = self._connect(self._config.admin_database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        d.datname AS name,
+                        pg_catalog.pg_get_userbyid(d.datdba) AS owner,
+                        pg_database_size(d.datname) AS size_bytes,
+                        has_database_privilege(d.datname, 'CONNECT') AS can_connect
+                    FROM pg_database AS d
+                    WHERE d.datistemplate = false
+                      AND d.datallowconn = true
+                      AND d.datname <> 'postgres'
+                    ORDER BY d.datname
+                    """
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+        databases: list[dict] = []
+        for row in rows:
+            name = str(row.get("name", ""))
+            table_count: int | None = None
+            schema_names: list[str] = []
+            connect_error = ""
+            if row.get("can_connect"):
+                try:
+                    table_count, schema_names = self._discover_database_shape(name)
+                except Exception as exc:
+                    connect_error = str(exc)
+            databases.append(
+                {
+                    "name": name,
+                    "owner": row.get("owner"),
+                    "size_bytes": row.get("size_bytes"),
+                    "can_connect": bool(row.get("can_connect")) and not connect_error,
+                    "table_count": table_count,
+                    "schemas": schema_names,
+                    "error": connect_error,
+                    "is_current_original": name == self._config.original_database,
+                    "is_current_target": name == self._config.new_database,
+                }
+            )
+        return databases
+
     def check_connection_status(self) -> dict:
         checks = [
             self._check_database_connection(self._config.original_database, "source database"),
@@ -72,6 +120,34 @@ class PostgresInspector:
         finally:
             conn.close()
 
+    def _discover_database_shape(self, database: str) -> tuple[int, list[str]]:
+        conn = self._connect(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) AS table_count
+                    FROM information_schema.tables
+                    WHERE table_type = 'BASE TABLE'
+                      AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                      AND table_schema NOT LIKE 'pg_%'
+                    """
+                )
+                table_row = cur.fetchone()
+                cur.execute(
+                    """
+                    SELECT schema_name
+                    FROM information_schema.schemata
+                    WHERE schema_name NOT IN ('information_schema', 'pg_catalog')
+                      AND schema_name NOT LIKE 'pg_%'
+                    ORDER BY schema_name
+                    """
+                )
+                schemas = [str(row["schema_name"]) for row in cur.fetchall()]
+        finally:
+            conn.close()
+        return int(table_row["table_count"] or 0) if table_row else 0, schemas
+
     def _check_database_connection(self, database: str, label: str) -> dict:
         try:
             conn = self._connect(database)
@@ -105,7 +181,7 @@ class PostgresInspector:
                 "can_connect": bool(row["can_connect"]),
                 "can_create_database": bool(row["can_create_database"]),
                 "hint": "" if bool(row["can_create_database"]) or database != self._config.admin_database else (
-                    "The configured user can connect, but may not be able to create db-new. "
+                    f"The configured user can connect, but may not be able to create {self._config.new_database}. "
                     "Grant CREATEDB, use a superuser/admin role, or pre-create the target database."
                 ),
             }
@@ -397,7 +473,10 @@ class PostgresInspector:
         if "database" in normalized and "does not exist" in normalized:
             return "Check original_database/admin_database in the TOML file, or create the missing PostgreSQL database."
         if "permission denied" in normalized or "insufficient privilege" in normalized or "must be owner" in normalized:
-            return "Check PostgreSQL role privileges. The configured user needs read access to db-original and permission for approved db-new actions."
+            return (
+                "Check PostgreSQL role privileges. The configured user needs read access to "
+                f"{self._config.original_database} and permission for approved {self._config.new_database} actions."
+            )
         return "Check the PostgreSQL settings in the TOML file, Docker port mapping, pg_hba.conf, and role permissions."
 
     def _load_tables(self, conn) -> list[dict]:

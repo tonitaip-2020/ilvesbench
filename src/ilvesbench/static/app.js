@@ -2,6 +2,10 @@ const statusBox = document.getElementById("statusBox");
 const runsContainer = document.getElementById("runs");
 const configPathInput = document.getElementById("configPath");
 const workloadPathInput = document.getElementById("workloadPath");
+const originalDatabaseSelect = document.getElementById("originalDatabase");
+const newDatabaseInput = document.getElementById("newDatabase");
+const schemasInput = document.getElementById("schemas");
+const dbSelectionStatus = document.getElementById("dbSelectionStatus");
 const postgresStatusBox = document.getElementById("postgresStatus");
 
 let activePoll = null;
@@ -9,6 +13,11 @@ let activeTab = "setup";
 let latestProfiles = null;
 let latestLlmStatus = null;
 let latestPostgresStatus = null;
+let discoveredDatabases = [];
+let lastAutoTargetDatabase = newDatabaseInput.value.trim();
+let profileLoading = false;
+let profileError = "";
+let latestProfilesContext = "";
 
 const WORKSPACE_TABS = [
   { id: "setup", label: "Setup", steps: ["llm_gateway", "inspect_source_schema", "extract_workload_logs"] },
@@ -36,6 +45,78 @@ async function api(path, options = {}) {
 function setStatus(message, isError = false) {
   statusBox.textContent = message;
   statusBox.dataset.error = isError ? "true" : "false";
+}
+
+function selectedSchemas() {
+  return schemasInput.value
+    .split(",")
+    .map((schema) => schema.trim())
+    .filter(Boolean);
+}
+
+function requestContext() {
+  return {
+    config_path: configPathInput.value.trim(),
+    workload_path: workloadPathInput.value.trim(),
+    original_database: originalDatabaseSelect.value.trim(),
+    new_database: newDatabaseInput.value.trim(),
+    schemas: selectedSchemas(),
+  };
+}
+
+function requestContextKey() {
+  const context = requestContext();
+  return JSON.stringify({
+    config_path: context.config_path,
+    original_database: context.original_database,
+    new_database: context.new_database,
+    schemas: context.schemas,
+  });
+}
+
+function selectedOriginalDatabase(run = null) {
+  return originalDatabaseSelect.value.trim() || latestPostgresStatus?.original_database || run?.summary?.original_database || "";
+}
+
+function selectedTargetDatabase(run = null) {
+  return newDatabaseInput.value.trim() || latestPostgresStatus?.new_database || run?.summary?.new_database || "";
+}
+
+function runMatchesSelection(run) {
+  if (!run || !run.summary) return false;
+  return run.summary.original_database === selectedOriginalDatabase()
+    && run.summary.new_database === selectedTargetDatabase();
+}
+
+function selectionOnlyRun(sourceRun = null) {
+  return {
+    run_id: "",
+    created_at: "",
+    updated_at: "",
+    status: profileLoading ? "running" : "pending",
+    config_path: configPathInput.value.trim(),
+    summary: {
+      original_database: selectedOriginalDatabase(),
+      new_database: selectedTargetDatabase(),
+    },
+    steps: [],
+    artifacts: {},
+    selectionOnly: true,
+    previousRunId: sourceRun?.run_id || "",
+  };
+}
+
+function updateDatabaseSelectionStatus() {
+  const source = originalDatabaseSelect.value.trim() || "not selected";
+  const target = newDatabaseInput.value.trim() || "not selected";
+  const schemas = selectedSchemas();
+  dbSelectionStatus.innerHTML = `
+    <strong>Chosen source database:</strong> ${escapeHtml(source)}
+    <span aria-hidden="true"> | </span>
+    <strong>Target database:</strong> ${escapeHtml(target)}
+    <span aria-hidden="true"> | </span>
+    <strong>Schemas:</strong> ${escapeHtml(schemas.length ? schemas.join(", ") : "config default")}
+  `;
 }
 
 function escapeHtml(value) {
@@ -234,7 +315,7 @@ function targetProfileFromRun(run) {
   const targetTables = normalizeStep.details?.target_tables || [];
   const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
   return {
-    database: run.summary?.new_database || "",
+    database: selectedTargetDatabase(run) || "",
     status: createStep.status === "completed" ? "completed" : "missing",
     summary: createStep.status === "completed"
       ? `${targetTables.length} proposed tables, ${targetColumns} proposed columns.`
@@ -252,6 +333,44 @@ function targetProfileFromRun(run) {
       { label: "Schema created", value: createStep.status === "completed" ? "yes" : "no", severity: createStep.status === "completed" ? "ok" : "warning" },
       { label: "Data migrated", value: migrateStep.status === "completed" ? "yes" : "no", severity: migrateStep.status === "completed" ? "ok" : "warning" },
     ],
+  };
+}
+
+function pendingProfile(database, kind) {
+  if (profileLoading) {
+    return {
+      database,
+      status: "running",
+      summary: `Profiling ${database} from PostgreSQL...`,
+      counts: {},
+      clusters: [],
+      risk_signals: [
+        { label: "Profile", value: "running", severity: "info" },
+      ],
+      storage: {},
+    };
+  }
+  if (profileError) {
+    return {
+      database,
+      status: "unavailable",
+      summary: profileError,
+      counts: {},
+      clusters: [],
+      risk_signals: [
+        { label: "Profile", value: "failed", severity: "warning" },
+      ],
+      storage: {},
+    };
+  }
+  return {
+    database,
+    status: kind === "target" ? "missing" : "pending",
+    summary: kind === "target" ? `${database} has not been created or profiled yet.` : `${database} has not been profiled yet.`,
+    counts: {},
+    clusters: [],
+    risk_signals: [],
+    storage: {},
   };
 }
 
@@ -301,7 +420,7 @@ function renderDatabasePair(run, sourceProfile, targetProfile) {
       <article class="bridge-state">
         <span class="label">Flow</span>
         ${pill(`source workload ${originalFigure.workloadStatus}`, originalFigure.workloadReady ? "completed" : "planned")}
-        ${pill(`db-new workload ${targetFigure.workloadStatus}`, targetFigure.workloadReady ? "completed" : "planned")}
+        ${pill(`${targetFigure.database} workload ${targetFigure.workloadStatus}`, targetFigure.workloadReady ? "completed" : "planned")}
       </article>
       ${renderDatabaseFigure(targetFigure)}
     </section>
@@ -310,6 +429,8 @@ function renderDatabasePair(run, sourceProfile, targetProfile) {
 
 function databaseFigure(kind, run, profile) {
   const counts = profile.counts || {};
+  const sourceName = selectedOriginalDatabase(run) || profile.database || "source database";
+  const targetName = selectedTargetDatabase(run) || profile.database || "target database";
   const createStep = step(run, "create_target_schema");
   const migrateStep = step(run, "migrate_data");
   const rewriteStep = step(run, "rewrite_queries");
@@ -320,9 +441,11 @@ function databaseFigure(kind, run, profile) {
   const newBench = step(run, "run_pgbench_new");
   const readiness = targetReadiness(run, profile);
   const exists = profile.status === "completed";
+  const profiling = profile.status === "running";
   const hasRows = readiness.hasRows;
-  const sourceWorkloadReady = workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0;
-  const targetWorkloadReady = rewriteStep.status === "completed" && Boolean(rewriteStep.details?.workload_path);
+  const hasMatchingRun = !run.selectionOnly;
+  const sourceWorkloadReady = hasMatchingRun && workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0;
+  const targetWorkloadReady = hasMatchingRun && rewriteStep.status === "completed" && Boolean(rewriteStep.details?.workload_path);
   const noIndexWorkNeeded = indexStep.status === "completed" && Number(indexStep.details?.recommendation_count || 0) === 0;
   const targetIndexesReady = indexCreateStep.status === "completed" || noIndexWorkNeeded;
 
@@ -330,19 +453,19 @@ function databaseFigure(kind, run, profile) {
     const ready = exists && sourceWorkloadReady && Boolean(originalBench.details?.workload_path);
     return {
       kind,
-      title: "db-original",
-      database: run.summary?.original_database || profile.database || "source database",
-      headline: exists ? "Starting point is available" : "Starting point is missing",
+      title: "Source database",
+      database: sourceName,
+      headline: profiling ? `Profiling ${sourceName}` : exists ? `${sourceName} is available` : `${sourceName} is not profiled`,
       summary: profile.summary || "Source profile has not been collected yet.",
       ready,
       workloadReady: sourceWorkloadReady,
-      workloadStatus: sourceWorkloadReady ? "available" : "missing",
+      workloadStatus: sourceWorkloadReady ? "available" : hasMatchingRun ? "missing" : "needs run",
       actions: originalActions(run),
       items: [
-        { label: "Database", value: exists ? "exists" : "missing", status: exists ? "ok" : "missing" },
-        { label: "Data", value: hasRows ? `${formatNumber(counts.estimated_rows)} estimated rows` : "no rows observed", status: hasRows ? "ok" : "warning" },
-        { label: "Indexes", value: `${formatNumber(counts.indexes || 0)} found`, status: Number(counts.indexes || 0) > 0 ? "ok" : "warning" },
-        { label: "Workload", value: sourceWorkloadReady ? "available" : "missing", status: sourceWorkloadReady ? "ok" : "pending" },
+        { label: "Database", value: profiling ? "profiling" : exists ? "exists" : "not profiled", status: profiling ? "pending" : exists ? "ok" : "warning" },
+        { label: "Data", value: profiling ? "estimating..." : hasRows ? `${formatNumber(counts.estimated_rows)} estimated rows` : exists ? "no rows observed" : "unknown", status: profiling ? "pending" : hasRows ? "ok" : "warning" },
+        { label: "Indexes", value: profiling ? "counting..." : exists ? `${formatNumber(counts.indexes || 0)} found` : "unknown", status: profiling ? "pending" : Number(counts.indexes || 0) > 0 ? "ok" : "warning" },
+        { label: "Workload", value: sourceWorkloadReady ? "available" : hasMatchingRun ? "missing" : "start a run", status: sourceWorkloadReady ? "ok" : "pending" },
         { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
       ],
     };
@@ -351,20 +474,20 @@ function databaseFigure(kind, run, profile) {
   const ready = readiness.structureReady && readiness.dataReady && targetWorkloadReady && targetIndexesReady && Boolean(newBench.details?.workload_path);
   return {
     kind,
-    title: "db-new",
-    database: run.summary?.new_database || profile.database || "target database",
-    headline: exists ? "Target database exists" : "Target database not created",
+    title: "Target database",
+    database: targetName,
+    headline: profiling ? `Profiling ${targetName}` : exists ? `${targetName} exists` : `${targetName} not created`,
     summary: exists ? (profile.summary || "Target profile is available.") : "Structure, data, indexes, and workload will appear here as they are created.",
     ready,
     workloadReady: targetWorkloadReady,
-    workloadStatus: targetWorkloadReady ? "created" : "not created",
+    workloadStatus: targetWorkloadReady ? "created" : hasMatchingRun ? "not created" : "needs run",
     actions: targetActions(run, profile),
     items: [
-      { label: "Database", value: exists ? "exists" : "not created", status: exists ? "ok" : "missing" },
-      { label: "Structure", value: readiness.structureReady ? "created" : "not created", status: readiness.structureReady ? "ok" : "pending" },
-      { label: "Data", value: readiness.dataReady ? "populated" : "not populated", status: readiness.dataReady ? "ok" : "pending" },
+      { label: "Database", value: profiling ? "profiling" : exists ? "exists" : "not created", status: profiling ? "pending" : exists ? "ok" : "missing" },
+      { label: "Structure", value: profiling ? "checking..." : readiness.structureReady ? "created" : "not created", status: profiling ? "pending" : readiness.structureReady ? "ok" : "pending" },
+      { label: "Data", value: profiling ? "estimating..." : readiness.dataReady ? "populated" : "not populated", status: profiling ? "pending" : readiness.dataReady ? "ok" : "pending" },
       { label: "Indexes", value: targetIndexesReady ? "created" : indexCreateStep.status === "planned" ? "planned" : "not created", status: targetIndexesReady ? "ok" : "pending" },
-      { label: "Workload", value: targetWorkloadReady ? "created" : "not created", status: targetWorkloadReady ? "ok" : "pending" },
+      { label: "Workload", value: targetWorkloadReady ? "created" : hasMatchingRun ? "not created" : "start a run", status: targetWorkloadReady ? "ok" : "pending" },
       { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
     ],
   };
@@ -463,9 +586,10 @@ function renderRiskSignals(profile) {
 }
 
 function actionButton(run, action, label, tone = "", disabledReason = "") {
-  const disabled = disabledReason ? "disabled" : "";
-  const title = disabledReason ? ` title="${escapeHtml(disabledReason)}"` : "";
-  const reason = disabledReason ? `<small>${escapeHtml(disabledReason)}</small>` : "";
+  const effectiveReason = disabledReason || (!run.run_id ? "Start a run for this database pair first." : "");
+  const disabled = effectiveReason ? "disabled" : "";
+  const title = effectiveReason ? ` title="${escapeHtml(effectiveReason)}"` : "";
+  const reason = effectiveReason ? `<small>${escapeHtml(effectiveReason)}</small>` : "";
   return `
     <button class="action-button ${tone}" type="button" data-action="${escapeHtml(action)}" data-run-id="${escapeHtml(run.run_id)}" ${disabled}${title}>
       <span>${escapeHtml(label)}</span>
@@ -477,15 +601,19 @@ function actionButton(run, action, label, tone = "", disabledReason = "") {
 function originalActions(run) {
   const actions = [];
   const originalBench = step(run, "run_pgbench_original");
-  const disabledReason = originalBench.details?.workload_path
+  const sourceName = selectedOriginalDatabase(run) || "source database";
+  const disabledReason = run.selectionOnly
+    ? `Start a run for ${sourceName} first.`
+    : originalBench.details?.workload_path
     ? ""
     : "Needs a source workload before pgbench can run.";
-  actions.push(actionButton(run, "run-pgbench-original", "Run pgbench on db-original", "primary-approval", disabledReason));
+  actions.push(actionButton(run, "run-pgbench-original", `Run pgbench on ${sourceName}`, "primary-approval", disabledReason));
   return actions;
 }
 
 function targetActions(run, profile = latestProfiles?.target || {}) {
   const actions = [];
+  const targetName = selectedTargetDatabase(run) || "target database";
   const createStep = step(run, "create_target_schema");
   const migrateStep = step(run, "migrate_data");
   const rewriteStep = step(run, "rewrite_queries");
@@ -499,13 +627,14 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const indexSqlCount = secondaryIndexSqlStatements(run).length;
   const hasIndexSql = indexSqlCount > 0;
   const readiness = targetReadiness(run, profile);
+  const selectionOnlyReason = run.selectionOnly ? `Start a run for ${selectedOriginalDatabase(run) || "the selected source database"} first.` : "";
 
   actions.push(actionButton(
     run,
     "create-schema",
-    "Create db-new structure",
+    `Create ${targetName} structure`,
     "primary-approval",
-    readiness.structureReady ? "db-new structure already exists." : hasCreateSql && ["planned", "failed"].includes(createStep.status || "") ? "" : "Needs generated db-new DDL first.",
+    selectionOnlyReason || (readiness.structureReady ? `${targetName} structure already exists.` : hasCreateSql && ["planned", "failed"].includes(createStep.status || "") ? "" : `Needs generated DDL for ${targetName} first.`),
   ));
   if (createStep.status === "failed" && hasCreateSql) {
     actions.push(actionButton(run, "repair-schema", "Repair schema SQL"));
@@ -513,32 +642,32 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   actions.push(actionButton(
     run,
     "migrate-data",
-    "Populate db-new",
+    `Populate ${targetName}`,
     "primary-approval",
-    readiness.dataReady ? "db-new already appears populated." : !readiness.structureReady ? "Create db-new structure first." : hasMigrationSql && ["planned", "failed"].includes(migrateStep.status || "") ? "" : "No migration SQL is available.",
+    selectionOnlyReason || (readiness.dataReady ? `${targetName} already appears populated.` : !readiness.structureReady ? `Create ${targetName} structure first.` : hasMigrationSql && ["planned", "failed"].includes(migrateStep.status || "") ? "" : "No migration SQL is available."),
   ));
   actions.push(actionButton(
     run,
     "regenerate-rewrite",
-    "Generate db-new workload",
+    `Generate ${targetName} workload`,
     "",
-    normalizationStep.status === "completed" && workloadStep.status === "completed" && ["planned", "completed", "failed"].includes(rewriteStep.status || "") ? "" : "Needs normalization and source workload first.",
+    selectionOnlyReason || (normalizationStep.status === "completed" && workloadStep.status === "completed" && ["planned", "completed", "failed"].includes(rewriteStep.status || "") ? "" : "Needs normalization and source workload first."),
   ));
   actions.push(actionButton(
     run,
     "create-secondary-indexes",
     `Create secondary indexes${indexSqlCount ? ` (${indexSqlCount})` : ""}`,
     "primary-approval",
-    !readiness.structureReady ? "Create db-new structure first." : hasIndexSql && indexCreateStep.status !== "completed" ? "" : indexCreateStep.status === "completed" ? "Secondary indexes are already created or not needed." : indexRecommendStep.status === "completed" ? "No secondary-index SQL is available." : "Run or regenerate index recommendations first.",
+    selectionOnlyReason || (!readiness.structureReady ? `Create ${targetName} structure first.` : hasIndexSql && indexCreateStep.status !== "completed" ? "" : indexCreateStep.status === "completed" ? "Secondary indexes are already created or not needed." : indexRecommendStep.status === "completed" ? "No secondary-index SQL is available." : "Run or regenerate index recommendations first."),
   ));
   actions.push(actionButton(
     run,
     "run-pgbench-new",
-    "Run pgbench on db-new",
+    `Run pgbench on ${targetName}`,
     "primary-approval",
-    newBench.details?.workload_path && readiness.structureReady && readiness.dataReady && rewriteStep.status === "completed"
+    selectionOnlyReason || (newBench.details?.workload_path && readiness.structureReady && readiness.dataReady && rewriteStep.status === "completed"
       ? ""
-      : !readiness.structureReady ? "Needs db-new structure first." : !readiness.dataReady ? "Needs db-new data before benchmarking." : rewriteStep.status !== "completed" || !newBench.details?.workload_path ? "Needs generated db-new workload first." : "db-new benchmark is not ready.",
+      : !readiness.structureReady ? `Needs ${targetName} structure first.` : !readiness.dataReady ? `Needs ${targetName} data before benchmarking.` : rewriteStep.status !== "completed" || !newBench.details?.workload_path ? `Needs generated ${targetName} workload first.` : `${targetName} benchmark is not ready.`),
   ));
   return actions;
 }
@@ -598,18 +727,20 @@ function renderSetup(run, sourceProfile) {
 }
 
 function renderProfile(run, sourceProfile, targetProfile) {
+  const sourceName = selectedOriginalDatabase(run) || sourceProfile.database || "source database";
+  const targetName = selectedTargetDatabase(run) || targetProfile.database || "target database";
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
         <article class="workspace-panel">
-          <h2>db-original Profile</h2>
+          <h2>${escapeHtml(sourceName)} Profile</h2>
           ${renderProfileCards(sourceProfile)}
           ${renderRiskSignals(sourceProfile)}
           <h3>Clusters</h3>
           ${renderClusters(sourceProfile)}
         </article>
         <article class="workspace-panel">
-          <h2>db-new Profile</h2>
+          <h2>${escapeHtml(targetName)} Profile</h2>
           ${renderProfileCards(targetProfile)}
           ${renderRiskSignals(targetProfile)}
           <h3>Clusters</h3>
@@ -646,6 +777,7 @@ function renderNormalize(run) {
 
 function renderMigrate(run, targetProfile) {
   const targetActionHtml = targetActions(run, targetProfile);
+  const targetName = selectedTargetDatabase(run) || "target database";
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
@@ -654,8 +786,8 @@ function renderMigrate(run, targetProfile) {
           ${renderStepCards(run, ["create_target_schema", "migrate_data"])}
         </article>
         <article class="workspace-panel">
-          <h2>db-new Actions</h2>
-          ${targetActionHtml.length ? `<div class="action-shelf">${targetActionHtml.join("")}</div>` : `<div class="empty-inline">No db-new action is ready.</div>`}
+          <h2>${escapeHtml(targetName)} Actions</h2>
+          ${targetActionHtml.length ? `<div class="action-shelf">${targetActionHtml.join("")}</div>` : `<div class="empty-inline">No target-database action is ready.</div>`}
         </article>
       </div>
     </section>
@@ -737,11 +869,13 @@ function renderPhysical(run) {
 function renderBenchmark(run) {
   const original = step(run, "run_pgbench_original");
   const target = step(run, "run_pgbench_new");
+  const sourceName = selectedOriginalDatabase(run) || "source database";
+  const targetName = selectedTargetDatabase(run) || "target database";
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
         <article class="workspace-panel">
-          <h2>db-original</h2>
+          <h2>${escapeHtml(sourceName)}</h2>
           <div class="metric-grid">
             ${metricCard("TPS", original.details?.throughput_tps ?? "pending")}
             ${metricCard("Latency", original.details?.average_latency_ms ? `${original.details.average_latency_ms} ms` : "pending")}
@@ -750,7 +884,7 @@ function renderBenchmark(run) {
           ${renderStepCards(run, ["run_pgbench_original"])}
         </article>
         <article class="workspace-panel">
-          <h2>db-new</h2>
+          <h2>${escapeHtml(targetName)}</h2>
           <div class="metric-grid">
             ${metricCard("TPS", target.details?.throughput_tps ?? "pending")}
             ${metricCard("Latency", target.details?.average_latency_ms ? `${target.details.average_latency_ms} ms` : "pending")}
@@ -812,35 +946,79 @@ function renderPostgresStatus(payload) {
     </div>
     <div class="connection-target">
       <code>${escapeHtml(payload.user || "")}@${escapeHtml(payload.host || "")}:${escapeHtml(payload.port || "")}</code>
-      <code>${escapeHtml(payload.original_database || "")} -> ${escapeHtml(payload.new_database || "")}</code>
+      <code>source ${escapeHtml(payload.original_database || "")} -> target ${escapeHtml(payload.new_database || "")}</code>
     </div>
     ${payload.hint ? `<div class="connection-hint">${escapeHtml(payload.hint)}</div>` : ""}
     <div class="connection-checks">${checks}</div>
   `;
 }
 
-async function renderRuns(runs) {
-  if (!runs.length) {
-    runsContainer.innerHTML = '<div class="empty">No runs yet.</div>';
-    return;
-  }
+function renderDatabaseOptions(payload) {
+  discoveredDatabases = payload.databases || [];
+  const configuredSource = payload.original_database || originalDatabaseSelect.value.trim();
+  const currentSelection = originalDatabaseSelect.value.trim() || configuredSource;
+  const names = new Set(discoveredDatabases.map((database) => database.name));
+  if (configuredSource) names.add(configuredSource);
+  if (currentSelection) names.add(currentSelection);
 
-  const currentRun = runs[0];
-  const artifacts = await loadCurrentArtifacts(currentRun);
-  const sourceProfile = latestProfiles?.original?.status === "completed"
-    ? latestProfiles.original
-    : profileFromSchema(artifacts.inspect_source_schema);
-  const targetProfile = latestProfiles?.target?.status === "completed"
-    ? latestProfiles.target
-    : targetProfileFromRun(currentRun);
+  originalDatabaseSelect.innerHTML = [...names].sort().map((name) => {
+    const database = discoveredDatabases.find((item) => item.name === name) || {};
+    const tableLabel = database.table_count === null || database.table_count === undefined
+      ? ""
+      : ` (${formatNumber(database.table_count)} tables)`;
+    const disabled = database.can_connect === false ? " disabled" : "";
+    return `<option value="${escapeHtml(name)}"${name === currentSelection ? " selected" : ""}${disabled}>${escapeHtml(name + tableLabel)}</option>`;
+  }).join("");
+
+  if (!originalDatabaseSelect.value && configuredSource) {
+    originalDatabaseSelect.value = configuredSource;
+  }
+  if (!newDatabaseInput.value.trim() && payload.new_database) {
+    newDatabaseInput.value = payload.new_database;
+    lastAutoTargetDatabase = payload.new_database;
+  }
+  if (!schemasInput.value.trim() && (payload.schemas || []).length) {
+    schemasInput.value = payload.schemas.join(", ");
+  }
+  updateDatabaseSelectionStatus();
+}
+
+async function discoverDatabases() {
+  setStatus("Discovering PostgreSQL databases...");
+  const data = await api("/api/postgres/discover", {
+    method: "POST",
+    body: JSON.stringify(requestContext()),
+  });
+  renderDatabaseOptions(data);
+  setStatus(`Discovered ${formatNumber((data.databases || []).length)} database(s).`);
+}
+
+async function renderRuns(runs) {
+  const latestRun = runs[0] || null;
+  const currentRun = runMatchesSelection(latestRun) ? latestRun : selectionOnlyRun(latestRun);
+  const artifacts = latestRun && runMatchesSelection(latestRun) ? await loadCurrentArtifacts(latestRun) : {};
+  const sourceProfile = latestProfiles?.original
+    || (runMatchesSelection(latestRun) && artifacts.inspect_source_schema ? profileFromSchema(artifacts.inspect_source_schema) : null)
+    || pendingProfile(selectedOriginalDatabase(currentRun), "source");
+  const targetProfile = latestProfiles?.target
+    || (runMatchesSelection(latestRun) ? targetProfileFromRun(currentRun) : null)
+    || pendingProfile(selectedTargetDatabase(currentRun), "target");
+  const headerLabel = currentRun.selectionOnly ? "Selected database pair" : "Current run";
+  const headerTitle = currentRun.selectionOnly
+    ? `${selectedOriginalDatabase(currentRun) || "source"} -> ${selectedTargetDatabase(currentRun) || "target"}`
+    : currentRun.run_id;
+  const headerMeta = currentRun.selectionOnly
+    ? (latestRun ? `Latest saved run ${latestRun.run_id} uses a different database pair.` : "No run exists for this database pair yet.")
+    : currentRun.created_at;
 
   runsContainer.innerHTML = `
     <article class="workspace">
       <header class="workspace-head">
         <div>
-          <span class="label">Current run</span>
-          <strong>${escapeHtml(currentRun.run_id)}</strong>
-          <small>${escapeHtml(currentRun.created_at)}</small>
+          <span class="label">${escapeHtml(headerLabel)}</span>
+          <strong>${escapeHtml(headerTitle)}</strong>
+          <small>${escapeHtml(headerMeta)}</small>
+          <small>Source database: ${escapeHtml(selectedOriginalDatabase(currentRun) || "not selected")}</small>
         </div>
         ${pill((currentRun.status || "pending").replaceAll("_", " "), currentRun.status || "pending")}
       </header>
@@ -852,23 +1030,30 @@ async function renderRuns(runs) {
 }
 
 async function refreshRuns() {
-  if (!latestProfiles) {
+  const data = await api("/api/runs");
+  const runs = data.runs || [];
+  const contextKey = requestContextKey();
+  if (!latestProfiles || latestProfilesContext !== contextKey) {
+    profileLoading = true;
+    profileError = "";
+    await renderRuns(runs);
     try {
       const profileData = await api("/api/postgres/profile", {
         method: "POST",
-        body: JSON.stringify({
-          config_path: configPathInput.value.trim(),
-          workload_path: workloadPathInput.value.trim(),
-        }),
+        body: JSON.stringify(requestContext()),
       });
       latestProfiles = profileData.profiles;
+      latestProfilesContext = contextKey;
     } catch (error) {
       latestProfiles = null;
+      latestProfilesContext = "";
+      profileError = error.message;
+    } finally {
+      profileLoading = false;
     }
   }
-  const data = await api("/api/runs");
-  await renderRuns(data.runs || []);
-  return data.runs || [];
+  await renderRuns(runs);
+  return runs;
 }
 
 async function pollRun(runId) {
@@ -907,27 +1092,27 @@ async function pollRun(runId) {
 }
 
 async function startRun() {
-  const config_path = configPathInput.value.trim();
-  const workload_path = workloadPathInput.value.trim();
   setStatus("Starting collection run...");
   const data = await api("/api/runs", {
     method: "POST",
-    body: JSON.stringify({ config_path, workload_path }),
+    body: JSON.stringify(requestContext()),
   });
   setStatus(`Run ${data.run_id} accepted.`);
   await pollRun(data.run_id);
 }
 
 async function triggerRunAction(runId, action) {
+  const sourceName = selectedOriginalDatabase() || "source database";
+  const targetName = selectedTargetDatabase() || "target database";
   const labels = {
-    "create-schema": "Creating db-new schema...",
+    "create-schema": `Creating ${targetName} schema...`,
     "repair-schema": "Repairing schema SQL...",
-    "reset-target-db": "Resetting db-new...",
+    "reset-target-db": `Resetting ${targetName}...`,
     "migrate-data": "Migrating data...",
     "regenerate-rewrite": "Regenerating workload...",
     "create-secondary-indexes": "Creating secondary indexes...",
-    "run-pgbench-original": "Benchmarking db-original...",
-    "run-pgbench-new": "Benchmarking db-new...",
+    "run-pgbench-original": `Benchmarking ${sourceName}...`,
+    "run-pgbench-new": `Benchmarking ${targetName}...`,
   };
   setStatus(labels[action] || "Starting action...");
   const data = await api(`/api/runs/${runId}/actions/${action}`, {
@@ -963,19 +1148,18 @@ async function testLLM() {
 }
 
 async function checkPostgres() {
-  const config_path = configPathInput.value.trim();
-  const workload_path = workloadPathInput.value.trim();
   setStatus("Checking PostgreSQL...");
   const data = await api("/api/postgres/status", {
     method: "POST",
-    body: JSON.stringify({ config_path, workload_path }),
+    body: JSON.stringify(requestContext()),
   });
   latestPostgresStatus = data;
+  updateDatabaseSelectionStatus();
   renderPostgresStatus(data);
   try {
     const profileData = await api("/api/postgres/profile", {
       method: "POST",
-      body: JSON.stringify({ config_path, workload_path }),
+      body: JSON.stringify(requestContext()),
     });
     latestProfiles = profileData.profiles;
     await refreshRuns();
@@ -989,6 +1173,10 @@ document.getElementById("runButton").addEventListener("click", () => {
   startRun().catch((error) => setStatus(error.message, true));
 });
 
+document.getElementById("discoverButton").addEventListener("click", () => {
+  discoverDatabases().catch((error) => setStatus(error.message, true));
+});
+
 document.getElementById("llmButton").addEventListener("click", () => {
   testLLM().catch((error) => setStatus(error.message, true));
 });
@@ -999,6 +1187,44 @@ document.getElementById("postgresButton").addEventListener("click", () => {
 
 document.getElementById("refreshButton").addEventListener("click", () => {
   refreshRuns().catch((error) => setStatus(error.message, true));
+});
+
+originalDatabaseSelect.addEventListener("change", () => {
+  const source = originalDatabaseSelect.value.trim();
+  if (!newDatabaseInput.value.trim() || newDatabaseInput.value.trim() === lastAutoTargetDatabase) {
+    newDatabaseInput.value = source ? `${source}_new` : "";
+    lastAutoTargetDatabase = newDatabaseInput.value.trim();
+  }
+  latestProfiles = null;
+  latestProfilesContext = "";
+  latestPostgresStatus = null;
+  updateDatabaseSelectionStatus();
+  refreshRuns().catch((error) => setStatus(error.message, true));
+});
+
+newDatabaseInput.addEventListener("input", () => {
+  latestProfiles = null;
+  latestProfilesContext = "";
+  updateDatabaseSelectionStatus();
+  refreshRuns().catch((error) => setStatus(error.message, true));
+});
+
+schemasInput.addEventListener("input", () => {
+  latestProfiles = null;
+  latestProfilesContext = "";
+  updateDatabaseSelectionStatus();
+  refreshRuns().catch((error) => setStatus(error.message, true));
+});
+
+configPathInput.addEventListener("input", () => {
+  latestProfiles = null;
+  latestProfilesContext = "";
+  latestPostgresStatus = null;
+});
+
+workloadPathInput.addEventListener("input", () => {
+  latestProfiles = null;
+  latestProfilesContext = "";
 });
 
 runsContainer.addEventListener("click", (event) => {
@@ -1014,4 +1240,5 @@ runsContainer.addEventListener("click", (event) => {
   triggerRunAction(button.dataset.runId, button.dataset.action).catch((error) => setStatus(error.message, true));
 });
 
+updateDatabaseSelectionStatus();
 refreshRuns().catch((error) => setStatus(error.message, true));

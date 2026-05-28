@@ -28,7 +28,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -112,7 +113,7 @@ h3 {
 
 .controls {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) auto;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
   gap: 12px;
   align-items: end;
 }
@@ -132,7 +133,8 @@ h3 {
   display: none;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 42px;
   padding: 9px 11px;
@@ -147,6 +149,22 @@ input {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.actions,
+.selection-status,
+.connection-status,
+.status-box {
+  grid-column: 1 / -1;
+}
+
+.selection-status {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-size: 0.92rem;
 }
 
 button {

@@ -73,6 +73,15 @@ class PipelineOrchestrator:
     def check_postgres_connection(self) -> dict:
         return self._postgres.check_connection_status()
 
+    def discover_postgres_databases(self) -> dict:
+        return {
+            "status": "ok",
+            "original_database": self._config.postgres.original_database,
+            "new_database": self._config.postgres.new_database,
+            "schemas": self._config.postgres.schemas,
+            "databases": self._postgres.discover_databases(),
+        }
+
     def profile_databases(self) -> dict:
         return {
             "original": self._postgres.profile_database(self._config.postgres.original_database),
@@ -224,7 +233,10 @@ class PipelineOrchestrator:
                 status="failed",
                 details={
                     **step.details,
-                    "summary": "Schema creation failed. Review the PostgreSQL error, then repair the DDL with the LLM or reset db-new and try again.",
+                    "summary": (
+                        "Schema creation failed. Review the PostgreSQL error, then repair the DDL "
+                        f"with the LLM or reset {self._config.postgres.new_database} and try again."
+                    ),
                 },
                 error=str(exc),
                 planned_only=False,
@@ -256,7 +268,7 @@ class PipelineOrchestrator:
         try:
             create_step = next(step for step in record.steps if step.name == "create_target_schema")
             if create_step.status != "completed":
-                raise ValueError("Create db-new schema must be completed before data migration.")
+                raise ValueError(f"Create {self._config.postgres.new_database} schema must be completed before data migration.")
 
             migrate_step = next(step for step in record.steps if step.name == "migrate_data")
             statements = [statement["sql"] for statement in migrate_step.details.get("statements", [])]
@@ -386,7 +398,10 @@ class PipelineOrchestrator:
                 status="planned",
                 details={
                     **run_pgbench_new_step.details,
-                    "summary": "db-new was reset. Recreate the schema, rerun migration, and then start the db-new benchmark when ready.",
+                    "summary": (
+                        f"{self._config.postgres.new_database} was reset. Recreate the schema, rerun migration, "
+                        f"and then start the {self._config.postgres.new_database} benchmark when ready."
+                    ),
                 },
                 error=None,
                 planned_only=True,
@@ -460,7 +475,10 @@ class PipelineOrchestrator:
                 status="failed",
                 details={
                     **create_step.details,
-                    "summary": "Schema repair failed. Review the error and either repair again or reset db-new.",
+                    "summary": (
+                        "Schema repair failed. Review the error and either repair again or reset "
+                        f"{self._config.postgres.new_database}."
+                    ),
                 },
                 error=str(exc),
                 planned_only=False,
@@ -686,11 +704,17 @@ class PipelineOrchestrator:
             target_exists = self._postgres.database_exists(self._config.postgres.new_database)
             target_has_data = self._target_database_has_data()
             if create_step.status != "completed" and not target_exists:
-                raise ValueError("Create db-new schema or provide an existing db-new database before benchmarking db-new.")
+                raise ValueError(
+                    f"Create {self._config.postgres.new_database} schema or provide an existing "
+                    f"{self._config.postgres.new_database} database before benchmarking it."
+                )
             if migrate_step.status != "completed" and not target_has_data:
-                raise ValueError("Populate db-new or provide an existing populated db-new database before benchmarking db-new.")
+                raise ValueError(
+                    f"Populate {self._config.postgres.new_database} or provide an existing populated "
+                    f"{self._config.postgres.new_database} database before benchmarking it."
+                )
             if rewrite_step.status != "completed" or not rewrite_step.details.get("workload_path"):
-                raise ValueError("Rewritten db-new workload must be completed before benchmarking db-new.")
+                raise ValueError(f"Rewritten {self._config.postgres.new_database} workload must be completed before benchmarking.")
             workload_path = Path(str(rewrite_step.details.get("workload_path"))).resolve()
             if workload_path.exists():
                 validation_errors = self._validate_db_new_workload(
@@ -702,7 +726,8 @@ class PipelineOrchestrator:
                         for item in validation_errors[:3]
                     )
                     raise ValueError(
-                        "The current db-new workload does not validate against db-new. "
+                        f"The current {self._config.postgres.new_database} workload does not validate against "
+                        f"{self._config.postgres.new_database}. "
                         f"Regenerate it before benchmarking. {sample_errors}"
                     )
             record = self._run_pgbench_new_step(record)
@@ -749,7 +774,10 @@ class PipelineOrchestrator:
             create_step = next(step for step in record.steps if step.name == "create_target_schema")
             target_exists = self._postgres.database_exists(self._config.postgres.new_database)
             if create_step.status != "completed" and not target_exists:
-                raise ValueError("Create db-new schema or provide an existing db-new database before secondary indexes can be created.")
+                raise ValueError(
+                    f"Create {self._config.postgres.new_database} schema or provide an existing "
+                    f"{self._config.postgres.new_database} database before secondary indexes can be created."
+                )
 
             statements = self._secondary_index_sql_statements(record)
             if not statements:
@@ -762,7 +790,7 @@ class PipelineOrchestrator:
                 {
                     **step.details,
                     "executed_statement_count": len(executed),
-                    "summary": f"Created or reused {len(executed)} secondary index(es) on db-new.",
+                    "summary": f"Created or reused {len(executed)} secondary index(es) on {self._config.postgres.new_database}.",
                 },
             )
             record = self._run_extended_metrics_step(
@@ -790,7 +818,7 @@ class PipelineOrchestrator:
         if step is not None:
             return step
         details = {
-            "summary": "Approval-gated: create recommended secondary indexes on db-new.",
+            "summary": f"Approval-gated: create recommended secondary indexes on {self._config.postgres.new_database}.",
             "recommendation_count": len(self._secondary_index_sql_statements(record)),
             "sql_statements": self._secondary_index_sql_statements(record),
         }
@@ -927,7 +955,7 @@ class PipelineOrchestrator:
                 record,
                 "create_target_schema",
                 {
-                    "summary": "Approval-gated SQL is ready for db-new schema creation.",
+                    "summary": f"Approval-gated SQL is ready for {self._config.postgres.new_database} schema creation.",
                     "normalization_summary": summary,
                     "target_table_count": len(target_tables),
                     "sql_statement_count": len(sql_statements),
@@ -1003,7 +1031,8 @@ class PipelineOrchestrator:
                         for item in validation_errors[:3]
                     )
                     raise ValueError(
-                        "Generated db-new workload does not validate against the current db-new schema. "
+                        f"Generated {self._config.postgres.new_database} workload does not validate against the current "
+                        f"{self._config.postgres.new_database} schema. "
                         f"{sample_errors}"
                     )
                 sql_text = "\n\n".join(proposal.statements) + "\n"
@@ -1034,7 +1063,7 @@ class PipelineOrchestrator:
         return [
             {
                 "name": table.name,
-                "purpose": "Existing db-new table detected from PostgreSQL metadata.",
+                "purpose": f"Existing {self._config.postgres.new_database} table detected from PostgreSQL metadata.",
                 "source_tables": [],
                 "columns": [
                     {
@@ -1127,7 +1156,10 @@ class PipelineOrchestrator:
                 record,
                 "create_secondary_indexes",
                 {
-                    "summary": "Approval-gated: create recommended secondary indexes on db-new after the target schema exists.",
+                    "summary": (
+                        f"Approval-gated: create recommended secondary indexes on {self._config.postgres.new_database} "
+                        "after the target schema exists."
+                    ),
                     "recommendation_count": len(statements),
                     "sql_statements": statements,
                 },
@@ -1234,9 +1266,9 @@ class PipelineOrchestrator:
             "run_pgbench_original",
             {
                 "summary": (
-                    "Approval-gated: benchmark db-original with pgbench for the configured duration."
+                    f"Approval-gated: benchmark {self._config.postgres.original_database} with pgbench for the configured duration."
                     if workload_exists
-                    else "Provide a workload SQL file before benchmarking db-original."
+                    else f"Provide a workload SQL file before benchmarking {self._config.postgres.original_database}."
                 ),
                 "workload_path": str(workload_path) if workload_exists else "",
                 "duration_seconds": self._config.pgbench.duration_seconds,
@@ -1254,9 +1286,9 @@ class PipelineOrchestrator:
             "run_pgbench_new",
             {
                 "summary": (
-                    "Approval-gated: benchmark db-new with the rewritten workload after schema creation and migration."
+                    f"Approval-gated: benchmark {self._config.postgres.new_database} with the rewritten workload after schema creation and migration."
                     if workload_path
-                    else "Rewritten db-new workload is not ready yet, so db-new benchmarking cannot start."
+                    else f"Rewritten {self._config.postgres.new_database} workload is not ready yet, so benchmarking cannot start."
                 ),
                 "workload_path": workload_path,
                 "duration_seconds": self._config.pgbench.duration_seconds,
@@ -1272,16 +1304,16 @@ class PipelineOrchestrator:
             StepResult(name="inspect_source_schema", title="Inspect source PostgreSQL schema", status="pending"),
             StepResult(name="extract_workload_logs", title="Extract workload from PostgreSQL logs or workload file", status="pending"),
             StepResult(name="propose_3nf_schema", title="Propose 3NF normalization plan", status="pending"),
-            StepResult(name="create_target_schema", title="Create db-new schema", status="pending", requires_approval=True),
-            StepResult(name="migrate_data", title="Migrate data into db-new", status="pending", requires_approval=True),
-            StepResult(name="rewrite_queries", title="Rewrite workload for db-new", status="pending"),
+            StepResult(name="create_target_schema", title=f"Create {self._config.postgres.new_database} schema", status="pending", requires_approval=True),
+            StepResult(name="migrate_data", title=f"Migrate data into {self._config.postgres.new_database}", status="pending", requires_approval=True),
+            StepResult(name="rewrite_queries", title=f"Rewrite workload for {self._config.postgres.new_database}", status="pending"),
             StepResult(name="suggest_summary_tables", title="Suggest summary tables", status="pending"),
             StepResult(name="optimize_indexes", title="Recommend workload-aware indexes", status="pending"),
             StepResult(name="create_secondary_indexes", title="Create secondary indexes", status="pending", requires_approval=True),
             StepResult(name="capture_hardware", title="Capture hardware snapshot", status="pending"),
             StepResult(name="tune_postgresql_conf", title="Recommend postgresql.conf tuning", status="pending"),
-            StepResult(name="run_pgbench_original", title="Run pgbench against db-original", status="pending", requires_approval=True),
-            StepResult(name="run_pgbench_new", title="Run pgbench against db-new", status="pending", requires_approval=True),
+            StepResult(name="run_pgbench_original", title=f"Run pgbench against {self._config.postgres.original_database}", status="pending", requires_approval=True),
+            StepResult(name="run_pgbench_new", title=f"Run pgbench against {self._config.postgres.new_database}", status="pending", requires_approval=True),
             StepResult(name="compare_disk_usage", title="Compare before/after benchmark results", status="pending"),
             StepResult(name="collect_extended_metrics", title="Collect advanced PostgreSQL metrics", status="pending"),
         ]
@@ -1460,7 +1492,7 @@ class PipelineOrchestrator:
         if workload_path is not None and workload_path.exists():
             return workload_path.read_text(encoding="utf-8", errors="replace")
         if log_summary is None:
-            raise ValueError("No workload source was available to rewrite for db-new.")
+            raise ValueError(f"No workload source was available to rewrite for {self._config.postgres.new_database}.")
 
         statements: list[str] = []
         for query in log_summary.top_queries:
@@ -1471,7 +1503,7 @@ class PipelineOrchestrator:
             for _ in range(repetitions):
                 statements.append(sample + ";")
         if not statements:
-            raise ValueError("No executable SQL statements were available to rewrite for db-new.")
+            raise ValueError(f"No executable SQL statements were available to rewrite for {self._config.postgres.new_database}.")
         return "\n\n".join(statements) + "\n"
 
     def _load_rewritten_or_source_workload_text(self, record: BenchmarkRunRecord, log_summary) -> str:

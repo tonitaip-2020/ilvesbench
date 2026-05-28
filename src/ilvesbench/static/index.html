@@ -22,16 +22,32 @@
           <input id="configPath" type="text" value="ilvesbench.example.toml">
         </label>
         <label class="field">
+          <span>Source database</span>
+          <select id="originalDatabase">
+            <option value="mvp_db">mvp_db</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Target database</span>
+          <input id="newDatabase" type="text" value="mvp_db_new">
+        </label>
+        <label class="field">
+          <span>Schemas</span>
+          <input id="schemas" type="text" value="public">
+        </label>
+        <label class="field">
           <span>Workload file path (optional)</span>
           <input id="workloadPath" type="text" placeholder="data/workload.sql">
           <small class="field-help">Default: <code>data/workload.sql</code>.</small>
         </label>
         <div class="actions">
           <button id="runButton" class="primary">Start run</button>
+          <button id="discoverButton">Discover databases</button>
           <button id="llmButton">Test LLM</button>
           <button id="postgresButton">Check PostgreSQL</button>
           <button id="refreshButton">Refresh</button>
         </div>
+        <div id="dbSelectionStatus" class="selection-status"></div>
         <div id="postgresStatus" class="connection-status" hidden></div>
         <pre id="statusBox" class="status-box">Waiting for input.</pre>
       </section>
