@@ -141,6 +141,47 @@ function rawSqlBlock(title, statements, path = "") {
   `;
 }
 
+function renderNormalizationReviews(run, reviews) {
+  if (!reviews.length) return "";
+  return `
+    <div class="normalization-review-list">
+      ${reviews.map((review) => {
+        const targets = (review.proposed_target_tables || []).map((table) => table.name).filter(Boolean);
+        const canDecide = run.run_id && review.status === "pending";
+        return `
+          <article class="normalization-review review-${escapeHtml(review.status || "pending")}">
+            <div class="review-head">
+              <div>
+                <strong>${escapeHtml(review.source_table || "Suspicious table")}</strong>
+                <span>${escapeHtml((review.normal_forms || []).join(", ") || "normalization")}</span>
+              </div>
+              ${pill((review.status || "pending").replaceAll("_", " "), review.status || "pending")}
+            </div>
+            <p>${escapeHtml(review.proposal_summary || "")}</p>
+            <div class="review-facts">
+              <span>Columns: ${escapeHtml((review.suspicious_columns || []).join(", ") || "n/a")}</span>
+              <span>Proposed tables: ${escapeHtml(targets.length ? targets.join(", ") : "none")}</span>
+            </div>
+            <ul>
+              ${(review.suspicion_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}
+            </ul>
+            ${canDecide ? `
+              <div class="review-actions">
+                <button type="button" class="action-button primary-approval" data-review-action="approved" data-review-id="${escapeHtml(review.id)}" data-run-id="${escapeHtml(run.run_id)}">
+                  <span>Approve decomposition</span>
+                </button>
+                <button type="button" class="action-button" data-review-action="rejected" data-review-id="${escapeHtml(review.id)}" data-run-id="${escapeHtml(run.run_id)}">
+                  <span>Reject for this run</span>
+                </button>
+              </div>
+            ` : ""}
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function step(run, name) {
   return (run.steps || []).find((item) => item.name === name) || {};
 }
@@ -789,7 +830,10 @@ function renderNormalize(run) {
   const details = normalize.details || {};
   const firstNormalFormDetails = firstNormalForm.details || {};
   const firstNormalFormFindings = firstNormalFormDetails.findings || details.first_normal_form_findings || [];
+  const reviews = details.normalization_reviews || [];
+  const pendingReviews = reviews.filter((review) => review.status === "pending").length;
   const targetTables = details.target_tables || [];
+  const draftTargetTables = details.draft_target_tables || [];
   const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
   return `
     <section class="tab-panel">
@@ -797,14 +841,16 @@ function renderNormalize(run) {
         <h2>Normalization Plan</h2>
         <div class="metric-grid">
           ${metricCard("Status", details.status || normalize.status || "pending")}
+          ${metricCard("Table reviews", `${formatNumber(reviews.length)} total`, `${formatNumber(pendingReviews)} pending`)}
           ${metricCard("Findings", formatNumber((details.table_findings || []).length))}
           ${metricCard("1NF warnings", formatNumber(firstNormalFormDetails.finding_count || firstNormalFormFindings.length || 0))}
           ${metricCard("Dependencies", formatNumber((details.functional_dependencies || []).length))}
-          ${metricCard("Target tables", formatNumber(targetTables.length))}
+          ${metricCard("Target tables", formatNumber(targetTables.length), draftTargetTables.length && !targetTables.length ? `${formatNumber(draftTargetTables.length)} draft` : "")}
           ${metricCard("Target columns", formatNumber(targetColumns))}
           ${metricCard("DDL statements", formatNumber((details.sql_statements || []).length))}
         </div>
         <p class="summary-text">${escapeHtml(details.summary || "No normalization result yet.")}</p>
+        ${renderNormalizationReviews(run, reviews)}
         ${firstNormalFormFindings.length ? `
           <div class="candidate-list">
             ${firstNormalFormFindings.map((finding) => `
@@ -1180,6 +1226,16 @@ async function triggerRunAction(runId, action) {
   await pollRun(data.run_id);
 }
 
+async function submitNormalizationReview(runId, candidateId, decision) {
+  setStatus(decision === "approved" ? "Approving normalization candidate..." : "Rejecting normalization candidate...");
+  const data = await api(`/api/runs/${runId}/actions/normalization-review`, {
+    method: "POST",
+    body: JSON.stringify({ candidate_id: candidateId, decision }),
+  });
+  setStatus("Normalization review saved.");
+  await pollRun(data.run_id);
+}
+
 async function testLLM() {
   const config_path = configPathInput.value.trim();
   setStatus("Testing LLM gateway...");
@@ -1289,6 +1345,16 @@ runsContainer.addEventListener("click", (event) => {
   if (tab) {
     activeTab = tab.dataset.tab;
     refreshRuns().catch((error) => setStatus(error.message, true));
+    return;
+  }
+
+  const reviewButton = event.target.closest("[data-review-action]");
+  if (reviewButton) {
+    submitNormalizationReview(
+      reviewButton.dataset.runId,
+      reviewButton.dataset.reviewId,
+      reviewButton.dataset.reviewAction,
+    ).catch((error) => setStatus(error.message, true));
     return;
   }
 

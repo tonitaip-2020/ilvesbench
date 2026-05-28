@@ -167,6 +167,22 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             thread.start()
             self._send_json({"status": "accepted", "run_id": run_id, "action": "repair-schema"}, status=HTTPStatus.ACCEPTED)
             return
+        if parsed.path.endswith("/actions/normalization-review"):
+            run_id = parsed.path.split("/")[-3]
+            record = self.server.orchestrator.apply_normalization_review(
+                run_id,
+                str(body.get("candidate_id", "")),
+                str(body.get("decision", "")),
+            )
+            self._send_json(
+                {
+                    "status": "completed",
+                    "run_id": record.run_id,
+                    "action": "normalization-review",
+                    "run_status": record.status,
+                }
+            )
+            return
         if parsed.path.endswith("/actions/migrate-data"):
             run_id = parsed.path.split("/")[-3]
             self.server.orchestrator.begin_migrate_data(run_id)

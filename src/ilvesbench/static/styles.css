@@ -648,6 +648,64 @@ code {
   color: var(--muted);
 }
 
+.normalization-review-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.normalization-review {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--amber);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.normalization-review.review-approved {
+  border-left-color: var(--green);
+}
+
+.normalization-review.review-rejected {
+  border-left-color: var(--red);
+}
+
+.review-head,
+.review-facts,
+.review-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.review-head strong,
+.review-head span {
+  display: block;
+}
+
+.review-head span,
+.review-facts {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.normalization-review p {
+  margin: 10px 0;
+}
+
+.normalization-review ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.review-actions {
+  justify-content: flex-start;
+  margin-top: 12px;
+}
+
 .pill {
   display: inline-flex;
   align-items: center;

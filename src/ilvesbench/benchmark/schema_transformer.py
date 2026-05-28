@@ -97,6 +97,13 @@ class SchemaTransformer:
             raw_response_text=llm_result.response_text,
         )
 
+    def build_first_normal_form_decomposition(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+    ) -> NormalizationProposal | None:
+        return self._first_normal_form_decomposition(schema, first_normal_form_findings)
+
     def _proposal_from_llm_response(self, schema: SchemaSnapshot, response_text: str) -> NormalizationProposal:
         payload = self._extract_json_object(response_text)
         target_tables = self._normalize_target_tables(schema, payload.get("target_tables", []))

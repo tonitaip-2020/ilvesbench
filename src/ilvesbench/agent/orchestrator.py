@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path, PureWindowsPath
+import re
 import traceback
 import uuid
 
@@ -151,16 +152,40 @@ class PipelineOrchestrator:
                     "sql_statements": proposal.sql_statements,
                     "source": proposal.source,
                 }
+                review_candidates = self._normalization_review_candidates(
+                    schema,
+                    first_normal_form_findings,
+                    proposal.target_tables,
+                )
+                if review_candidates:
+                    proposal_dict.update(
+                        {
+                            "status": "awaiting_review",
+                            "summary": (
+                                f"{len(review_candidates)} suspicious table(s) need human normalization review "
+                                "before final DDL is generated."
+                            ),
+                            "review_status": "pending",
+                            "normalization_reviews": review_candidates,
+                            "draft_target_tables": proposal.target_tables,
+                            "draft_sql_statements": proposal.sql_statements,
+                            "target_tables": [],
+                            "sql_statements": [],
+                        }
+                    )
                 record.artifacts["propose_3nf_schema"] = self._store.write_artifact(
                     record.run_id,
                     "normalization_proposal",
                     proposal_dict | {"raw_response_text": proposal.raw_response_text},
                 )
-                record = self._complete_step(
-                    record,
-                    "propose_3nf_schema",
-                    proposal_dict,
-                )
+                if review_candidates:
+                    record = self._input_required_step(record, "propose_3nf_schema", proposal_dict)
+                else:
+                    record = self._complete_step(
+                        record,
+                        "propose_3nf_schema",
+                        proposal_dict,
+                    )
             else:
                 record = self._fail_step(
                     record,
@@ -523,6 +548,99 @@ class PipelineOrchestrator:
         finally:
             record.updated_at = datetime.now(UTC).isoformat()
             self._store.upsert_run(record)
+        return record
+
+    def apply_normalization_review(self, run_id: str, candidate_id: str, decision: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("Normalization review decision must be approved or rejected.")
+
+        schema = self._load_schema_artifact(record)
+        normalization_step = next(step for step in record.steps if step.name == "propose_3nf_schema")
+        details = dict(normalization_step.details)
+        reviews = [dict(item) for item in details.get("normalization_reviews", [])]
+        if not reviews:
+            raise ValueError("This run has no pending normalization reviews.")
+
+        matched = False
+        for review in reviews:
+            if str(review.get("id")) == candidate_id:
+                review["status"] = decision
+                matched = True
+                break
+        if not matched:
+            raise ValueError(f"Normalization review candidate not found: {candidate_id}")
+
+        details["normalization_reviews"] = reviews
+        pending = [review for review in reviews if review.get("status") == "pending"]
+        if pending:
+            details["review_status"] = "pending"
+            details["summary"] = (
+                f"{len(pending)} suspicious table(s) still need approve/reject decisions before final DDL is generated."
+            )
+            record = self._input_required_step(record, "propose_3nf_schema", details)
+            record.summary.update(self._summary_counts(record))
+            record.status = self._overall_status(record)
+            self._store.upsert_run(record)
+            return record
+
+        approved_findings = [
+            finding
+            for review in reviews
+            if review.get("status") == "approved"
+            for finding in review.get("findings", [])
+        ]
+        if approved_findings:
+            proposal = self._schema_transformer.build_first_normal_form_decomposition(schema, approved_findings)
+            if proposal is None:
+                raise ValueError("Approved normalization reviews did not produce a target-table proposal.")
+            details.update(
+                {
+                    "status": proposal.status,
+                    "summary": (
+                        f"Generated final DDL from {len(approved_findings)} approved normalization finding(s)."
+                    ),
+                    "rationale": proposal.rationale,
+                    "table_findings": proposal.table_findings,
+                    "functional_dependencies": proposal.functional_dependencies,
+                    "target_tables": proposal.target_tables,
+                    "sql_statements": proposal.sql_statements,
+                    "source": "human_reviewed_1nf",
+                    "review_status": "completed",
+                }
+            )
+        else:
+            details.update(
+                {
+                    "status": "appears_3nf",
+                    "summary": "All normalization candidates were rejected; no target DDL was generated.",
+                    "rationale": ["Human review rejected all suspicious-table normalization candidates."],
+                    "table_findings": [],
+                    "functional_dependencies": [],
+                    "target_tables": [],
+                    "sql_statements": [],
+                    "source": "human_review",
+                    "review_status": "completed",
+                }
+            )
+
+        record.artifacts["propose_3nf_schema"] = self._store.write_artifact(
+            record.run_id,
+            "normalization_proposal",
+            details,
+        )
+        record = self._complete_step(record, "propose_3nf_schema", details)
+        record = self._plan_target_schema_step(record)
+        record = self._plan_migration_step(record, schema)
+        log_summary = self._load_log_summary_artifact(record)
+        record = self._plan_rewrite_queries_step(record, log_summary)
+        record = self._plan_index_recommendations_step(record, schema, log_summary)
+        record = self._plan_pgbench_new_step(record)
+        record.summary.pop("error", None)
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
         return record
 
     def begin_repair_target_schema(self, run_id: str) -> BenchmarkRunRecord:
@@ -1084,6 +1202,66 @@ class PipelineOrchestrator:
             return self._complete_step(record, "compare_disk_usage", comparison)
         return self._mark_planned(record, "compare_disk_usage", comparison)
 
+    def _normalization_review_candidates(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+        draft_target_tables: list[dict],
+    ) -> list[dict]:
+        reviewable_findings = [
+            finding
+            for finding in first_normal_form_findings
+            if finding.get("pattern") == "delimited_multi_value_column"
+            and str(finding.get("table", "")).strip()
+            and str(finding.get("column", "")).strip()
+        ]
+        if not reviewable_findings:
+            return []
+
+        source_tables = {f"{table.schema}.{table.name}": table for table in schema.tables}
+        findings_by_table: dict[str, list[dict]] = {}
+        for finding in reviewable_findings:
+            table_name = str(finding.get("table", "")).strip()
+            findings_by_table.setdefault(table_name, []).append(finding)
+
+        candidates: list[dict] = []
+        for table_name in sorted(findings_by_table):
+            findings = findings_by_table[table_name]
+            source_table = source_tables.get(table_name)
+            columns = [str(finding.get("column", "")) for finding in findings if str(finding.get("column", ""))]
+            relevant_targets = [
+                table
+                for table in draft_target_tables
+                if table_name in table.get("source_tables", [])
+            ]
+            reasons = [
+                str(finding.get("summary", ""))
+                for finding in findings
+                if str(finding.get("summary", "")).strip()
+            ]
+            if not reasons:
+                reasons = [f"{table_name} has sampled data that looks suspicious for normalization review."]
+
+            candidate_id = re.sub(r"[^a-zA-Z0-9_]+", "_", table_name).strip("_").lower()
+            candidates.append(
+                {
+                    "id": candidate_id,
+                    "source_table": table_name,
+                    "status": "pending",
+                    "normal_forms": ["1NF"],
+                    "suspicious_columns": columns,
+                    "source_column_count": len(source_table.columns) if source_table is not None else 0,
+                    "suspicion_reasons": reasons,
+                    "proposal_summary": (
+                        f"Split {', '.join(columns)} out of {table_name} into child table(s), "
+                        "while keeping the remaining columns in a copied parent table."
+                    ),
+                    "findings": findings,
+                    "proposed_target_tables": relevant_targets,
+                }
+            )
+        return candidates
+
     def _plan_target_schema_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
         if normalization_step is None:
@@ -1096,6 +1274,21 @@ class PipelineOrchestrator:
         sql_statements = normalization_step.details.get("sql_statements", [])
         target_tables = normalization_step.details.get("target_tables", [])
         summary = normalization_step.details.get("summary", "")
+
+        if normalization_step.details.get("review_status") == "pending":
+            return self._mark_planned(
+                record,
+                "create_target_schema",
+                {
+                    "summary": "Target-schema DDL is waiting for table-by-table normalization review decisions.",
+                    "normalization_summary": summary,
+                    "pending_review_count": sum(
+                        1
+                        for review in normalization_step.details.get("normalization_reviews", [])
+                        if review.get("status") == "pending"
+                    ),
+                },
+            )
 
         if sql_statements:
             ddl_path = self._store.write_text_artifact(

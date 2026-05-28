@@ -627,6 +627,85 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(migrate_step.details["truncated_table_count"], 2)
             self.assertEqual(pgbench_new_step.status, "planned")
 
+    def test_normalization_review_approval_generates_final_ddl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workload_path = root / "workload.sql"
+            workload_path.write_text("SELECT id, name FROM items WHERE id = 1;", encoding="utf-8")
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f"""
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [workload]
+                path = "{workload_path.name}"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            record = orchestrator.create_mvp_record()
+            schema_dict = to_dict(orchestrator._fake_schema)
+            record.artifacts["inspect_source_schema"] = orchestrator.store.write_artifact(
+                record.run_id,
+                "schema_snapshot",
+                schema_dict,
+            )
+            finding = {
+                "table": "public.items",
+                "column": "name",
+                "pattern": "delimited_multi_value_column",
+                "summary": "public.items.name appears to store multiple comma-separated values.",
+                "confidence": 0.9,
+                "evidence": {"delimiter": ","},
+            }
+            record = orchestrator._replace_step(
+                record,
+                "propose_3nf_schema",
+                status="input_required",
+                details={
+                    "status": "awaiting_review",
+                    "summary": "Review suspicious table.",
+                    "review_status": "pending",
+                    "normalization_reviews": [
+                        {
+                            "id": "public_items",
+                            "source_table": "public.items",
+                            "status": "pending",
+                            "findings": [finding],
+                            "suspicion_reasons": [finding["summary"]],
+                            "proposed_target_tables": [],
+                        }
+                    ],
+                    "target_tables": [],
+                    "sql_statements": [],
+                },
+                error=None,
+                planned_only=False,
+            )
+            orchestrator.store.upsert_run(record)
+
+            updated = orchestrator.apply_normalization_review(record.run_id, "public_items", "approved")
+
+            normalize_step = next(step for step in updated.steps if step.name == "propose_3nf_schema")
+            create_step = next(step for step in updated.steps if step.name == "create_target_schema")
+            self.assertEqual(normalize_step.status, "completed")
+            self.assertEqual(normalize_step.details["review_status"], "completed")
+            self.assertTrue(normalize_step.details["sql_statements"])
+            self.assertEqual(create_step.status, "planned")
+            self.assertTrue(create_step.details["sql_statements"])
+
 
 if __name__ == "__main__":
     unittest.main()
