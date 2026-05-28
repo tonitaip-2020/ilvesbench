@@ -12,7 +12,7 @@ from ilvesbench.models import LogSummary
 class WorkloadPlan:
     status: str
     summary: str
-    candidate_summary_tables: list[str] = field(default_factory=list)
+    candidate_summary_tables: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -43,11 +43,17 @@ class WorkloadPlanner:
                 status="no_queries",
                 summary="The workload source was parsed, but no executable SQL statements were detected.",
             )
+        candidates = self._summary_table_candidates(log_summary)
+        if candidates:
+            return WorkloadPlan(
+                status="recommended",
+                summary=f"Found {len(candidates)} candidate summary-table pattern(s) in the workload.",
+                candidate_summary_tables=candidates,
+            )
         return WorkloadPlan(
             status="planned",
             summary=(
-                "Workload extraction is active, and query transformation can now be proposed for db-new. "
-                "Summary-table synthesis remains a later module."
+                "Workload extraction is active. No obvious aggregate summary-table candidate was detected yet."
             ),
         )
 
@@ -173,6 +179,38 @@ class WorkloadPlanner:
         if tail:
             statements.append(tail)
         return statements
+
+    def _summary_table_candidates(self, log_summary: LogSummary) -> list[dict]:
+        candidates: list[dict] = []
+        for index, query in enumerate(log_summary.top_queries, start=1):
+            sql = query.sample_sql.strip()
+            normalized = re.sub(r"\s+", " ", sql, flags=re.MULTILINE).strip()
+            if not normalized:
+                continue
+            has_aggregate = bool(re.search(r"\b(count|sum|avg|min|max)\s*\(", normalized, re.IGNORECASE))
+            group_by = re.search(r"\bgroup\s+by\s+(?P<columns>.+?)(?:\border\s+by\b|\blimit\b|$)", normalized, re.IGNORECASE)
+            if not has_aggregate or not group_by:
+                continue
+            group_columns = [
+                item.strip().strip('"')
+                for item in group_by.group("columns").rstrip(";").split(",")
+                if item.strip()
+            ][:6]
+            candidates.append(
+                {
+                    "label": f"Summary candidate {len(candidates) + 1}",
+                    "pattern": "aggregate_group_by",
+                    "query_frequency": query.count,
+                    "grouping_column_count": len(group_columns),
+                    "grouping_columns_sample": group_columns,
+                    "reason": "Repeated aggregate query with GROUP BY could be materialized or maintained as a summary table.",
+                    "creation_status": "placeholder",
+                    "sample_query": normalized[:500],
+                }
+            )
+            if len(candidates) >= 8:
+                break
+        return candidates
 
     def _normalize_statement(self, sql: str, target_table_names: set[str]) -> str:
         normalized = sql.strip().rstrip(";")

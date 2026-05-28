@@ -56,6 +56,22 @@ class PostgresInspector:
             "hint": hints[0] if hints else "",
         }
 
+    def profile_database(self, database: str) -> dict:
+        if not self.database_exists(database):
+            return {
+                "database": database,
+                "status": "missing",
+                "summary": "Database does not exist yet.",
+            }
+
+        conn = self._connect(database)
+        try:
+            information_schema = self._load_information_schema_profile(conn)
+            table_metrics = self._load_table_metrics(conn)
+            return self._build_abstract_profile(database, information_schema, table_metrics)
+        finally:
+            conn.close()
+
     def _check_database_connection(self, database: str, label: str) -> dict:
         try:
             conn = self._connect(database)
@@ -102,8 +118,9 @@ class PostgresInspector:
                 "hint": self._connection_hint(str(exc)),
             }
 
-    def inspect_schema(self) -> SchemaSnapshot:
-        conn = self._connect(self._config.original_database)
+    def inspect_schema(self, database: str | None = None) -> SchemaSnapshot:
+        database_name = database or self._config.original_database
+        conn = self._connect(database_name)
         try:
             tables = self._load_tables(conn)
             columns = self._load_columns(conn)
@@ -167,11 +184,32 @@ class PostgresInspector:
 
         ordered_tables = sorted(table_map.values(), key=lambda item: (item.schema, item.name))
         return SchemaSnapshot(
-            database=self._config.original_database,
+            database=database_name,
             collected_at=datetime.now(UTC).isoformat(),
             tables=ordered_tables,
             database_size_bytes=size_bytes,
         )
+
+    def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
+        conn = self._connect(database)
+        errors: list[dict] = []
+        try:
+            with conn.cursor() as cur:
+                for statement in statements:
+                    sql_text = statement.strip().rstrip(";")
+                    if not sql_text:
+                        continue
+                    try:
+                        cur.execute("EXPLAIN " + sql_text)
+                        cur.fetchall()
+                    except Exception as exc:
+                        conn.rollback()
+                        errors.append({"statement": statement, "error": str(exc)})
+                    else:
+                        conn.rollback()
+        finally:
+            conn.close()
+        return errors
 
     def collect_database_metrics(self, database: str) -> dict:
         conn = self._connect(database)
@@ -467,6 +505,237 @@ class PostgresInspector:
             cur.execute(query)
             row = cur.fetchone()
         return row["size_bytes"] if row else None
+
+    def _load_information_schema_profile(self, conn) -> dict:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    t.table_schema,
+                    t.table_name,
+                    COUNT(c.column_name) AS column_count,
+                    COUNT(*) FILTER (WHERE c.is_nullable = 'YES') AS nullable_column_count,
+                    COUNT(*) FILTER (WHERE c.column_default IS NOT NULL) AS defaulted_column_count
+                FROM information_schema.tables AS t
+                LEFT JOIN information_schema.columns AS c
+                  ON c.table_schema = t.table_schema
+                 AND c.table_name = t.table_name
+                WHERE t.table_type = 'BASE TABLE'
+                  AND t.table_schema = ANY(%s)
+                GROUP BY t.table_schema, t.table_name
+                ORDER BY t.table_schema, t.table_name
+                """,
+                (self._config.schemas,),
+            )
+            tables = [dict(row) for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT
+                    c.table_schema,
+                    c.table_name,
+                    c.data_type,
+                    COUNT(*) AS count
+                FROM information_schema.columns AS c
+                JOIN information_schema.tables AS t
+                  ON t.table_schema = c.table_schema
+                 AND t.table_name = c.table_name
+                 AND t.table_type = 'BASE TABLE'
+                WHERE c.table_schema = ANY(%s)
+                GROUP BY c.table_schema, c.table_name, c.data_type
+                """,
+                (self._config.schemas,),
+            )
+            data_types = [dict(row) for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT
+                    tc.table_schema,
+                    tc.table_name,
+                    tc.constraint_name,
+                    tc.constraint_type,
+                    ccu.table_schema AS referenced_table_schema,
+                    ccu.table_name AS referenced_table_name
+                FROM information_schema.table_constraints AS tc
+                LEFT JOIN information_schema.constraint_column_usage AS ccu
+                  ON ccu.constraint_schema = tc.constraint_schema
+                 AND ccu.constraint_name = tc.constraint_name
+                WHERE tc.table_schema = ANY(%s)
+                """,
+                (self._config.schemas,),
+            )
+            constraints = [dict(row) for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT COUNT(*) AS index_count
+                FROM pg_indexes
+                WHERE schemaname = ANY(%s)
+                """,
+                (self._config.schemas,),
+            )
+            index_row = cur.fetchone()
+
+        return {
+            "tables": tables,
+            "data_types": data_types,
+            "constraints": constraints,
+            "index_count": int(index_row["index_count"] or 0) if index_row else 0,
+        }
+
+    def _build_abstract_profile(self, database: str, information_schema: dict, table_metrics: list[dict]) -> dict:
+        tables = information_schema.get("tables", [])
+        constraints = information_schema.get("constraints", [])
+        data_types = information_schema.get("data_types", [])
+        table_keys = {(row["table_schema"], row["table_name"]) for row in tables}
+        primary_key_tables = {
+            (row["table_schema"], row["table_name"])
+            for row in constraints
+            if row.get("constraint_type") == "PRIMARY KEY"
+        }
+        fk_rows = [row for row in constraints if row.get("constraint_type") == "FOREIGN KEY"]
+        unique_count = sum(1 for row in constraints if row.get("constraint_type") == "UNIQUE")
+        check_count = sum(1 for row in constraints if row.get("constraint_type") == "CHECK")
+        index_count = int(information_schema.get("index_count") or 0)
+        column_counts = [int(row.get("column_count") or 0) for row in tables]
+        total_columns = sum(column_counts)
+        wide_tables = sum(1 for count in column_counts if count >= 30)
+        missing_pk = max(0, len(table_keys - primary_key_tables))
+        nullable_columns = sum(int(row.get("nullable_column_count") or 0) for row in tables)
+        defaulted_columns = sum(int(row.get("defaulted_column_count") or 0) for row in tables)
+        type_counts: dict[str, int] = defaultdict(int)
+        for row in data_types:
+            type_counts[str(row.get("data_type") or "unknown")] += int(row.get("count") or 0)
+        estimated_rows = sum(int(row.get("n_live_tup") or 0) for row in table_metrics)
+        populated_tables = sum(1 for row in table_metrics if int(row.get("n_live_tup") or 0) > 0)
+
+        graph: dict[tuple[str, str], set[tuple[str, str]]] = {key: set() for key in table_keys}
+        for row in fk_rows:
+            source = (row["table_schema"], row["table_name"])
+            target_schema = row.get("referenced_table_schema")
+            target_table = row.get("referenced_table_name")
+            if not target_schema or not target_table:
+                continue
+            target = (target_schema, target_table)
+            if source in graph and target in graph:
+                graph[source].add(target)
+                graph[target].add(source)
+
+        clusters = self._abstract_clusters(graph, tables)
+        total_bytes = sum(int(row.get("total_bytes") or 0) for row in table_metrics)
+        table_size_buckets = self._table_size_buckets(table_metrics)
+        issue_count = missing_pk + wide_tables
+        if len(tables) > 200:
+            scale = "large"
+        elif len(tables) > 40:
+            scale = "medium"
+        else:
+            scale = "small"
+
+        return {
+            "database": database,
+            "status": "completed",
+            "collected_at": datetime.now(UTC).isoformat(),
+            "scale": scale,
+            "summary": f"{len(tables)} tables, {total_columns} columns, {len(fk_rows)} foreign-key relationships.",
+            "counts": {
+                "tables": len(tables),
+                "columns": total_columns,
+                "foreign_keys": len(fk_rows),
+                "indexes": index_count,
+                "unique_constraints": unique_count,
+                "check_constraints": check_count,
+                "tables_without_primary_key": missing_pk,
+                "wide_tables": wide_tables,
+                "estimated_rows": estimated_rows,
+                "populated_tables": populated_tables,
+                "nullable_columns": nullable_columns,
+                "defaulted_columns": defaulted_columns,
+            },
+            "averages": {
+                "columns_per_table": round(total_columns / len(tables), 2) if tables else 0,
+                "foreign_keys_per_table": round(len(fk_rows) / len(tables), 2) if tables else 0,
+            },
+            "risk_signals": [
+                {"label": "Tables without primary-key evidence", "value": missing_pk, "severity": "warning" if missing_pk else "ok"},
+                {"label": "Wide tables", "value": wide_tables, "severity": "warning" if wide_tables else "ok"},
+                {"label": "Relationship density", "value": round(len(fk_rows) / len(tables), 2) if tables else 0, "severity": "info"},
+            ],
+            "type_mix": [
+                {"data_type": key, "count": value}
+                for key, value in sorted(type_counts.items(), key=lambda item: item[1], reverse=True)[:8]
+            ],
+            "storage": {
+                "total_relation_bytes": total_bytes,
+                "table_size_buckets": table_size_buckets,
+            },
+            "clusters": clusters,
+            "privacy": {
+                "abstracted": True,
+                "table_names_returned": False,
+                "column_names_returned": False,
+            },
+            "issue_count": issue_count,
+        }
+
+    def _abstract_clusters(self, graph: dict[tuple[str, str], set[tuple[str, str]]], tables: list[dict]) -> list[dict]:
+        column_counts = {
+            (row["table_schema"], row["table_name"]): int(row.get("column_count") or 0)
+            for row in tables
+        }
+        seen: set[tuple[str, str]] = set()
+        clusters: list[dict] = []
+        for node in sorted(graph):
+            if node in seen:
+                continue
+            stack = [node]
+            component: list[tuple[str, str]] = []
+            seen.add(node)
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for neighbor in graph[current]:
+                    if neighbor not in seen:
+                        seen.add(neighbor)
+                        stack.append(neighbor)
+
+            relationship_edges = sum(len(graph[item]) for item in component) // 2
+            component_columns = sum(column_counts.get(item, 0) for item in component)
+            clusters.append(
+                {
+                    "label": f"Cluster {len(clusters) + 1}",
+                    "table_count": len(component),
+                    "relationship_count": relationship_edges,
+                    "average_columns": round(component_columns / len(component), 2) if component else 0,
+                    "shape": self._cluster_shape(len(component), relationship_edges),
+                }
+            )
+        return sorted(clusters, key=lambda item: item["table_count"], reverse=True)[:12]
+
+    def _cluster_shape(self, table_count: int, relationship_count: int) -> str:
+        if table_count <= 1:
+            return "isolated"
+        density = relationship_count / table_count
+        if density >= 2:
+            return "dense"
+        if density >= 1:
+            return "connected"
+        return "sparse"
+
+    def _table_size_buckets(self, table_metrics: list[dict]) -> dict:
+        buckets = {"empty_or_tiny": 0, "small": 0, "medium": 0, "large": 0}
+        for row in table_metrics:
+            size = int(row.get("total_bytes") or 0)
+            if size < 1024 * 1024:
+                buckets["empty_or_tiny"] += 1
+            elif size < 128 * 1024 * 1024:
+                buckets["small"] += 1
+            elif size < 1024 * 1024 * 1024:
+                buckets["medium"] += 1
+            else:
+                buckets["large"] += 1
+        return buckets
 
     def _load_table_metrics(self, conn) -> list[dict]:
         query = """

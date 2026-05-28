@@ -32,11 +32,35 @@ class StaticGateway:
 
 
 class FailingPostgres:
+    def database_exists(self, database: str) -> bool:
+        return True
+
     def create_database_if_missing(self, database: str) -> str:
         return "created"
 
     def execute_statements(self, database: str, statements: list[str]) -> list[dict]:
         raise RuntimeError('there is no unique constraint matching given keys for referenced table "student_course"')
+
+
+class RecordingPostgres:
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    def database_exists(self, database: str) -> bool:
+        return True
+
+    def execute_statements(self, database: str, statements: list[str]) -> list[dict]:
+        self.executed.extend(statements)
+        return [{"statement": statement} for statement in statements]
+
+    def collect_database_metrics(self, database: str) -> dict:
+        return {
+            "database": database,
+            "database_size_bytes": 0,
+            "table_metrics": [],
+            "database_activity": {},
+            "statement_metrics": {},
+        }
 
 
 class FailingPgBench:
@@ -442,6 +466,101 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(rewrite_step.details["workload_path"].endswith(".sql"))
             self.assertEqual(pgbench_new_step.status, "planned")
             self.assertEqual(pgbench_new_step.details["workload_path"], rewrite_step.details["workload_path"])
+
+    def test_artifact_loading_recovers_from_moved_windows_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workload_path = root / "workload.sql"
+            workload_path.write_text("SELECT * FROM users WHERE id = 1;", encoding="utf-8")
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f"""
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [logs]
+                path = "missing.log"
+
+                [workload]
+                path = "{workload_path.name}"
+
+                [pgbench]
+                enabled = false
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            result = orchestrator.run_mvp_collection()
+            result.artifacts["extract_workload_logs"] = (
+                "C:\\Users\\manos\\Documents\\Codex\\ilvesbench\\data\\artifacts\\"
+                f"{result.run_id}\\log_summary.json"
+            )
+
+            log_summary = orchestrator._load_log_summary_artifact(result)
+
+            self.assertIsNotNone(log_summary)
+            self.assertEqual(log_summary.source_kind, "workload_file")
+            self.assertEqual(log_summary.statements_detected, 1)
+
+    def test_create_secondary_indexes_uses_legacy_index_recommendation_sql(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            postgres = RecordingPostgres()
+            orchestrator._postgres = postgres
+            record = orchestrator.create_mvp_record()
+            record.steps = [
+                step for step in record.steps
+                if step.name != "create_secondary_indexes"
+            ]
+            record = orchestrator._replace_step(
+                record,
+                "optimize_indexes",
+                status="completed",
+                details={
+                    "recommendation_count": 1,
+                    "sql_statements": ['CREATE INDEX IF NOT EXISTS "idx_items_name" ON "items" ("name");'],
+                },
+                error=None,
+                planned_only=False,
+            )
+
+            orchestrator.begin_create_secondary_indexes(record.run_id)
+            updated = orchestrator.execute_create_secondary_indexes(record.run_id)
+
+            create_step = next(step for step in updated.steps if step.name == "create_secondary_indexes")
+            self.assertEqual(create_step.status, "completed")
+            self.assertEqual(postgres.executed, ['CREATE INDEX IF NOT EXISTS "idx_items_name" ON "items" ("name");'])
 
 
 if __name__ == "__main__":

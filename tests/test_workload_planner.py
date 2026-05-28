@@ -11,7 +11,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from ilvesbench.benchmark.workload import WorkloadPlanner
-from ilvesbench.models import LLMResult
+from ilvesbench.models import LLMResult, LogSummary, QueryObservation
 
 
 class StaticGateway:
@@ -106,6 +106,31 @@ class WorkloadPlannerTests(unittest.TestCase):
             proposal.statements[1],
             "SELECT c.course_name FROM courses c WHERE c.course_code = 'CS101';",
         )
+
+    def test_build_plan_recommends_summary_table_candidates_for_aggregate_workload(self) -> None:
+        planner = WorkloadPlanner()
+        plan = planner.build_plan(
+            LogSummary(
+                path="workload.sql",
+                lines_processed=1,
+                statements_detected=1,
+                transactions_detected=0,
+                multi_statement_transactions=0,
+                top_queries=[
+                    QueryObservation(
+                        fingerprint="orders by day",
+                        sample_sql="SELECT customer_id, count(*) FROM orders GROUP BY customer_id;",
+                        count=42,
+                    )
+                ],
+                sampled_transactions=[],
+                source_kind="workload_file",
+            )
+        )
+
+        self.assertEqual(plan.status, "recommended")
+        self.assertEqual(len(plan.candidate_summary_tables), 1)
+        self.assertEqual(plan.candidate_summary_tables[0]["pattern"], "aggregate_group_by")
 
 
 if __name__ == "__main__":

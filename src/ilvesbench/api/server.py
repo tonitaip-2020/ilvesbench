@@ -4,7 +4,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import mimetypes
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import threading
 from urllib.parse import urlparse
 
@@ -57,7 +57,7 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 if not artifact_path:
                     self._send_json({"error": "Artifact not found."}, status=HTTPStatus.NOT_FOUND)
                     return
-                target = Path(artifact_path)
+                target = self._resolve_artifact_path(run_id, artifact_path)
                 if not target.exists():
                     self._send_json({"error": "Artifact file is missing."}, status=HTTPStatus.NOT_FOUND)
                     return
@@ -179,6 +179,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             thread.start()
             self._send_json({"status": "accepted", "run_id": run_id, "action": "run-pgbench-new"}, status=HTTPStatus.ACCEPTED)
             return
+        if parsed.path.endswith("/actions/create-secondary-indexes"):
+            run_id = parsed.path.split("/")[-3]
+            self.server.orchestrator.begin_create_secondary_indexes(run_id)
+            thread = threading.Thread(
+                target=self.server.orchestrator.execute_create_secondary_indexes,
+                args=(run_id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"status": "accepted", "run_id": run_id, "action": "create-secondary-indexes"}, status=HTTPStatus.ACCEPTED)
+            return
         if parsed.path == "/api/llm/test":
             config_path = body.get("config_path", self.server.config_path)
             self.server.reload_config(config_path)
@@ -191,6 +202,13 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             self.server.reload_config(config_path, workload_path=workload_path)
             result = self.server.orchestrator.check_postgres_connection()
             self._send_json(result)
+            return
+        if parsed.path == "/api/postgres/profile":
+            config_path = body.get("config_path", self.server.config_path)
+            workload_path = body.get("workload_path")
+            self.server.reload_config(config_path, workload_path=workload_path)
+            profiles = self.server.orchestrator.profile_databases()
+            self._send_json({"status": "ok", "profiles": profiles})
             return
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 
@@ -209,6 +227,18 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _resolve_artifact_path(self, run_id: str, artifact_path: str) -> Path:
+        target = Path(artifact_path)
+        if target.exists():
+            return target
+        filename = PureWindowsPath(artifact_path).name
+        if not filename or filename == artifact_path:
+            filename = target.name
+        relocated = self.server.orchestrator._config.resolve_path(
+            self.server.orchestrator._config.storage.artifact_dir
+        ) / run_id / filename
+        return relocated if relocated.exists() else target
 
     def _read_json_body(self) -> dict:
         content_length = int(self.headers.get("Content-Length", "0"))

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import traceback
 import uuid
 
@@ -73,6 +73,12 @@ class PipelineOrchestrator:
     def check_postgres_connection(self) -> dict:
         return self._postgres.check_connection_status()
 
+    def profile_databases(self) -> dict:
+        return {
+            "original": self._postgres.profile_database(self._config.postgres.original_database),
+            "target": self._postgres.profile_database(self._config.postgres.new_database),
+        }
+
     def load_run_record(self, run_id: str) -> BenchmarkRunRecord:
         record = self._store.get_run_record(run_id)
         if record is None:
@@ -134,7 +140,13 @@ class PipelineOrchestrator:
             record = self._mark_planned(
                 record,
                 "suggest_summary_tables",
-                {"status": workload_plan.status, "summary": workload_plan.summary},
+                {
+                    "status": workload_plan.status,
+                    "summary": workload_plan.summary,
+                    "candidate_count": len(workload_plan.candidate_summary_tables),
+                    "candidates": workload_plan.candidate_summary_tables,
+                    "creation_status": "placeholder",
+                },
             )
 
             record = self._plan_target_schema_step(record)
@@ -671,12 +683,28 @@ class PipelineOrchestrator:
             create_step = next(step for step in record.steps if step.name == "create_target_schema")
             migrate_step = next(step for step in record.steps if step.name == "migrate_data")
             rewrite_step = next(step for step in record.steps if step.name == "rewrite_queries")
-            if create_step.status != "completed":
-                raise ValueError("Create db-new schema must be completed before benchmarking db-new.")
-            if migrate_step.status != "completed":
-                raise ValueError("Data migration must be completed before benchmarking db-new.")
+            target_exists = self._postgres.database_exists(self._config.postgres.new_database)
+            target_has_data = self._target_database_has_data()
+            if create_step.status != "completed" and not target_exists:
+                raise ValueError("Create db-new schema or provide an existing db-new database before benchmarking db-new.")
+            if migrate_step.status != "completed" and not target_has_data:
+                raise ValueError("Populate db-new or provide an existing populated db-new database before benchmarking db-new.")
             if rewrite_step.status != "completed" or not rewrite_step.details.get("workload_path"):
                 raise ValueError("Rewritten db-new workload must be completed before benchmarking db-new.")
+            workload_path = Path(str(rewrite_step.details.get("workload_path"))).resolve()
+            if workload_path.exists():
+                validation_errors = self._validate_db_new_workload(
+                    self._split_sql_statements(workload_path.read_text(encoding="utf-8", errors="replace"))
+                )
+                if validation_errors:
+                    sample_errors = " | ".join(
+                        str(item.get("error", "")).splitlines()[0]
+                        for item in validation_errors[:3]
+                    )
+                    raise ValueError(
+                        "The current db-new workload does not validate against db-new. "
+                        f"Regenerate it before benchmarking. {sample_errors}"
+                    )
             record = self._run_pgbench_new_step(record)
             record = self._run_extended_metrics_step(
                 record,
@@ -697,6 +725,105 @@ class PipelineOrchestrator:
         record.updated_at = datetime.now(UTC).isoformat()
         self._store.upsert_run(record)
         return record
+
+    def begin_create_secondary_indexes(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        record.status = "running"
+        step = self._secondary_index_step(record)
+        record = self._replace_step(
+            record,
+            "create_secondary_indexes",
+            status="running",
+            details=step.details,
+            error=None,
+            planned_only=False,
+        )
+        record.summary.update(self._summary_counts(record))
+        self._store.upsert_run(record)
+        return record
+
+    def execute_create_secondary_indexes(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        step = self._secondary_index_step(record)
+        try:
+            create_step = next(step for step in record.steps if step.name == "create_target_schema")
+            target_exists = self._postgres.database_exists(self._config.postgres.new_database)
+            if create_step.status != "completed" and not target_exists:
+                raise ValueError("Create db-new schema or provide an existing db-new database before secondary indexes can be created.")
+
+            statements = self._secondary_index_sql_statements(record)
+            if not statements:
+                raise ValueError("No secondary-index SQL statements are available for this run.")
+
+            executed = self._postgres.execute_statements(self._config.postgres.new_database, statements)
+            record = self._complete_step(
+                record,
+                "create_secondary_indexes",
+                {
+                    **step.details,
+                    "executed_statement_count": len(executed),
+                    "summary": f"Created or reused {len(executed)} secondary index(es) on db-new.",
+                },
+            )
+            record = self._run_extended_metrics_step(
+                record,
+                [self._config.postgres.original_database, self._config.postgres.new_database],
+            )
+        except Exception as exc:
+            record = self._replace_step(
+                record,
+                "create_secondary_indexes",
+                status="failed",
+                details=step.details,
+                error=str(exc),
+                planned_only=False,
+            )
+            record.summary["error"] = str(exc)
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
+        return record
+
+    def _secondary_index_step(self, record: BenchmarkRunRecord) -> StepResult:
+        step = next((step for step in record.steps if step.name == "create_secondary_indexes"), None)
+        if step is not None:
+            return step
+        details = {
+            "summary": "Approval-gated: create recommended secondary indexes on db-new.",
+            "recommendation_count": len(self._secondary_index_sql_statements(record)),
+            "sql_statements": self._secondary_index_sql_statements(record),
+        }
+        record.steps.append(
+            StepResult(
+                name="create_secondary_indexes",
+                title="Create secondary indexes",
+                status="planned" if details["sql_statements"] else "pending",
+                requires_approval=True,
+                planned_only=True,
+                details=details,
+            )
+        )
+        return record.steps[-1]
+
+    def _secondary_index_sql_statements(self, record: BenchmarkRunRecord) -> list[str]:
+        statements: list[str] = []
+        for step_name in ("create_secondary_indexes", "optimize_indexes"):
+            step = next((step for step in record.steps if step.name == step_name), None)
+            if step is None:
+                continue
+            for statement in step.details.get("sql_statements", []):
+                if statement and statement not in statements:
+                    statements.append(statement)
+        return statements
+
+    def _target_database_has_data(self) -> bool:
+        try:
+            profile = self._postgres.profile_database(self._config.postgres.new_database)
+        except Exception:
+            return False
+        counts = profile.get("counts", {})
+        return int(counts.get("estimated_rows") or 0) > 0 or int(counts.get("populated_tables") or 0) > 0
 
     def _store_pgbench_result(
         self,
@@ -849,6 +976,8 @@ class PipelineOrchestrator:
         migrate_step = next((step for step in record.steps if step.name == "migrate_data"), None)
         target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
         migration_statements = migrate_step.details.get("statements", []) if migrate_step else []
+        if not target_tables:
+            target_tables = self._existing_target_tables()
 
         try:
             workload_sql = self._load_source_workload_text(log_summary)
@@ -864,8 +993,19 @@ class PipelineOrchestrator:
                 "statement_count": len(proposal.statements),
                 "statements": proposal.statements,
                 "source": proposal.source,
+                "target_table_count": len(target_tables),
             }
             if proposal.statements:
+                validation_errors = self._validate_db_new_workload(proposal.statements)
+                if validation_errors:
+                    sample_errors = " | ".join(
+                        str(item.get("error", "")).splitlines()[0]
+                        for item in validation_errors[:3]
+                    )
+                    raise ValueError(
+                        "Generated db-new workload does not validate against the current db-new schema. "
+                        f"{sample_errors}"
+                    )
                 sql_text = "\n\n".join(proposal.statements) + "\n"
                 sql_path = self._store.write_text_artifact(
                     record.run_id,
@@ -883,6 +1023,67 @@ class PipelineOrchestrator:
             return self._complete_step(record, "rewrite_queries", proposal_dict)
         except Exception as exc:
             return self._fail_step(record, "rewrite_queries", str(exc))
+
+    def _existing_target_tables(self) -> list[dict]:
+        try:
+            if not self._postgres.database_exists(self._config.postgres.new_database):
+                return []
+            schema = self._postgres.inspect_schema(self._config.postgres.new_database)
+        except Exception:
+            return []
+        return [
+            {
+                "name": table.name,
+                "purpose": "Existing db-new table detected from PostgreSQL metadata.",
+                "source_tables": [],
+                "columns": [
+                    {
+                        "source_table": "",
+                        "source_column": column.name,
+                        "name": column.name,
+                    }
+                    for column in table.columns
+                ],
+                "primary_key": [
+                    column
+                    for constraint in table.unique_constraints
+                    for column in constraint.columns
+                ][:1],
+                "uniques": [constraint.columns for constraint in table.unique_constraints],
+                "foreign_keys": [
+                    {
+                        "columns": foreign_key.columns,
+                        "references_table": foreign_key.referenced_table.split(".")[-1],
+                        "references_columns": foreign_key.referenced_columns,
+                    }
+                    for foreign_key in table.foreign_keys
+                ],
+            }
+            for table in schema.tables
+        ]
+
+    def _validate_db_new_workload(self, statements: list[str]) -> list[dict]:
+        try:
+            target_exists = self._postgres.database_exists(self._config.postgres.new_database)
+        except Exception as exc:
+            # Planning can run before PostgreSQL is available; validation is best-effort then.
+            return []
+        if not target_exists:
+            return []
+        try:
+            return self._postgres.validate_workload_statements(
+                self._config.postgres.new_database,
+                statements,
+            )
+        except Exception as exc:
+            return [{"statement": "", "error": str(exc)}]
+
+    def _split_sql_statements(self, text: str) -> list[str]:
+        return [
+            statement.strip() + ";"
+            for statement in text.split(";")
+            if statement.strip()
+        ]
 
     def _plan_index_recommendations_step(
         self,
@@ -914,9 +1115,33 @@ class PipelineOrchestrator:
                 "index_recommendations",
                 plan_dict,
             )
+            record = self._plan_secondary_index_creation_step(record, plan_dict)
             return self._complete_step(record, "optimize_indexes", plan_dict)
         except Exception as exc:
             return self._fail_step(record, "optimize_indexes", str(exc))
+
+    def _plan_secondary_index_creation_step(self, record: BenchmarkRunRecord, index_plan: dict) -> BenchmarkRunRecord:
+        statements = list(index_plan.get("sql_statements", []))
+        if statements:
+            return self._mark_planned(
+                record,
+                "create_secondary_indexes",
+                {
+                    "summary": "Approval-gated: create recommended secondary indexes on db-new after the target schema exists.",
+                    "recommendation_count": len(statements),
+                    "sql_statements": statements,
+                },
+            )
+
+        return self._complete_step(
+            record,
+            "create_secondary_indexes",
+            {
+                "summary": "No secondary indexes were recommended for creation.",
+                "recommendation_count": 0,
+                "sql_statements": [],
+            },
+        )
 
     def _run_tuning_step(
         self,
@@ -1045,13 +1270,14 @@ class PipelineOrchestrator:
         return [
             StepResult(name="llm_gateway", title="Test LLM gateway", status="pending"),
             StepResult(name="inspect_source_schema", title="Inspect source PostgreSQL schema", status="pending"),
+            StepResult(name="extract_workload_logs", title="Extract workload from PostgreSQL logs or workload file", status="pending"),
             StepResult(name="propose_3nf_schema", title="Propose 3NF normalization plan", status="pending"),
             StepResult(name="create_target_schema", title="Create db-new schema", status="pending", requires_approval=True),
             StepResult(name="migrate_data", title="Migrate data into db-new", status="pending", requires_approval=True),
+            StepResult(name="rewrite_queries", title="Rewrite workload for db-new", status="pending"),
             StepResult(name="suggest_summary_tables", title="Suggest summary tables", status="pending"),
-            StepResult(name="extract_workload_logs", title="Extract workload from PostgreSQL logs or workload file", status="pending"),
-            StepResult(name="rewrite_queries", title="Rewrites queries for db-new", status="pending"),
             StepResult(name="optimize_indexes", title="Recommend workload-aware indexes", status="pending"),
+            StepResult(name="create_secondary_indexes", title="Create secondary indexes", status="pending", requires_approval=True),
             StepResult(name="capture_hardware", title="Capture hardware snapshot", status="pending"),
             StepResult(name="tune_postgresql_conf", title="Recommend postgresql.conf tuning", status="pending"),
             StepResult(name="run_pgbench_original", title="Run pgbench against db-original", status="pending", requires_approval=True),
@@ -1102,26 +1328,23 @@ class PipelineOrchestrator:
         return record
 
     def _load_schema_artifact(self, record: BenchmarkRunRecord) -> SchemaSnapshot:
-        artifact_path = record.artifacts.get("inspect_source_schema")
-        if not artifact_path:
+        target = self._resolve_run_artifact_path(record, "inspect_source_schema")
+        if target is None:
             raise ValueError("Schema artifact is missing from the run.")
-        payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        payload = json.loads(target.read_text(encoding="utf-8"))
         return self._schema_snapshot_from_payload(payload)
 
     def _load_optional_artifact(self, record: BenchmarkRunRecord, name: str) -> dict | None:
-        artifact_path = record.artifacts.get(name)
-        if not artifact_path:
-            return None
-        target = Path(artifact_path)
-        if not target.exists():
+        target = self._resolve_run_artifact_path(record, name)
+        if target is None:
             return None
         return json.loads(target.read_text(encoding="utf-8"))
 
     def _load_log_summary_artifact(self, record: BenchmarkRunRecord) -> LogSummary | None:
-        artifact_path = record.artifacts.get("extract_workload_logs")
-        if not artifact_path:
+        target = self._resolve_run_artifact_path(record, "extract_workload_logs")
+        if target is None:
             return None
-        payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        payload = json.loads(target.read_text(encoding="utf-8"))
         return LogSummary(
             path=str(payload.get("path", "")),
             lines_processed=int(payload.get("lines_processed", 0)),
@@ -1147,6 +1370,23 @@ class PipelineOrchestrator:
             ],
             source_kind=str(payload.get("source_kind", "postgres_log")),
         )
+
+    def _resolve_run_artifact_path(self, record: BenchmarkRunRecord, name: str) -> Path | None:
+        artifact_path = record.artifacts.get(name)
+        if not artifact_path:
+            return None
+
+        target = Path(artifact_path)
+        if target.exists():
+            return target
+
+        filename = PureWindowsPath(artifact_path).name
+        if not filename or filename == artifact_path:
+            filename = target.name
+        relocated = self._config.resolve_path(self._config.storage.artifact_dir) / record.run_id / filename
+        if relocated.exists():
+            return relocated
+        return None
 
     def _schema_snapshot_from_payload(self, payload: dict) -> SchemaSnapshot:
         from ilvesbench.models import ColumnMetadata, ForeignKeyMetadata, IndexMetadata, TableMetadata, UniqueConstraintMetadata

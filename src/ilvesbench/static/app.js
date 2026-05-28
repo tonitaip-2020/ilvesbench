@@ -3,8 +3,23 @@ const runsContainer = document.getElementById("runs");
 const configPathInput = document.getElementById("configPath");
 const workloadPathInput = document.getElementById("workloadPath");
 const postgresStatusBox = document.getElementById("postgresStatus");
+
 let activePoll = null;
-let openPanels = new Set();
+let activeTab = "setup";
+let latestProfiles = null;
+let latestLlmStatus = null;
+let latestPostgresStatus = null;
+
+const WORKSPACE_TABS = [
+  { id: "setup", label: "Setup", steps: ["llm_gateway", "inspect_source_schema", "extract_workload_logs"] },
+  { id: "profile", label: "Profile", steps: ["inspect_source_schema", "collect_extended_metrics"] },
+  { id: "normalize", label: "Normalize", steps: ["propose_3nf_schema"] },
+  { id: "migrate", label: "Migrate", steps: ["create_target_schema", "migrate_data"] },
+  { id: "workload", label: "Workload", steps: ["rewrite_queries", "suggest_summary_tables"] },
+  { id: "physical", label: "Physical design", steps: ["optimize_indexes", "create_secondary_indexes", "tune_postgresql_conf"] },
+  { id: "benchmark", label: "Benchmark", steps: ["run_pgbench_original", "run_pgbench_new"] },
+  { id: "compare", label: "Compare", steps: ["compare_disk_usage"] },
+];
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -24,7 +39,7 @@ function setStatus(message, isError = false) {
 }
 
 function escapeHtml(value) {
-  return String(value)
+  return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -32,74 +47,767 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function renderValue(value) {
-  if (Array.isArray(value)) {
-    return value.join(", ");
+function step(run, name) {
+  return (run.steps || []).find((item) => item.name === name) || {};
+}
+
+function statusRank(status) {
+  return {
+    failed: 6,
+    input_required: 5,
+    running: 4,
+    planned: 3,
+    pending: 2,
+    completed: 1,
+  }[status] || 0;
+}
+
+function effectiveStep(run, name) {
+  const item = step(run, name);
+  if (name === "llm_gateway" && latestLlmStatus) {
+    return {
+      ...item,
+      title: item.title || "Test LLM gateway",
+      status: latestLlmStatus.status,
+      details: {
+        ...(item.details || {}),
+        summary: latestLlmStatus.summary,
+      },
+      error: latestLlmStatus.status === "failed" ? latestLlmStatus.summary : null,
+    };
   }
-  if (value && typeof value === "object") {
-    return JSON.stringify(value);
+  if (name === "inspect_source_schema" && latestPostgresStatus?.status === "ok" && item.status !== "completed") {
+    return {
+      ...item,
+      title: item.title || "Inspect source PostgreSQL schema",
+      status: "completed",
+      details: {
+        ...(item.details || {}),
+        summary: "PostgreSQL connection is available.",
+      },
+      error: null,
+    };
   }
-  return String(value);
+  return item;
 }
 
-function panelKey(runId, name) {
-  return `${runId}:${name}`;
+function aggregateStatus(run, names, tabId = "") {
+  if (tabId === "setup") {
+    const llm = latestLlmStatus?.status || step(run, "llm_gateway").status || "pending";
+    const postgres = latestPostgresStatus?.status === "ok" ? "completed" : step(run, "inspect_source_schema").status || "pending";
+    const workload = step(run, "extract_workload_logs").status || "pending";
+    const statuses = [llm, postgres, workload];
+    if (statuses.includes("running")) return "running";
+    if (statuses.includes("failed")) return "failed";
+    if (statuses.includes("input_required")) return "input_required";
+    if (statuses.includes("planned")) return "planned";
+    if (statuses.every((status) => status === "completed")) return "completed";
+    return statuses.sort((a, b) => statusRank(b) - statusRank(a))[0] || "pending";
+  }
+  const statuses = names.map((name) => step(run, name).status || "pending");
+  if (statuses.includes("running")) return "running";
+  if (statuses.includes("failed")) return "failed";
+  if (statuses.includes("input_required")) return "input_required";
+  if (statuses.includes("planned")) return "planned";
+  if (statuses.every((status) => status === "completed")) return "completed";
+  return statuses.sort((a, b) => statusRank(b) - statusRank(a))[0] || "pending";
 }
 
-function isPanelOpen(runId, name) {
-  return openPanels.has(panelKey(runId, name));
+function formatNumber(value) {
+  if (value === null || value === undefined || value === "") return "0";
+  const number = Number(value);
+  return Number.isFinite(number) ? new Intl.NumberFormat().format(number) : String(value);
 }
 
-function renderCollapsible(runId, name, title, meta, contentRenderer) {
-  const open = isPanelOpen(runId, name);
+function formatBytes(value) {
+  const number = Number(value || 0);
+  if (!number) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = number;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(size >= 10 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function pill(label, status) {
+  return `<span class="pill pill-${escapeHtml(status || "pending")}">${escapeHtml(label)}</span>`;
+}
+
+function metricCard(label, value, meta = "") {
   return `
-    <section class="collapsible" data-panel="${escapeHtml(name)}">
-      <button class="collapsible-toggle" type="button" data-toggle-panel="${escapeHtml(name)}" data-run-id="${escapeHtml(runId)}" aria-expanded="${open ? "true" : "false"}">
-        <span class="collapsible-title">${escapeHtml(title)}</span>
-        <span class="collapsible-meta">${escapeHtml(meta)}</span>
-        <span class="collapsible-caret">${open ? "Hide" : "Show"}</span>
-      </button>
-      ${open ? `<div class="collapsible-body">${contentRenderer()}</div>` : ""}
+    <article class="metric-card">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
+    </article>
+  `;
+}
+
+function profileFromSchema(schema) {
+  const tables = schema?.tables || [];
+  const columnCount = tables.reduce((total, table) => total + (table.columns || []).length, 0);
+  const fkCount = tables.reduce((total, table) => total + (table.foreign_keys || []).length, 0);
+  const indexCount = tables.reduce((total, table) => total + (table.indexes || []).length, 0);
+  const uniqueCount = tables.reduce((total, table) => total + (table.unique_constraints || []).length, 0);
+  const missingKeyCount = tables.filter((table) => !(table.unique_constraints || []).length).length;
+  const wideTableCount = tables.filter((table) => (table.columns || []).length >= 30).length;
+  const clusters = abstractClustersFromSchema(tables);
+  return {
+    database: schema?.database || "",
+    status: tables.length ? "completed" : "unavailable",
+    summary: `${tables.length} tables, ${columnCount} columns, ${fkCount} relationships.`,
+    counts: {
+      tables: tables.length,
+      columns: columnCount,
+      foreign_keys: fkCount,
+      unique_constraints: uniqueCount,
+      indexes: indexCount,
+      tables_without_primary_key: missingKeyCount,
+      wide_tables: wideTableCount,
+    },
+    averages: {
+      columns_per_table: tables.length ? Math.round((columnCount / tables.length) * 100) / 100 : 0,
+      foreign_keys_per_table: tables.length ? Math.round((fkCount / tables.length) * 100) / 100 : 0,
+    },
+    clusters,
+    risk_signals: [
+      { label: "Tables without key evidence", value: missingKeyCount, severity: missingKeyCount ? "warning" : "ok" },
+      { label: "Wide tables", value: wideTableCount, severity: wideTableCount ? "warning" : "ok" },
+      { label: "Relationship density", value: tables.length ? Math.round((fkCount / tables.length) * 100) / 100 : 0, severity: "info" },
+    ],
+    storage: { total_relation_bytes: schema?.database_size_bytes || 0 },
+    privacy: { abstracted: true, table_names_returned: false, column_names_returned: false },
+  };
+}
+
+function abstractClustersFromSchema(tables) {
+  const nodes = new Set(tables.map((table) => `${table.schema}.${table.name}`));
+  const graph = new Map([...nodes].map((name) => [name, new Set()]));
+  const columnCounts = new Map(tables.map((table) => [`${table.schema}.${table.name}`, (table.columns || []).length]));
+  for (const table of tables) {
+    const source = `${table.schema}.${table.name}`;
+    for (const foreignKey of table.foreign_keys || []) {
+      const target = foreignKey.referenced_table;
+      if (graph.has(source) && graph.has(target)) {
+        graph.get(source).add(target);
+        graph.get(target).add(source);
+      }
+    }
+  }
+  const seen = new Set();
+  const clusters = [];
+  for (const node of [...graph.keys()].sort()) {
+    if (seen.has(node)) continue;
+    const stack = [node];
+    const component = [];
+    seen.add(node);
+    while (stack.length) {
+      const current = stack.pop();
+      component.push(current);
+      for (const neighbor of graph.get(current)) {
+        if (!seen.has(neighbor)) {
+          seen.add(neighbor);
+          stack.push(neighbor);
+        }
+      }
+    }
+    const edges = component.reduce((total, item) => total + graph.get(item).size, 0) / 2;
+    const columns = component.reduce((total, item) => total + (columnCounts.get(item) || 0), 0);
+    clusters.push({
+      label: `Cluster ${clusters.length + 1}`,
+      table_count: component.length,
+      relationship_count: edges,
+      average_columns: component.length ? Math.round((columns / component.length) * 100) / 100 : 0,
+      shape: edges / Math.max(component.length, 1) >= 1 ? "connected" : component.length > 1 ? "sparse" : "isolated",
+    });
+  }
+  return clusters.sort((a, b) => b.table_count - a.table_count).slice(0, 12);
+}
+
+function targetProfileFromRun(run) {
+  const createStep = step(run, "create_target_schema");
+  const migrateStep = step(run, "migrate_data");
+  const normalizeStep = step(run, "propose_3nf_schema");
+  const targetTables = normalizeStep.details?.target_tables || [];
+  const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
+  return {
+    database: run.summary?.new_database || "",
+    status: createStep.status === "completed" ? "completed" : "missing",
+    summary: createStep.status === "completed"
+      ? `${targetTables.length} proposed tables, ${targetColumns} proposed columns.`
+      : "Database has not been created yet.",
+    counts: {
+      tables: targetTables.length,
+      columns: targetColumns,
+      foreign_keys: targetTables.reduce((total, table) => total + (table.foreign_keys || []).length, 0),
+      indexes: 0,
+      estimated_rows: 0,
+      data_populated: migrateStep.status === "completed" ? 1 : 0,
+    },
+    clusters: [],
+    risk_signals: [
+      { label: "Schema created", value: createStep.status === "completed" ? "yes" : "no", severity: createStep.status === "completed" ? "ok" : "warning" },
+      { label: "Data migrated", value: migrateStep.status === "completed" ? "yes" : "no", severity: migrateStep.status === "completed" ? "ok" : "warning" },
+    ],
+  };
+}
+
+async function fetchArtifact(runId, artifactName) {
+  return api(`/api/runs/${runId}/artifacts/${artifactName}`);
+}
+
+async function loadCurrentArtifacts(run) {
+  const artifacts = {};
+  const names = ["inspect_source_schema", "extract_workload_logs", "collect_extended_metrics", "compare_disk_usage"];
+  await Promise.all(
+    names
+      .filter((name) => run.artifacts?.[name])
+      .map((name) =>
+        fetchArtifact(run.run_id, name)
+          .then((payload) => {
+            artifacts[name] = payload;
+          })
+          .catch(() => {}),
+      ),
+  );
+  return artifacts;
+}
+
+function renderTabs(run) {
+  return `
+    <nav class="workspace-tabs" aria-label="Run workflow">
+      ${WORKSPACE_TABS.map((tab) => {
+        const status = aggregateStatus(run, tab.steps, tab.id);
+        return `
+          <button class="tab-button tab-status-${escapeHtml(status)} ${activeTab === tab.id ? "is-active" : ""}" type="button" data-tab="${escapeHtml(tab.id)}">
+            <span>${escapeHtml(tab.label)}</span>
+            <small>${escapeHtml(status.replaceAll("_", " "))}</small>
+          </button>
+        `;
+      }).join("")}
+    </nav>
+  `;
+}
+
+function renderDatabasePair(run, sourceProfile, targetProfile) {
+  const originalFigure = databaseFigure("original", run, sourceProfile);
+  const targetFigure = databaseFigure("target", run, targetProfile);
+  return `
+    <section class="database-pair">
+      ${renderDatabaseFigure(originalFigure)}
+      <article class="bridge-state">
+        <span class="label">Flow</span>
+        ${pill(`source workload ${originalFigure.workloadStatus}`, originalFigure.workloadReady ? "completed" : "planned")}
+        ${pill(`db-new workload ${targetFigure.workloadStatus}`, targetFigure.workloadReady ? "completed" : "planned")}
+      </article>
+      ${renderDatabaseFigure(targetFigure)}
     </section>
   `;
 }
 
-function compactList(items, max = 250) {
-  if (!Array.isArray(items)) {
-    return [];
+function databaseFigure(kind, run, profile) {
+  const counts = profile.counts || {};
+  const createStep = step(run, "create_target_schema");
+  const migrateStep = step(run, "migrate_data");
+  const rewriteStep = step(run, "rewrite_queries");
+  const indexStep = step(run, "optimize_indexes");
+  const indexCreateStep = step(run, "create_secondary_indexes");
+  const workloadStep = step(run, "extract_workload_logs");
+  const originalBench = step(run, "run_pgbench_original");
+  const newBench = step(run, "run_pgbench_new");
+  const readiness = targetReadiness(run, profile);
+  const exists = profile.status === "completed";
+  const hasRows = readiness.hasRows;
+  const sourceWorkloadReady = workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0;
+  const targetWorkloadReady = rewriteStep.status === "completed" && Boolean(rewriteStep.details?.workload_path);
+  const noIndexWorkNeeded = indexStep.status === "completed" && Number(indexStep.details?.recommendation_count || 0) === 0;
+  const targetIndexesReady = indexCreateStep.status === "completed" || noIndexWorkNeeded;
+
+  if (kind === "original") {
+    const ready = exists && sourceWorkloadReady && Boolean(originalBench.details?.workload_path);
+    return {
+      kind,
+      title: "db-original",
+      database: run.summary?.original_database || profile.database || "source database",
+      headline: exists ? "Starting point is available" : "Starting point is missing",
+      summary: profile.summary || "Source profile has not been collected yet.",
+      ready,
+      workloadReady: sourceWorkloadReady,
+      workloadStatus: sourceWorkloadReady ? "available" : "missing",
+      actions: originalActions(run),
+      items: [
+        { label: "Database", value: exists ? "exists" : "missing", status: exists ? "ok" : "missing" },
+        { label: "Data", value: hasRows ? `${formatNumber(counts.estimated_rows)} estimated rows` : "no rows observed", status: hasRows ? "ok" : "warning" },
+        { label: "Indexes", value: `${formatNumber(counts.indexes || 0)} found`, status: Number(counts.indexes || 0) > 0 ? "ok" : "warning" },
+        { label: "Workload", value: sourceWorkloadReady ? "available" : "missing", status: sourceWorkloadReady ? "ok" : "pending" },
+        { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
+      ],
+    };
   }
-  return items.slice(0, max);
+
+  const ready = readiness.structureReady && readiness.dataReady && targetWorkloadReady && targetIndexesReady && Boolean(newBench.details?.workload_path);
+  return {
+    kind,
+    title: "db-new",
+    database: run.summary?.new_database || profile.database || "target database",
+    headline: exists ? "Target database exists" : "Target database not created",
+    summary: exists ? (profile.summary || "Target profile is available.") : "Structure, data, indexes, and workload will appear here as they are created.",
+    ready,
+    workloadReady: targetWorkloadReady,
+    workloadStatus: targetWorkloadReady ? "created" : "not created",
+    actions: targetActions(run, profile),
+    items: [
+      { label: "Database", value: exists ? "exists" : "not created", status: exists ? "ok" : "missing" },
+      { label: "Structure", value: readiness.structureReady ? "created" : "not created", status: readiness.structureReady ? "ok" : "pending" },
+      { label: "Data", value: readiness.dataReady ? "populated" : "not populated", status: readiness.dataReady ? "ok" : "pending" },
+      { label: "Indexes", value: targetIndexesReady ? "created" : indexCreateStep.status === "planned" ? "planned" : "not created", status: targetIndexesReady ? "ok" : "pending" },
+      { label: "Workload", value: targetWorkloadReady ? "created" : "not created", status: targetWorkloadReady ? "ok" : "pending" },
+      { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
+    ],
+  };
+}
+
+function renderDatabaseFigure(figure) {
+  return `
+    <article class="database-figure database-figure-${escapeHtml(figure.kind)}">
+      <header class="database-figure-head">
+        <div>
+          <span class="label">${escapeHtml(figure.title)}</span>
+          <strong>${escapeHtml(figure.database)}</strong>
+        </div>
+        ${pill(figure.ready ? "benchmark ready" : "not ready", figure.ready ? "completed" : "planned")}
+      </header>
+      <div class="db-glyph" aria-hidden="true">
+        <span></span>
+      </div>
+      <p class="database-headline">${escapeHtml(figure.headline)}</p>
+      <p class="database-summary">${escapeHtml(figure.summary)}</p>
+      <div class="state-checklist">
+        ${figure.items.map((item) => `
+          <div class="state-row state-${escapeHtml(item.status)}">
+            <span>${escapeHtml(item.label)}</span>
+            <strong>${escapeHtml(item.value)}</strong>
+          </div>
+        `).join("")}
+      </div>
+      ${figure.actions.length ? `<div class="database-actions">${figure.actions.join("")}</div>` : ""}
+    </article>
+  `;
+}
+
+function targetReadiness(run, profile) {
+  const counts = profile.counts || {};
+  const createStep = step(run, "create_target_schema");
+  const migrateStep = step(run, "migrate_data");
+  const exists = profile.status === "completed";
+  const hasRows = Number(counts.estimated_rows || 0) > 0 || Number(counts.populated_tables || 0) > 0;
+  return {
+    exists,
+    hasRows,
+    structureReady: exists || createStep.status === "completed",
+    dataReady: hasRows || migrateStep.status === "completed",
+  };
+}
+
+function renderProfileCards(profile) {
+  const counts = profile.counts || {};
+  return `
+    <div class="metric-grid">
+      ${metricCard("Tables", formatNumber(counts.tables))}
+      ${metricCard("Columns", formatNumber(counts.columns))}
+      ${metricCard("Relationships", formatNumber(counts.foreign_keys))}
+      ${metricCard("Indexes", formatNumber(counts.indexes))}
+      ${metricCard("Rows", formatNumber(counts.estimated_rows))}
+      ${metricCard("Key gaps", formatNumber(counts.tables_without_primary_key))}
+      ${metricCard("Wide tables", formatNumber(counts.wide_tables))}
+      ${metricCard("Storage", formatBytes(profile.storage?.total_relation_bytes || profile.storage?.database_size_bytes))}
+    </div>
+  `;
+}
+
+function renderClusters(profile) {
+  const clusters = profile.clusters || [];
+  if (!clusters.length) {
+    return `<div class="empty-inline">No schema clusters available yet.</div>`;
+  }
+  return `
+    <div class="cluster-list">
+      ${clusters.map((cluster) => `
+        <article class="cluster-row">
+          <strong>${escapeHtml(cluster.label)}</strong>
+          <span>${formatNumber(cluster.table_count)} tables</span>
+          <span>${formatNumber(cluster.relationship_count)} links</span>
+          <span>${escapeHtml(cluster.shape || "unknown")}</span>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderRiskSignals(profile) {
+  const signals = profile.risk_signals || [];
+  if (!signals.length) return "";
+  return `
+    <div class="signal-list">
+      ${signals.map((signal) => `
+        <article class="signal signal-${escapeHtml(signal.severity || "info")}">
+          <span>${escapeHtml(signal.label)}</span>
+          <strong>${escapeHtml(signal.value)}</strong>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function actionButton(run, action, label, tone = "", disabledReason = "") {
+  const disabled = disabledReason ? "disabled" : "";
+  const title = disabledReason ? ` title="${escapeHtml(disabledReason)}"` : "";
+  const reason = disabledReason ? `<small>${escapeHtml(disabledReason)}</small>` : "";
+  return `
+    <button class="action-button ${tone}" type="button" data-action="${escapeHtml(action)}" data-run-id="${escapeHtml(run.run_id)}" ${disabled}${title}>
+      <span>${escapeHtml(label)}</span>
+      ${reason}
+    </button>
+  `;
+}
+
+function originalActions(run) {
+  const actions = [];
+  const originalBench = step(run, "run_pgbench_original");
+  const disabledReason = originalBench.details?.workload_path
+    ? ""
+    : "Needs a source workload before pgbench can run.";
+  actions.push(actionButton(run, "run-pgbench-original", "Run pgbench on db-original", "primary-approval", disabledReason));
+  return actions;
+}
+
+function targetActions(run, profile = latestProfiles?.target || {}) {
+  const actions = [];
+  const createStep = step(run, "create_target_schema");
+  const migrateStep = step(run, "migrate_data");
+  const rewriteStep = step(run, "rewrite_queries");
+  const normalizationStep = step(run, "propose_3nf_schema");
+  const workloadStep = step(run, "extract_workload_logs");
+  const indexRecommendStep = step(run, "optimize_indexes");
+  const indexCreateStep = step(run, "create_secondary_indexes");
+  const newBench = step(run, "run_pgbench_new");
+  const hasCreateSql = (createStep.details?.sql_statements || []).length > 0;
+  const hasMigrationSql = (migrateStep.details?.statements || []).length > 0;
+  const indexSqlCount = secondaryIndexSqlStatements(run).length;
+  const hasIndexSql = indexSqlCount > 0;
+  const readiness = targetReadiness(run, profile);
+
+  actions.push(actionButton(
+    run,
+    "create-schema",
+    "Create db-new structure",
+    "primary-approval",
+    readiness.structureReady ? "db-new structure already exists." : hasCreateSql && ["planned", "failed"].includes(createStep.status || "") ? "" : "Needs generated db-new DDL first.",
+  ));
+  if (createStep.status === "failed" && hasCreateSql) {
+    actions.push(actionButton(run, "repair-schema", "Repair schema SQL"));
+  }
+  actions.push(actionButton(
+    run,
+    "migrate-data",
+    "Populate db-new",
+    "primary-approval",
+    readiness.dataReady ? "db-new already appears populated." : !readiness.structureReady ? "Create db-new structure first." : hasMigrationSql && ["planned", "failed"].includes(migrateStep.status || "") ? "" : "No migration SQL is available.",
+  ));
+  actions.push(actionButton(
+    run,
+    "regenerate-rewrite",
+    "Generate db-new workload",
+    "",
+    normalizationStep.status === "completed" && workloadStep.status === "completed" && ["planned", "completed", "failed"].includes(rewriteStep.status || "") ? "" : "Needs normalization and source workload first.",
+  ));
+  actions.push(actionButton(
+    run,
+    "create-secondary-indexes",
+    `Create secondary indexes${indexSqlCount ? ` (${indexSqlCount})` : ""}`,
+    "primary-approval",
+    !readiness.structureReady ? "Create db-new structure first." : hasIndexSql && indexCreateStep.status !== "completed" ? "" : indexCreateStep.status === "completed" ? "Secondary indexes are already created or not needed." : indexRecommendStep.status === "completed" ? "No secondary-index SQL is available." : "Run or regenerate index recommendations first.",
+  ));
+  actions.push(actionButton(
+    run,
+    "run-pgbench-new",
+    "Run pgbench on db-new",
+    "primary-approval",
+    newBench.details?.workload_path && readiness.structureReady && readiness.dataReady && rewriteStep.status === "completed"
+      ? ""
+      : !readiness.structureReady ? "Needs db-new structure first." : !readiness.dataReady ? "Needs db-new data before benchmarking." : rewriteStep.status !== "completed" || !newBench.details?.workload_path ? "Needs generated db-new workload first." : "db-new benchmark is not ready.",
+  ));
+  return actions;
+}
+
+function secondaryIndexSqlStatements(run) {
+  const indexCreateStep = step(run, "create_secondary_indexes");
+  const indexRecommendStep = step(run, "optimize_indexes");
+  return [
+    ...(indexCreateStep.details?.sql_statements || []),
+    ...(indexRecommendStep.details?.sql_statements || []),
+  ].filter((statement, index, statements) => statement && statements.indexOf(statement) === index);
+}
+
+function renderActionShelf(run) {
+  const actions = [...originalActions(run), ...targetActions(run)];
+  return actions.length ? `<div class="action-shelf">${actions.join("")}</div>` : `<div class="empty-inline">No gated action is ready.</div>`;
+}
+
+function renderStepCards(run, names) {
+  return `
+    <div class="step-card-grid">
+      ${names.map((name) => {
+        const item = effectiveStep(run, name);
+        const details = item.details || {};
+        const detailSummary = details.summary || details.status || item.error || "";
+        return `
+          <article class="step-card step-${escapeHtml(item.status || "pending")}">
+            <div class="step-card-head">
+              <strong>${escapeHtml(item.title || name)}</strong>
+              ${pill((item.status || "pending").replaceAll("_", " "), item.status || "pending")}
+            </div>
+            ${detailSummary ? `<p>${escapeHtml(detailSummary)}</p>` : ""}
+            ${item.error ? `<p class="error-text">${escapeHtml(item.error)}</p>` : ""}
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderSetup(run, sourceProfile) {
+  return `
+    <section class="tab-panel">
+      <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>Readiness</h2>
+          ${renderStepCards(run, ["llm_gateway", "inspect_source_schema", "extract_workload_logs"])}
+        </article>
+        <article class="workspace-panel">
+          <h2>Abstract Source Profile</h2>
+          ${renderProfileCards(sourceProfile)}
+          ${renderRiskSignals(sourceProfile)}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderProfile(run, sourceProfile, targetProfile) {
+  return `
+    <section class="tab-panel">
+      <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>db-original Profile</h2>
+          ${renderProfileCards(sourceProfile)}
+          ${renderRiskSignals(sourceProfile)}
+          <h3>Clusters</h3>
+          ${renderClusters(sourceProfile)}
+        </article>
+        <article class="workspace-panel">
+          <h2>db-new Profile</h2>
+          ${renderProfileCards(targetProfile)}
+          ${renderRiskSignals(targetProfile)}
+          <h3>Clusters</h3>
+          ${renderClusters(targetProfile)}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderNormalize(run) {
+  const normalize = step(run, "propose_3nf_schema");
+  const details = normalize.details || {};
+  const targetTables = details.target_tables || [];
+  const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
+  return `
+    <section class="tab-panel">
+      <article class="workspace-panel">
+        <h2>Normalization Plan</h2>
+        <div class="metric-grid">
+          ${metricCard("Status", details.status || normalize.status || "pending")}
+          ${metricCard("Findings", formatNumber((details.table_findings || []).length))}
+          ${metricCard("Dependencies", formatNumber((details.functional_dependencies || []).length))}
+          ${metricCard("Target tables", formatNumber(targetTables.length))}
+          ${metricCard("Target columns", formatNumber(targetColumns))}
+          ${metricCard("DDL statements", formatNumber((details.sql_statements || []).length))}
+        </div>
+        <p class="summary-text">${escapeHtml(details.summary || "No normalization result yet.")}</p>
+        ${renderStepCards(run, ["propose_3nf_schema"])}
+      </article>
+    </section>
+  `;
+}
+
+function renderMigrate(run, targetProfile) {
+  const targetActionHtml = targetActions(run, targetProfile);
+  return `
+    <section class="tab-panel">
+      <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>Target Database</h2>
+          ${renderStepCards(run, ["create_target_schema", "migrate_data"])}
+        </article>
+        <article class="workspace-panel">
+          <h2>db-new Actions</h2>
+          ${targetActionHtml.length ? `<div class="action-shelf">${targetActionHtml.join("")}</div>` : `<div class="empty-inline">No db-new action is ready.</div>`}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderWorkload(run, artifacts) {
+  const logs = artifacts.extract_workload_logs || {};
+  const rewrite = step(run, "rewrite_queries");
+  const summaryTables = step(run, "suggest_summary_tables");
+  const candidates = summaryTables.details?.candidates || [];
+  return `
+    <section class="tab-panel">
+      <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>Workload</h2>
+          <div class="metric-grid">
+            ${metricCard("Source", logs.source_kind || "pending")}
+            ${metricCard("Statements", formatNumber(logs.statements_detected || 0))}
+            ${metricCard("Transactions", formatNumber(logs.transactions_detected || 0))}
+            ${metricCard("Rewrite statements", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
+          </div>
+          ${renderStepCards(run, ["extract_workload_logs", "rewrite_queries"])}
+        </article>
+        <article class="workspace-panel">
+          <h2>Summary Tables</h2>
+          <div class="metric-grid">
+            ${metricCard("Candidates", formatNumber(candidates.length))}
+            ${metricCard("Creation", summaryTables.details?.creation_status || "placeholder")}
+          </div>
+          ${candidates.length ? `
+            <div class="candidate-list">
+              ${candidates.map((candidate) => `
+                <article class="candidate-card">
+                  <strong>${escapeHtml(candidate.label)}</strong>
+                  <span>${escapeHtml(candidate.pattern)}</span>
+                  <p>${escapeHtml(candidate.reason)}</p>
+                </article>
+              `).join("")}
+            </div>
+          ` : `<div class="empty-inline">No summary-table candidates yet.</div>`}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderPhysical(run) {
+  const indexes = step(run, "optimize_indexes");
+  const indexCreation = step(run, "create_secondary_indexes");
+  const tuning = step(run, "tune_postgresql_conf");
+  const indexSql = secondaryIndexSqlStatements(run);
+  return `
+    <section class="tab-panel">
+      <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>Secondary Indexes</h2>
+          <div class="metric-grid">
+            ${metricCard("Recommendations", formatNumber(indexes.details?.recommendation_count || 0))}
+            ${metricCard("Create status", indexCreation.status || "pending")}
+            ${metricCard("SQL statements", formatNumber(indexSql.length))}
+          </div>
+          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("create-secondary-indexes")).join("")}</div>
+          ${renderStepCards(run, ["optimize_indexes", "create_secondary_indexes"])}
+        </article>
+        <article class="workspace-panel">
+          <h2>PostgreSQL Tuning</h2>
+          <div class="metric-grid">
+            ${metricCard("Recommendations", formatNumber(tuning.details?.recommendation_count || 0))}
+            ${metricCard("Source", tuning.details?.source || "pending")}
+          </div>
+          ${renderStepCards(run, ["tune_postgresql_conf"])}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderBenchmark(run) {
+  const original = step(run, "run_pgbench_original");
+  const target = step(run, "run_pgbench_new");
+  return `
+    <section class="tab-panel">
+      <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>db-original</h2>
+          <div class="metric-grid">
+            ${metricCard("TPS", original.details?.throughput_tps ?? "pending")}
+            ${metricCard("Latency", original.details?.average_latency_ms ? `${original.details.average_latency_ms} ms` : "pending")}
+            ${metricCard("Energy", original.details?.joules_per_transaction ? `${original.details.joules_per_transaction} J/tx` : "pending")}
+          </div>
+          ${renderStepCards(run, ["run_pgbench_original"])}
+        </article>
+        <article class="workspace-panel">
+          <h2>db-new</h2>
+          <div class="metric-grid">
+            ${metricCard("TPS", target.details?.throughput_tps ?? "pending")}
+            ${metricCard("Latency", target.details?.average_latency_ms ? `${target.details.average_latency_ms} ms` : "pending")}
+            ${metricCard("Energy", target.details?.joules_per_transaction ? `${target.details.joules_per_transaction} J/tx` : "pending")}
+          </div>
+          ${renderStepCards(run, ["run_pgbench_new"])}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function renderCompare(run, artifacts) {
+  const comparison = artifacts.compare_disk_usage || step(run, "compare_disk_usage").details || {};
+  return `
+    <section class="tab-panel">
+      <article class="workspace-panel">
+        <h2>Comparison</h2>
+        <div class="metric-grid">
+          ${metricCard("Status", comparison.status || "pending")}
+          ${metricCard("Throughput change", comparison.throughput_change_percent !== undefined ? `${comparison.throughput_change_percent}%` : "pending")}
+          ${metricCard("Latency improvement", comparison.latency_improvement_percent !== undefined ? `${comparison.latency_improvement_percent}%` : "pending")}
+          ${metricCard("Storage change", comparison.size_change_percent !== undefined ? `${comparison.size_change_percent}%` : "pending")}
+          ${metricCard("Energy change", comparison.energy_per_transaction_change_percent !== undefined ? `${comparison.energy_per_transaction_change_percent}%` : "pending")}
+        </div>
+        ${renderStepCards(run, ["compare_disk_usage", "collect_extended_metrics"])}
+      </article>
+    </section>
+  `;
+}
+
+function renderActiveTab(run, artifacts, sourceProfile, targetProfile) {
+  if (activeTab === "profile") return renderProfile(run, sourceProfile, targetProfile);
+  if (activeTab === "normalize") return renderNormalize(run);
+  if (activeTab === "migrate") return renderMigrate(run, targetProfile);
+  if (activeTab === "workload") return renderWorkload(run, artifacts);
+  if (activeTab === "physical") return renderPhysical(run);
+  if (activeTab === "benchmark") return renderBenchmark(run);
+  if (activeTab === "compare") return renderCompare(run, artifacts);
+  return renderSetup(run, sourceProfile);
 }
 
 function renderPostgresStatus(payload) {
-  const checks = (payload.checks || [])
-    .map((check) => {
-      const details = check.status === "ok"
-        ? `
-          <div class="connection-detail">Connected as <code>${escapeHtml(check.current_user || "")}</code> to <code>${escapeHtml(check.current_database || check.database)}</code></div>
-          <div class="connection-detail">Server <code>${escapeHtml(check.server_version || "")}</code>${check.can_create_database === false ? " · no CREATEDB privilege detected" : ""}</div>
-        `
-        : `
-          <div class="connection-error">${escapeHtml(check.error || "Connection check failed.")}</div>
-        `;
-      const hint = check.hint ? `<div class="connection-hint">${escapeHtml(check.hint)}</div>` : "";
-      return `
-        <article class="connection-check connection-${escapeHtml(check.status)}">
-          <div class="connection-check-head">
-            <strong>${escapeHtml(check.label || check.database)}</strong>
-            <span>${escapeHtml(check.status)}</span>
-          </div>
-          ${details}
-          ${hint}
-        </article>
-      `;
-    })
-    .join("");
+  const checks = (payload.checks || []).map((check) => `
+    <article class="connection-check connection-${escapeHtml(check.status)}">
+      <div class="connection-check-head">
+        <strong>${escapeHtml(check.label || check.database)}</strong>
+        <span>${escapeHtml(check.status)}</span>
+      </div>
+      ${check.error ? `<p class="connection-error">${escapeHtml(check.error)}</p>` : `<p>${escapeHtml(check.current_database || check.database)} ${escapeHtml(check.server_version || "")}</p>`}
+    </article>
+  `).join("");
   postgresStatusBox.hidden = false;
   postgresStatusBox.dataset.status = payload.status || "unknown";
   postgresStatusBox.innerHTML = `
     <div class="connection-head">
-      <strong>PostgreSQL connection</strong>
+      <strong>PostgreSQL</strong>
       <span>${escapeHtml(payload.status || "unknown")}</span>
     </div>
     <div class="connection-target">
@@ -111,330 +819,6 @@ function renderPostgresStatus(payload) {
   `;
 }
 
-function renderRunActions(run) {
-  const normalizationStep = (run.steps || []).find((step) => step.name === "propose_3nf_schema");
-  const createStep = (run.steps || []).find((step) => step.name === "create_target_schema");
-  const migrateStep = (run.steps || []).find((step) => step.name === "migrate_data");
-  const rewriteStep = (run.steps || []).find((step) => step.name === "rewrite_queries");
-  const pgbenchOriginalStep = (run.steps || []).find((step) => step.name === "run_pgbench_original");
-  const pgbenchNewStep = (run.steps || []).find((step) => step.name === "run_pgbench_new");
-  const schemaSql = createStep?.details?.sql_statements || normalizationStep?.details?.sql_statements || [];
-  const canResetTargetDb =
-    schemaSql.length &&
-    ["planned", "completed", "failed"].includes(createStep?.status || "");
-  const canRunOriginalBenchmark =
-    !!pgbenchOriginalStep?.details?.workload_path &&
-    ["planned", "completed", "failed"].includes(pgbenchOriginalStep?.status || "");
-  const canRunNewBenchmark =
-    !!pgbenchNewStep?.details?.workload_path &&
-    ["planned", "completed", "failed"].includes(pgbenchNewStep?.status || "") &&
-    createStep?.status === "completed" &&
-    migrateStep?.status === "completed" &&
-    rewriteStep?.status === "completed";
-  const canRegenerateRewrite =
-    normalizationStep?.status === "completed" &&
-    (run.steps || []).find((step) => step.name === "extract_workload_logs")?.status === "completed" &&
-    ["planned", "completed", "failed"].includes(rewriteStep?.status || "");
-  const actions = [];
-
-  if (createStep?.status === "planned" && (createStep.details?.sql_statements || []).length) {
-    actions.push(`
-      <button class="action-button primary-approval" data-action="create-schema" data-run-id="${escapeHtml(run.run_id)}">
-        Approve db-new creation
-      </button>
-    `);
-  }
-
-  if (createStep?.status === "failed" && schemaSql.length) {
-    actions.push(`
-      <button class="action-button" data-action="repair-schema" data-run-id="${escapeHtml(run.run_id)}">
-        Repair schema SQL with LLM
-      </button>
-    `);
-  }
-
-  if (canResetTargetDb) {
-    actions.push(`
-      <button class="action-button" data-action="reset-target-db" data-run-id="${escapeHtml(run.run_id)}">
-        Drop db-new and reset
-      </button>
-    `);
-  }
-
-  if (
-    createStep?.status === "completed" &&
-    migrateStep?.status === "planned" &&
-    (migrateStep.details?.statements || []).length
-  ) {
-    actions.push(`
-      <button class="action-button primary-approval" data-action="migrate-data" data-run-id="${escapeHtml(run.run_id)}">
-        Approve data migration
-      </button>
-    `);
-  }
-
-  if (canRunOriginalBenchmark) {
-    actions.push(`
-      <button class="action-button primary-approval" data-action="run-pgbench-original" data-run-id="${escapeHtml(run.run_id)}">
-        Run pgbench on db-original
-      </button>
-    `);
-  }
-
-  if (canRegenerateRewrite) {
-    actions.push(`
-      <button class="action-button" data-action="regenerate-rewrite" data-run-id="${escapeHtml(run.run_id)}">
-        Regenerate rewritten workload
-      </button>
-    `);
-  }
-
-  if (canRunNewBenchmark) {
-    actions.push(`
-      <button class="action-button primary-approval" data-action="run-pgbench-new" data-run-id="${escapeHtml(run.run_id)}">
-        Run pgbench on db-new
-      </button>
-    `);
-  }
-
-  if (!actions.length) {
-    return `
-      <div class="run-actions-info">
-        No approval action is available yet for this run.
-      </div>
-    `;
-  }
-
-  return `
-    <div class="run-actions-panel">
-      <p class="approval-heading">Human approval</p>
-      <div class="run-actions">${actions.join("")}</div>
-    </div>
-  `;
-}
-
-function renderSummary(run) {
-  const summaryEntries = Object.entries(run.summary || {});
-  return summaryEntries.length
-    ? renderCollapsible(run.run_id, "summary", "Run summary", `${summaryEntries.length} fields`, () => {
-        const summary = summaryEntries
-          .map(
-            ([key, value]) => `
-              <div class="detail-row">
-                <span>${escapeHtml(key)}</span>
-                <code>${escapeHtml(renderValue(value))}</code>
-              </div>
-            `
-          )
-          .join("");
-        return `<div class="run-summary">${summary}</div>`;
-      })
-    : "";
-}
-
-function renderSteps(run) {
-  const steps = (run.steps || [])
-    .map((step) => {
-      const approval = step.requires_approval
-        ? '<p class="step-note">Human approval required before execution.</p>'
-        : "";
-      const error = step.error ? `<p class="step-error">${escapeHtml(step.error)}</p>` : "";
-      const detailEntries = Object.entries(step.details || {});
-      const detailCount = detailEntries.length;
-      const stepKey = `step-${step.name}`;
-      const detailsPanel = detailCount
-        ? renderCollapsible(
-            run.run_id,
-            stepKey,
-            "Step details",
-            `${detailCount} fields`,
-            () => {
-              const details = detailEntries
-                .map(
-                  ([key, value]) => `
-                    <div class="detail-row">
-                      <span>${escapeHtml(key)}</span>
-                      <code>${escapeHtml(renderValue(value))}</code>
-                    </div>
-                  `
-                )
-                .join("");
-              return `<div class="step-details">${details}</div>`;
-            },
-          )
-        : "";
-
-      return `
-        <li class="step step-${step.status}">
-          <div class="step-head">
-            <strong>${escapeHtml(step.title)}</strong>
-            <span>${escapeHtml(step.status)}</span>
-          </div>
-          ${approval}
-          ${error}
-          ${detailsPanel}
-        </li>
-      `;
-    })
-    .join("");
-
-  return renderCollapsible(run.run_id, "steps", "Pipeline steps", `${(run.steps || []).length} steps`, () => `<ul class="step-list">${steps}</ul>`);
-}
-
-function renderSourceTable(table) {
-  const columns = (table.columns || [])
-    .map(
-      (column) => `
-        <li>
-          <code>${escapeHtml(column.name)}</code>
-          <span>${escapeHtml(column.data_type)}</span>
-        </li>
-      `
-    )
-    .join("");
-  return `
-    <article class="preview-table">
-      <h4>${escapeHtml(`${table.schema}.${table.name}`)}</h4>
-      <ul>${columns}</ul>
-    </article>
-  `;
-}
-
-function renderTargetTable(table) {
-  const columns = (table.columns || [])
-    .map(
-      (column) => `
-        <li>
-          <code>${escapeHtml(column.name)}</code>
-          <span>${escapeHtml(`${column.source_table}.${column.source_column}`)}</span>
-        </li>
-      `
-    )
-    .join("");
-  const keyInfo = [];
-  if ((table.primary_key || []).length) {
-    keyInfo.push(`PK: ${(table.primary_key || []).join(", ")}`);
-  }
-  if ((table.foreign_keys || []).length) {
-    keyInfo.push(
-      ...table.foreign_keys.map((foreignKey) => {
-        return `FK: ${foreignKey.columns.join(", ")} -> ${foreignKey.references_table}(${foreignKey.references_columns.join(", ")})`;
-      }),
-    );
-  }
-  return `
-    <article class="preview-table normalized-table">
-      <h4>${escapeHtml(table.name)}</h4>
-      <p class="preview-purpose">${escapeHtml(table.purpose || "")}</p>
-      <ul>${columns}</ul>
-      ${keyInfo.length ? `<div class="preview-notes">${keyInfo.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</div>` : ""}
-    </article>
-  `;
-}
-
-function renderPreviewPanel(run, artifacts) {
-  const normalizationStep = (run.steps || []).find((step) => step.name === "propose_3nf_schema");
-  const migrationStep = (run.steps || []).find((step) => step.name === "migrate_data");
-  const rewriteStep = (run.steps || []).find((step) => step.name === "rewrite_queries");
-  const sourceTables = artifacts?.inspect_source_schema?.tables || [];
-  const targetTables = normalizationStep?.details?.target_tables || [];
-  const sqlStatements = normalizationStep?.details?.sql_statements || [];
-  const migrationStatements = migrationStep?.details?.statements || [];
-  const rewrittenStatements = rewriteStep?.details?.statements || [];
-  const sourceColumnCount = sourceTables.reduce((total, table) => total + (table.columns || []).length, 0);
-  const targetColumnCount = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
-  const renderSourceHtml = () => {
-    const tables = compactList(sourceTables);
-    const overflow = sourceTables.length > tables.length
-      ? `<div class="empty preview-empty">Showing ${tables.length} of ${sourceTables.length} source tables.</div>`
-      : "";
-    return tables.length
-      ? tables.map((table) => renderSourceTable(table)).join("") + overflow
-      : '<div class="empty preview-empty">Source schema preview unavailable.</div>';
-  };
-  const renderTargetHtml = () => {
-    const tables = compactList(targetTables);
-    const overflow = targetTables.length > tables.length
-      ? `<div class="empty preview-empty">Showing ${tables.length} of ${targetTables.length} target tables.</div>`
-      : "";
-    return tables.length
-      ? tables.map((table) => renderTargetTable(table)).join("") + overflow
-      : '<div class="empty preview-empty">No normalized target tables proposed yet.</div>';
-  };
-  const renderMigrationHtml = () => {
-    const statements = compactList(migrationStatements);
-    const overflow = migrationStatements.length > statements.length
-      ? `<div class="empty preview-empty">Showing ${statements.length} of ${migrationStatements.length} migration statements.</div>`
-      : "";
-    return statements.length
-      ? statements
-          .map(
-            (statement) => `
-              <article class="sql-card">
-                <p class="sql-purpose">${escapeHtml(statement.purpose || statement.target_table)}</p>
-                <pre>${escapeHtml(statement.sql)}</pre>
-              </article>
-            `,
-          )
-          .join("") + overflow
-      : '<div class="empty preview-empty">No migration SQL proposed yet.</div>';
-  };
-  const renderDdlHtml = () => {
-    const statements = compactList(sqlStatements);
-    const overflow = sqlStatements.length > statements.length
-      ? `<div class="empty preview-empty">Showing ${statements.length} of ${sqlStatements.length} DDL statements.</div>`
-      : "";
-    return statements.length
-      ? statements
-          .map(
-            (statement) => `
-              <article class="sql-card">
-                <p class="sql-purpose">Target schema DDL</p>
-                <pre>${escapeHtml(statement)}</pre>
-              </article>
-            `,
-          )
-          .join("") + overflow
-      : '<div class="empty preview-empty">No target schema SQL proposed yet.</div>';
-  };
-  const renderRewrittenHtml = () => {
-    const statements = compactList(rewrittenStatements);
-    const overflow = rewrittenStatements.length > statements.length
-      ? `<div class="empty preview-empty">Showing ${statements.length} of ${rewrittenStatements.length} rewritten queries.</div>`
-      : "";
-    return statements.length
-      ? statements
-          .map(
-            (statement) => `
-              <article class="sql-card">
-                <p class="sql-purpose">Rewritten db-new workload query</p>
-                <pre>${escapeHtml(statement)}</pre>
-              </article>
-            `,
-          )
-          .join("") + overflow
-      : '<div class="empty preview-empty">No rewritten db-new workload is available yet.</div>';
-  };
-
-  return `
-    <section class="preview-panel">
-      <div class="section-header">
-        <h3>Preview diff</h3>
-        <p>${sourceTables.length} source tables, ${sourceColumnCount} source columns, ${targetTables.length} target tables, ${targetColumnCount} target columns.</p>
-      </div>
-      ${renderCollapsible(run.run_id, "preview-source", "Source tables", `${sourceTables.length} tables, ${sourceColumnCount} columns`, renderSourceHtml)}
-      ${renderCollapsible(run.run_id, "preview-target", "Normalized target tables", `${targetTables.length} tables, ${targetColumnCount} columns`, renderTargetHtml)}
-      ${renderCollapsible(run.run_id, "preview-ddl", "Planned target schema SQL", `${sqlStatements.length} statements`, renderDdlHtml)}
-      ${renderCollapsible(run.run_id, "preview-migration", "Planned data migration SQL", `${migrationStatements.length} statements`, renderMigrationHtml)}
-      ${renderCollapsible(run.run_id, "preview-rewrite", "Rewritten workload for db-new", `${rewrittenStatements.length} statements`, renderRewrittenHtml)}
-    </section>
-  `;
-}
-
-async function fetchArtifact(runId, artifactName) {
-  return api(`/api/runs/${runId}/artifacts/${artifactName}`);
-}
-
 async function renderRuns(runs) {
   if (!runs.length) {
     runsContainer.innerHTML = '<div class="empty">No runs yet.</div>';
@@ -442,43 +826,46 @@ async function renderRuns(runs) {
   }
 
   const currentRun = runs[0];
+  const artifacts = await loadCurrentArtifacts(currentRun);
+  const sourceProfile = latestProfiles?.original?.status === "completed"
+    ? latestProfiles.original
+    : profileFromSchema(artifacts.inspect_source_schema);
+  const targetProfile = latestProfiles?.target?.status === "completed"
+    ? latestProfiles.target
+    : targetProfileFromRun(currentRun);
 
-  let currentArtifacts = {};
-  try {
-    const artifactPromises = [];
-    if (currentRun.artifacts?.inspect_source_schema) {
-      artifactPromises.push(
-        fetchArtifact(currentRun.run_id, "inspect_source_schema").then((payload) => {
-          currentArtifacts.inspect_source_schema = payload;
-        }),
-      );
-    }
-    await Promise.all(artifactPromises);
-  } catch (error) {
-    setStatus(`Could not load preview artifacts: ${error.message}`, true);
-  }
-
-  const currentSection = `
-    <section class="current-run-layout">
-      <article class="run-card current-run-card">
-        <p class="run-label">Current run</p>
-        <div class="run-topline">
-          <span class="run-id">${escapeHtml(currentRun.run_id)}</span>
-          <span class="badge badge-${escapeHtml(currentRun.status)}">${escapeHtml(currentRun.status)}</span>
+  runsContainer.innerHTML = `
+    <article class="workspace">
+      <header class="workspace-head">
+        <div>
+          <span class="label">Current run</span>
+          <strong>${escapeHtml(currentRun.run_id)}</strong>
+          <small>${escapeHtml(currentRun.created_at)}</small>
         </div>
-        <p class="run-meta">${escapeHtml(currentRun.created_at)}</p>
-        <p class="run-meta">${escapeHtml(currentRun.config_path)}</p>
-        ${renderRunActions(currentRun)}
-        ${renderPreviewPanel(currentRun, currentArtifacts)}
-        ${renderSummary(currentRun)}
-        ${renderSteps(currentRun)}
-      </article>
-    </section>
+        ${pill((currentRun.status || "pending").replaceAll("_", " "), currentRun.status || "pending")}
+      </header>
+      ${renderDatabasePair(currentRun, sourceProfile, targetProfile)}
+      ${renderTabs(currentRun)}
+      ${renderActiveTab(currentRun, artifacts, sourceProfile, targetProfile)}
+    </article>
   `;
-  runsContainer.innerHTML = currentSection;
 }
 
 async function refreshRuns() {
+  if (!latestProfiles) {
+    try {
+      const profileData = await api("/api/postgres/profile", {
+        method: "POST",
+        body: JSON.stringify({
+          config_path: configPathInput.value.trim(),
+          workload_path: workloadPathInput.value.trim(),
+        }),
+      });
+      latestProfiles = profileData.profiles;
+    } catch (error) {
+      latestProfiles = null;
+    }
+  }
   const data = await api("/api/runs");
   await renderRuns(data.runs || []);
   return data.runs || [];
@@ -495,81 +882,18 @@ async function pollRun(runId) {
     attempts += 1;
     const run = await api(`/api/runs/${runId}`);
     await refreshRuns();
-
     if (run.status === "running") {
-      setStatus(`Run ${runId} is still running. The current-run panel is updating automatically.`);
+      setStatus(`Run ${runId} is running.`);
       if (attempts >= 120) {
         clearInterval(activePoll);
         activePoll = null;
-        setStatus(
-          `Run ${runId} is still marked running after several minutes. Check the current-run panel for failed-step details.`,
-          true,
-        );
+        setStatus(`Run ${runId} is still running after several minutes.`, true);
       }
       return;
     }
-
     clearInterval(activePoll);
     activePoll = null;
-
-    const normalizationStep = (run.steps || []).find((step) => step.name === "propose_3nf_schema");
-    const normalizationSummary = normalizationStep?.details?.summary
-      ? ` Normalization note: ${normalizationStep.details.summary}`
-      : "";
-
-    if (run.status === "completed") {
-      const createStep = (run.steps || []).find((step) => step.name === "create_target_schema");
-      const migrateStep = (run.steps || []).find((step) => step.name === "migrate_data");
-      const rewriteStep = (run.steps || []).find((step) => step.name === "rewrite_queries");
-      const pgbenchOriginalStep = (run.steps || []).find((step) => step.name === "run_pgbench_original");
-      const pgbenchNewStep = (run.steps || []).find((step) => step.name === "run_pgbench_new");
-      const pendingActions = [];
-      if (createStep?.status === "planned" && (createStep.details?.sql_statements || []).length) {
-        pendingActions.push("db-new schema creation");
-      }
-      if (migrateStep?.status === "planned" && (migrateStep.details?.statements || []).length) {
-        pendingActions.push("data migration");
-      }
-      if (pgbenchOriginalStep?.status === "planned" && pgbenchOriginalStep?.details?.workload_path) {
-        pendingActions.push("db-original benchmarking");
-      }
-      if (
-        pgbenchNewStep?.status === "planned" &&
-        pgbenchNewStep?.details?.workload_path &&
-        createStep?.status === "completed" &&
-        migrateStep?.status === "completed" &&
-        rewriteStep?.status === "completed"
-      ) {
-        pendingActions.push("db-new benchmarking");
-      }
-      if (pendingActions.length) {
-        setStatus(
-          `Run ${runId} finished its planning phase. Use the approval buttons in the current run card for: ${pendingActions.join(", ")}.${normalizationSummary}`,
-        );
-        return;
-      }
-      setStatus(`Run ${runId} completed.${normalizationSummary}`);
-      return;
-    }
-
-    if (run.status === "awaiting_input") {
-      const workloadStep = (run.steps || []).find((step) => step.name === "extract_workload_logs");
-      const recommendation = workloadStep?.details?.recommended_action
-        ? ` ${workloadStep.details.recommended_action}`
-        : "";
-      const createStep = (run.steps || []).find((step) => step.name === "create_target_schema");
-      if (createStep?.status === "failed") {
-        setStatus(
-          `Run ${runId} needs human review. PostgreSQL rejected the proposed db-new schema, and you can now repair the SQL with the LLM or reset db-new.${normalizationSummary}`,
-          true,
-        );
-        return;
-      }
-      setStatus(`Run ${runId} is waiting for human input.${recommendation}${normalizationSummary}`, true);
-      return;
-    }
-
-    setStatus(`Run ${runId} failed.${normalizationSummary}`, true);
+    setStatus(run.status === "completed" ? `Run ${runId} completed.` : `Run ${runId} needs attention.`, run.status !== "completed");
   };
 
   await pollOnce();
@@ -585,62 +909,80 @@ async function pollRun(runId) {
 async function startRun() {
   const config_path = configPathInput.value.trim();
   const workload_path = workloadPathInput.value.trim();
-  setStatus("Starting MVP collection run...");
+  setStatus("Starting collection run...");
   const data = await api("/api/runs", {
     method: "POST",
     body: JSON.stringify({ config_path, workload_path }),
   });
-  setStatus(`Run ${data.run_id} accepted. Tracking progress...`);
+  setStatus(`Run ${data.run_id} accepted.`);
   await pollRun(data.run_id);
 }
 
 async function triggerRunAction(runId, action) {
   const labels = {
-    "create-schema": "Starting db-new schema creation...",
-    "repair-schema": "Asking the LLM to repair the failed schema SQL...",
-    "reset-target-db": "Dropping db-new and resetting approval steps...",
-    "migrate-data": "Starting data migration...",
-    "regenerate-rewrite": "Regenerating the rewritten workload for db-new...",
-    "run-pgbench-original": "Starting pgbench against db-original...",
-    "run-pgbench-new": "Starting pgbench against db-new...",
+    "create-schema": "Creating db-new schema...",
+    "repair-schema": "Repairing schema SQL...",
+    "reset-target-db": "Resetting db-new...",
+    "migrate-data": "Migrating data...",
+    "regenerate-rewrite": "Regenerating workload...",
+    "create-secondary-indexes": "Creating secondary indexes...",
+    "run-pgbench-original": "Benchmarking db-original...",
+    "run-pgbench-new": "Benchmarking db-new...",
   };
   setStatus(labels[action] || "Starting action...");
   const data = await api(`/api/runs/${runId}/actions/${action}`, {
     method: "POST",
     body: JSON.stringify({}),
   });
-  setStatus(`Action ${data.action} accepted for ${data.run_id}. Tracking progress...`);
+  setStatus(`Action ${data.action} accepted.`);
   await pollRun(data.run_id);
 }
 
 async function testLLM() {
   const config_path = configPathInput.value.trim();
   setStatus("Testing LLM gateway...");
-  const data = await api("/api/llm/test", {
-    method: "POST",
-    body: JSON.stringify({ config_path }),
-  });
-  setStatus(JSON.stringify(data, null, 2));
+  try {
+    const data = await api("/api/llm/test", {
+      method: "POST",
+      body: JSON.stringify({ config_path }),
+    });
+    latestLlmStatus = {
+      status: "completed",
+      summary: "LLM gateway responded successfully.",
+    };
+    await refreshRuns();
+    setStatus(JSON.stringify(data, null, 2));
+  } catch (error) {
+    latestLlmStatus = {
+      status: "failed",
+      summary: error.message,
+    };
+    await refreshRuns();
+    throw error;
+  }
 }
 
 async function checkPostgres() {
   const config_path = configPathInput.value.trim();
   const workload_path = workloadPathInput.value.trim();
-  setStatus("Checking PostgreSQL connection...");
+  setStatus("Checking PostgreSQL...");
   const data = await api("/api/postgres/status", {
     method: "POST",
     body: JSON.stringify({ config_path, workload_path }),
   });
+  latestPostgresStatus = data;
   renderPostgresStatus(data);
-  if (data.status === "ok") {
-    setStatus("PostgreSQL connection check completed successfully.");
-    return;
+  try {
+    const profileData = await api("/api/postgres/profile", {
+      method: "POST",
+      body: JSON.stringify({ config_path, workload_path }),
+    });
+    latestProfiles = profileData.profiles;
+    await refreshRuns();
+  } catch (error) {
+    latestProfiles = null;
   }
-  if (data.status === "warning") {
-    setStatus(data.hint || "PostgreSQL connection works, but a permission warning was detected.", true);
-    return;
-  }
-  setStatus(data.hint || "PostgreSQL connection check failed.", true);
+  setStatus(data.status === "ok" ? "PostgreSQL is ready." : data.hint || "PostgreSQL check needs attention.", data.status !== "ok");
 }
 
 document.getElementById("runButton").addEventListener("click", () => {
@@ -660,25 +1002,16 @@ document.getElementById("refreshButton").addEventListener("click", () => {
 });
 
 runsContainer.addEventListener("click", (event) => {
-  const toggle = event.target.closest("[data-toggle-panel]");
-  if (toggle) {
-    const key = panelKey(toggle.dataset.runId, toggle.dataset.togglePanel);
-    if (openPanels.has(key)) {
-      openPanels.delete(key);
-    } else {
-      openPanels.add(key);
-    }
+  const tab = event.target.closest("[data-tab]");
+  if (tab) {
+    activeTab = tab.dataset.tab;
     refreshRuns().catch((error) => setStatus(error.message, true));
     return;
   }
 
   const button = event.target.closest("[data-action]");
-  if (!button) {
-    return;
-  }
-  const runId = button.dataset.runId;
-  const action = button.dataset.action;
-  triggerRunAction(runId, action).catch((error) => setStatus(error.message, true));
+  if (!button) return;
+  triggerRunAction(button.dataset.runId, button.dataset.action).catch((error) => setStatus(error.message, true));
 });
 
 refreshRuns().catch((error) => setStatus(error.message, true));

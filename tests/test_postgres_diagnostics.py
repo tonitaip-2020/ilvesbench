@@ -22,6 +22,62 @@ class PostgresDiagnosticsTests(unittest.TestCase):
         self.assertIn("original_database/admin_database", inspector._connection_hint('database "mvp_db" does not exist'))
         self.assertIn("role privileges", inspector._connection_hint("permission denied for schema public"))
 
+    def test_abstract_profile_does_not_return_table_or_column_names(self) -> None:
+        inspector = PostgresInspector(PostgresConfig(schemas=["public"]))
+        profile = inspector._build_abstract_profile(
+            "source_db",
+            {
+                "tables": [
+                    {
+                        "table_schema": "public",
+                        "table_name": "sensitive_orders",
+                        "column_count": 3,
+                        "nullable_column_count": 1,
+                        "defaulted_column_count": 0,
+                    },
+                    {
+                        "table_schema": "public",
+                        "table_name": "sensitive_customers",
+                        "column_count": 2,
+                        "nullable_column_count": 0,
+                        "defaulted_column_count": 1,
+                    },
+                ],
+                "data_types": [
+                    {"table_schema": "public", "table_name": "sensitive_orders", "data_type": "integer", "count": 1},
+                    {"table_schema": "public", "table_name": "sensitive_orders", "data_type": "text", "count": 2},
+                ],
+                "constraints": [
+                    {
+                        "table_schema": "public",
+                        "table_name": "sensitive_orders",
+                        "constraint_name": "orders_pkey",
+                        "constraint_type": "PRIMARY KEY",
+                        "referenced_table_schema": None,
+                        "referenced_table_name": None,
+                    },
+                    {
+                        "table_schema": "public",
+                        "table_name": "sensitive_orders",
+                        "constraint_name": "orders_customer_fkey",
+                        "constraint_type": "FOREIGN KEY",
+                        "referenced_table_schema": "public",
+                        "referenced_table_name": "sensitive_customers",
+                    },
+                ],
+                "index_count": 3,
+            },
+            [{"total_bytes": 8192}],
+        )
+
+        self.assertTrue(profile["privacy"]["abstracted"])
+        self.assertEqual(profile["counts"]["tables"], 2)
+        self.assertEqual(profile["counts"]["foreign_keys"], 1)
+        self.assertEqual(profile["counts"]["indexes"], 3)
+        rendered = str(profile)
+        self.assertNotIn("sensitive_orders", rendered)
+        self.assertNotIn("sensitive_customers", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
