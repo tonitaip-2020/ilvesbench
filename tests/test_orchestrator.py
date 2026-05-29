@@ -54,6 +54,9 @@ class RecordingPostgres:
         self.executed.extend(statements)
         return [{"statement": statement} for statement in statements]
 
+    def ensure_source_fdw(self, target_database: str, source_schema_alias: str, table_names: list[str]) -> list[dict]:
+        return [{"schema": source_schema_alias, "table": table_name} for table_name in table_names]
+
     def truncate_user_tables(self, database: str) -> list[str]:
         self.truncated = True
         return ["public.items", "public.items_lookup"]
@@ -626,6 +629,87 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(migrate_step.status, "planned")
             self.assertEqual(migrate_step.details["truncated_table_count"], 2)
             self.assertEqual(pgbench_new_step.status, "planned")
+
+    def test_migrate_data_generates_missing_deterministic_migration_sql(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            postgres = RecordingPostgres()
+            orchestrator._postgres = postgres
+            record = orchestrator.create_mvp_record()
+            record.artifacts["inspect_source_schema"] = orchestrator.store.write_artifact(
+                record.run_id,
+                "schema_snapshot",
+                to_dict(orchestrator._fake_schema),
+            )
+            target_tables = [
+                {
+                    "name": "items_lookup",
+                    "source_tables": ["public.items"],
+                    "columns": [
+                        {"source_table": "public.items", "source_column": "ID", "name": "id"},
+                        {"source_table": "public.items", "source_column": "Name", "name": "name"},
+                    ],
+                    "primary_key": ["id"],
+                    "foreign_keys": [],
+                    "migration_strategy": "copy_distinct",
+                }
+            ]
+            record = orchestrator._replace_step(
+                record,
+                "propose_3nf_schema",
+                status="completed",
+                details={"target_tables": target_tables, "sql_statements": ["CREATE TABLE items_lookup (id integer, name text);"]},
+                error=None,
+                planned_only=False,
+            )
+            record = orchestrator._replace_step(
+                record,
+                "create_target_schema",
+                status="completed",
+                details={"sql_statements": ["CREATE TABLE items_lookup (id integer, name text);"]},
+                error=None,
+                planned_only=False,
+            )
+            record = orchestrator._replace_step(
+                record,
+                "migrate_data",
+                status="failed",
+                details={"summary": "Previous migration SQL was missing."},
+                error="No migration SQL is available for this run.",
+                planned_only=False,
+            )
+            orchestrator.store.upsert_run(record)
+
+            orchestrator.begin_migrate_data(record.run_id)
+            updated = orchestrator.execute_migrate_data(record.run_id)
+
+            migrate_step = next(step for step in updated.steps if step.name == "migrate_data")
+            self.assertEqual(migrate_step.status, "completed")
+            self.assertEqual(migrate_step.details["source"], "deterministic_1nf")
+            self.assertEqual(migrate_step.details["executed_statement_count"], 1)
+            self.assertIn('"id", "name"', postgres.executed[0])
+            self.assertNotIn('"ID"', postgres.executed[0])
+            self.assertNotIn('"Name"', postgres.executed[0])
 
     def test_normalization_review_approval_generates_final_ddl(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

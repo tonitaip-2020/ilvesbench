@@ -320,6 +320,9 @@ class PipelineOrchestrator:
 
             migrate_step = next(step for step in record.steps if step.name == "migrate_data")
             schema = self._load_schema_artifact(record)
+            if not migrate_step.details.get("statements"):
+                record = self._plan_migration_step(record, schema)
+                migrate_step = next(step for step in record.steps if step.name == "migrate_data")
             if migrate_step.details.get("source") == "deterministic_1nf":
                 refreshed = self._migration_planner.plan(schema, migrate_step.details.get("target_tables", []))
                 if refreshed.statements:

@@ -682,18 +682,24 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const newBench = step(run, "run_pgbench_new");
   const hasCreateSql = (createStep.details?.sql_statements || []).length > 0;
   const hasMigrationSql = (migrateStep.details?.statements || []).length > 0;
+  const hasTargetTables = (normalizationStep.details?.target_tables || []).length > 0;
   const indexSqlCount = secondaryIndexSqlStatements(run).length;
   const hasIndexSql = indexSqlCount > 0;
   const readiness = targetReadiness(run, profile);
   const selectionOnlyReason = run.selectionOnly ? `Start a run for ${selectedOriginalDatabase(run) || "the selected source database"} first.` : "";
   const noTargetReason = !readiness.exists && createStep.status !== "completed" ? `${targetName} does not exist yet.` : "";
+  const canApplyCreateSql = hasCreateSql && ["planned", "failed", "pending"].includes(createStep.status || "");
+  const migrationStatus = migrateStep.status || "";
+  const canGenerateOrRunMigration = readiness.structureReady
+    && (hasMigrationSql || hasTargetTables)
+    && ["planned", "failed", "pending", "completed"].includes(migrationStatus);
 
   actions.push(actionButton(
     run,
     "create-schema",
-    `Create ${targetName} structure`,
+    `${readiness.structureReady ? "Apply" : "Create"} ${targetName} structure`,
     "primary-approval",
-    selectionOnlyReason || (readiness.structureReady ? `${targetName} structure already exists.` : hasCreateSql && ["planned", "failed"].includes(createStep.status || "") ? "" : `Needs generated DDL for ${targetName} first.`),
+    selectionOnlyReason || (createStep.status === "completed" ? `${targetName} structure has already been created for this run.` : canApplyCreateSql ? "" : `Needs generated DDL for ${targetName} first.`),
   ));
   if (createStep.status === "failed" && hasCreateSql) {
     actions.push(actionButton(run, "repair-schema", "Repair schema SQL"));
@@ -715,9 +721,9 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   actions.push(actionButton(
     run,
     "migrate-data",
-    `Populate ${targetName}`,
+    `${hasMigrationSql ? "Populate" : "Generate and populate"} ${targetName}`,
     "primary-approval",
-    selectionOnlyReason || (readiness.dataReady ? `${targetName} already appears populated.` : !readiness.structureReady ? `Create ${targetName} structure first.` : hasMigrationSql && ["planned", "failed"].includes(migrateStep.status || "") ? "" : "No migration SQL is available."),
+    selectionOnlyReason || (readiness.dataReady ? `${targetName} already appears populated.` : !readiness.structureReady ? `Create ${targetName} structure first.` : canGenerateOrRunMigration ? "" : "No approved target tables or migration SQL are available."),
   ));
   actions.push(actionButton(
     run,
@@ -824,7 +830,7 @@ function renderProfile(run, sourceProfile, targetProfile) {
   `;
 }
 
-function renderNormalize(run) {
+function renderNormalize(run, targetProfile = latestProfiles?.target || {}) {
   const firstNormalForm = step(run, "scan_first_normal_form");
   const normalize = step(run, "propose_3nf_schema");
   const details = normalize.details || {};
@@ -835,6 +841,9 @@ function renderNormalize(run) {
   const targetTables = details.target_tables || [];
   const draftTargetTables = details.draft_target_tables || [];
   const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
+  const nextActions = targetActions(run, targetProfile).filter((html) =>
+    html.includes('data-action="create-schema"') || html.includes('data-action="migrate-data"')
+  );
   return `
     <section class="tab-panel">
       <article class="workspace-panel">
@@ -851,6 +860,9 @@ function renderNormalize(run) {
         </div>
         <p class="summary-text">${escapeHtml(details.summary || "No normalization result yet.")}</p>
         ${renderNormalizationReviews(run, reviews)}
+        ${normalize.status === "completed" || details.review_status === "completed" ? `
+          <div class="action-shelf">${nextActions.join("")}</div>
+        ` : ""}
         ${firstNormalFormFindings.length ? `
           <div class="candidate-list">
             ${firstNormalFormFindings.map((finding) => `
@@ -1020,7 +1032,7 @@ function renderCompare(run, artifacts) {
 
 function renderActiveTab(run, artifacts, sourceProfile, targetProfile) {
   if (activeTab === "profile") return renderProfile(run, sourceProfile, targetProfile);
-  if (activeTab === "normalize") return renderNormalize(run);
+  if (activeTab === "normalize") return renderNormalize(run, targetProfile);
   if (activeTab === "migrate") return renderMigrate(run, targetProfile);
   if (activeTab === "workload") return renderWorkload(run, artifacts);
   if (activeTab === "physical") return renderPhysical(run);
@@ -1112,6 +1124,11 @@ async function renderRuns(runs) {
   const headerMeta = currentRun.selectionOnly
     ? (latestRun ? `Latest saved run ${latestRun.run_id} uses a different database pair.` : "No run exists for this database pair yet.")
     : currentRun.created_at;
+  const switchLatestButton = currentRun.selectionOnly && latestRun?.summary?.original_database && latestRun?.summary?.new_database
+    ? `<button class="action-button" type="button" data-use-run-selection data-original-database="${escapeHtml(latestRun.summary.original_database)}" data-new-database="${escapeHtml(latestRun.summary.new_database)}">
+        <span>Use latest run databases</span>
+      </button>`
+    : "";
 
   runsContainer.innerHTML = `
     <article class="workspace">
@@ -1122,6 +1139,7 @@ async function renderRuns(runs) {
           <small>${escapeHtml(headerMeta)}</small>
           <small>Source database: ${escapeHtml(selectedOriginalDatabase(currentRun) || "not selected")}</small>
         </div>
+        ${switchLatestButton}
         ${pill((currentRun.status || "pending").replaceAll("_", " "), currentRun.status || "pending")}
       </header>
       ${renderDatabasePair(currentRun, sourceProfile, targetProfile)}
@@ -1355,6 +1373,30 @@ runsContainer.addEventListener("click", (event) => {
       reviewButton.dataset.reviewId,
       reviewButton.dataset.reviewAction,
     ).catch((error) => setStatus(error.message, true));
+    return;
+  }
+
+  const useRunSelection = event.target.closest("[data-use-run-selection]");
+  if (useRunSelection) {
+    const original = useRunSelection.dataset.originalDatabase || "";
+    const target = useRunSelection.dataset.newDatabase || "";
+    if (original) {
+      let option = [...originalDatabaseSelect.options].find((item) => item.value === original);
+      if (!option) {
+        option = new Option(original, original);
+        originalDatabaseSelect.add(option);
+      }
+      originalDatabaseSelect.value = original;
+    }
+    if (target) {
+      newDatabaseInput.value = target;
+      lastAutoTargetDatabase = target;
+    }
+    latestProfiles = null;
+    latestProfilesContext = "";
+    latestPostgresStatus = null;
+    updateDatabaseSelectionStatus();
+    refreshRuns().catch((error) => setStatus(error.message, true));
     return;
   }
 

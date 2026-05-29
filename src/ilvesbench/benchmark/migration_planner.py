@@ -22,7 +22,7 @@ class MigrationPlanner:
     def __init__(self, llm: LLMGateway | None = None) -> None:
         self._llm = llm
 
-    def plan(self, schema: SchemaSnapshot, target_tables: list[dict]) -> MigrationProposal:
+    def plan(self, schema: SchemaSnapshot | None, target_tables: list[dict]) -> MigrationProposal:
         if not target_tables:
             return MigrationProposal(
                 status="no_migration_needed",
@@ -30,7 +30,7 @@ class MigrationPlanner:
                 rationale=["Migration planning requires a target-table decomposition."],
                 source="fallback",
             )
-        deterministic = self._deterministic_first_normal_form_plan(target_tables)
+        deterministic = self._deterministic_first_normal_form_plan(schema, target_tables)
         if deterministic is not None:
             return deterministic
         if self._llm is None:
@@ -118,7 +118,7 @@ class MigrationPlanner:
             {"role": "user", "content": user_prompt},
         ]
 
-    def _deterministic_first_normal_form_plan(self, target_tables: list[dict]) -> MigrationProposal | None:
+    def _deterministic_first_normal_form_plan(self, schema: SchemaSnapshot | None, target_tables: list[dict]) -> MigrationProposal | None:
         if not any(table.get("migration_strategy") for table in target_tables):
             return None
 
@@ -130,7 +130,11 @@ class MigrationPlanner:
             if not source_table:
                 continue
             target_columns = [str(column.get("name", "")) for column in table.get("columns", []) if column.get("name")]
-            source_columns = [str(column.get("source_column", "")) for column in table.get("columns", []) if column.get("source_column")]
+            source_columns = [
+                self._source_column_name(schema, source_table, str(column.get("source_column", "")))
+                for column in table.get("columns", [])
+                if column.get("source_column")
+            ]
             if not target_columns or len(target_columns) != len(source_columns):
                 continue
             target_column_sql = ", ".join(self._quote_identifier(column) for column in target_columns)
@@ -162,7 +166,8 @@ class MigrationPlanner:
             selected_columns = ", ".join(
                 [self._quote_identifier(column) for column in parent_columns] + ["trim(extracted_value)"]
             )
-            source_column_sql = self._quote_identifier(source_column)
+            resolved_source_column = self._source_column_name(schema, source_table, source_column)
+            source_column_sql = self._quote_identifier(resolved_source_column)
             statements.append(
                 {
                     "target_table": table["name"],
@@ -196,6 +201,28 @@ class MigrationPlanner:
 
     def _source_table_name(self, source_table: str) -> str:
         return source_table.split(".")[-1]
+
+    def _source_column_name(self, schema: SchemaSnapshot | None, source_table: str, source_column: str) -> str:
+        source_column = source_column.strip()
+        if not source_column:
+            return ""
+        if schema is None:
+            return source_column
+        schema_name = source_table.split(".")[0] if "." in source_table else ""
+        table_name = self._source_table_name(source_table)
+        normalized = self._sanitize_identifier(source_column)
+        for table in schema.tables:
+            if table.name.lower() != table_name.lower():
+                continue
+            if schema_name and table.schema.lower() != schema_name.lower():
+                continue
+            for column in table.columns:
+                if column.name == source_column:
+                    return column.name
+            for column in table.columns:
+                if column.name.lower() == source_column.lower() or self._sanitize_identifier(column.name) == normalized:
+                    return column.name
+        return source_column
 
     def _sql_literal(self, value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
