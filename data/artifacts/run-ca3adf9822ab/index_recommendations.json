@@ -1,8 +1,0 @@
-{
-  "status": "unavailable",
-  "summary": "Index recommendations need inspected source tables or normalized target tables.",
-  "source": "heuristic",
-  "recommendation_count": 0,
-  "recommendations": [],
-  "sql_statements": []
-}

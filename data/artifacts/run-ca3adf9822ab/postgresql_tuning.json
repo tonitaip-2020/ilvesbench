@@ -1,9 +1,0 @@
-{
-  "status": "insufficient_hardware",
-  "summary": "Hardware memory was unavailable, so PostgreSQL knob recommendations were not generated.",
-  "source": "heuristic",
-  "recommendation_count": 0,
-  "recommendations": [],
-  "postgresql_conf_lines": [],
-  "alter_system_statements": []
-}
