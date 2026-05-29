@@ -123,6 +123,27 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 status=HTTPStatus.ACCEPTED,
             )
             return
+        if parsed.path == "/api/runs/actions/regenerate-rewrite":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
+            record = self.server.orchestrator.create_state_resume_record()
+            thread = threading.Thread(
+                target=self.server.orchestrator.execute_query_migration_from_current_state,
+                args=(record,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json(
+                {"status": "accepted", "run_id": record.run_id, "action": "regenerate-rewrite"},
+                status=HTTPStatus.ACCEPTED,
+            )
+            return
         if parsed.path.endswith("/actions/create-schema"):
             run_id = parsed.path.split("/")[-3]
             self.server.orchestrator.begin_create_target_schema(run_id)
@@ -279,6 +300,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             )
             profiles = self.server.orchestrator.profile_databases()
             self._send_json({"status": "ok", "profiles": profiles})
+            return
+        if parsed.path == "/api/workload/status":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
+            self._send_json(self.server.orchestrator.workload_source_status())
             return
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 

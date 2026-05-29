@@ -38,7 +38,7 @@
         <label class="field">
           <span>Workload file path (optional)</span>
           <input id="workloadPath" type="text" placeholder="data/workload.sql">
-          <small class="field-help">Default: <code>data/workload.sql</code>.</small>
+          <small class="field-help">Relative paths resolve from the config file directory.</small>
         </label>
         <div class="actions">
           <button id="runButton" class="primary">Start run</button>
@@ -48,6 +48,7 @@
           <button id="refreshButton">Refresh</button>
         </div>
         <div id="dbSelectionStatus" class="selection-status"></div>
+        <div id="workloadSourceStatus" class="selection-status workload-source-status"></div>
         <div id="postgresStatus" class="connection-status" hidden></div>
         <pre id="statusBox" class="status-box">Waiting for input.</pre>
       </section>

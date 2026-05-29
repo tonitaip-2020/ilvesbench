@@ -8,6 +8,11 @@ from ilvesbench.llm.gateway import LLMGateway
 from ilvesbench.models import LogSummary
 
 
+LINE_COMMENT_RE = re.compile(r"--.*?$", re.MULTILINE)
+BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+PGBENCH_META_COMMAND_RE = re.compile(r"^\s*\\.*$", re.MULTILINE)
+
+
 @dataclass(slots=True)
 class WorkloadPlan:
     status: str
@@ -23,6 +28,12 @@ class WorkloadRewriteProposal:
     statements: list[str] = field(default_factory=list)
     source: str = "fallback"
     raw_response_text: str | None = None
+
+
+class WorkloadRewriteError(ValueError):
+    def __init__(self, message: str, raw_response_text: str = "") -> None:
+        super().__init__(message)
+        self.raw_response_text = raw_response_text
 
 
 class WorkloadPlanner:
@@ -84,13 +95,99 @@ class WorkloadPlanner:
                 source="fallback",
             )
 
-        llm_result = self._llm.generate(
-            self._build_rewrite_messages(normalized_source_statements, target_tables, migration_statements),
-            max_tokens=2400,
+        if len(normalized_source_statements) > 1:
+            return self._rewrite_statement_batches(
+                normalized_source_statements,
+                target_tables,
+                migration_statements,
+            )
+        return self._rewrite_statement_batch(normalized_source_statements, target_tables, migration_statements)
+
+    def _rewrite_statement_batches(
+        self,
+        source_statements: list[str],
+        target_tables: list[dict],
+        migration_statements: list[dict],
+    ) -> WorkloadRewriteProposal:
+        statements: list[str] = []
+        reasoning: list[str] = []
+        raw_responses: list[str] = []
+        sources: list[str] = []
+        for index, statement in enumerate(source_statements, start=1):
+            proposal = self._rewrite_statement_batch([statement], target_tables, migration_statements, batch_index=index)
+            statements.extend(proposal.statements)
+            reasoning.extend(proposal.rationale)
+            sources.append(proposal.source)
+            if proposal.raw_response_text:
+                raw_responses.append(f"Batch {index}:\n{proposal.raw_response_text}")
+        return WorkloadRewriteProposal(
+            status="planned",
+            summary=f"Rewrote {len(statements)} query statement(s) for db-new in {len(source_statements)} model call(s).",
+            rationale=reasoning,
+            statements=statements,
+            source="llm_batched" if any(source == "llm" for source in sources) else "llm_batched_fallback",
+            raw_response_text="\n\n".join(raw_responses),
         )
-        proposal = self._proposal_from_response(llm_result.response_text, target_tables)
-        proposal.raw_response_text = llm_result.response_text
-        return proposal
+
+    def _rewrite_statement_batch(
+        self,
+        source_statements: list[str],
+        target_tables: list[dict],
+        migration_statements: list[dict],
+        batch_index: int | None = None,
+    ) -> WorkloadRewriteProposal:
+        messages = self._build_rewrite_messages(source_statements, target_tables, migration_statements, batch_index=batch_index)
+        try:
+            llm_result = self._llm.generate(messages, max_tokens=2400)
+        except Exception as exc:
+            raise WorkloadRewriteError(
+                f"LLM request failed while rewriting query batch {batch_index or 1}: {exc}"
+            ) from exc
+        try:
+            proposal = self._proposal_from_response(llm_result.response_text, target_tables)
+            proposal.raw_response_text = llm_result.response_text
+            return proposal
+        except ValueError as first_error:
+            direct_sql_proposal = self._proposal_from_direct_sql(llm_result.response_text, target_tables)
+            if direct_sql_proposal is not None:
+                return direct_sql_proposal
+
+            repair_messages = self._build_repair_messages(
+                source_statements,
+                target_tables,
+                migration_statements,
+                llm_result.response_text,
+                str(first_error),
+            )
+            try:
+                repair_result = self._llm.generate(repair_messages, max_tokens=2400)
+            except Exception as exc:
+                raise WorkloadRewriteError(
+                    f"LLM repair request failed while rewriting query batch {batch_index or 1}: {exc}",
+                    raw_response_text=llm_result.response_text,
+                ) from exc
+            raw_response_text = (
+                "Initial response:\n"
+                f"{llm_result.response_text}\n\n"
+                "Repair response:\n"
+                f"{repair_result.response_text}"
+            )
+            try:
+                proposal = self._proposal_from_response(repair_result.response_text, target_tables)
+                proposal.raw_response_text = raw_response_text
+                return proposal
+            except ValueError as repair_error:
+                direct_sql_proposal = self._proposal_from_direct_sql(repair_result.response_text, target_tables)
+                if direct_sql_proposal is not None:
+                    direct_sql_proposal.raw_response_text = raw_response_text
+                    return direct_sql_proposal
+                raise WorkloadRewriteError(
+                    (
+                        "The LLM did not return valid JSON or executable SQL for query migration after a retry. "
+                        f"Last parser error: {repair_error}"
+                    ),
+                    raw_response_text=raw_response_text,
+                ) from repair_error
 
     def _proposal_from_response(self, response_text: str, target_tables: list[dict]) -> WorkloadRewriteProposal:
         payload = self._extract_json_object(response_text)
@@ -111,27 +208,54 @@ class WorkloadPlanner:
             source="llm",
         )
 
+    def _proposal_from_direct_sql(self, response_text: str, target_tables: list[dict]) -> WorkloadRewriteProposal | None:
+        target_table_names = {str(table.get("name", "")).strip() for table in target_tables if str(table.get("name", "")).strip()}
+        try:
+            statements = [
+                self._normalize_statement(statement, target_table_names)
+                for statement in self._split_statements(response_text)
+            ]
+        except ValueError:
+            return None
+        statements = [statement for statement in statements if statement]
+        if not statements:
+            return None
+        return WorkloadRewriteProposal(
+            status="planned",
+            summary="The LLM returned SQL without a JSON wrapper; IlvesBench recovered executable statements.",
+            rationale=["Recovered direct SQL response after JSON parsing failed."],
+            statements=statements,
+            source="llm_sql_fallback",
+            raw_response_text=response_text,
+        )
+
     def _build_rewrite_messages(
         self,
         source_statements: list[str],
         target_tables: list[dict],
         migration_statements: list[dict],
+        batch_index: int | None = None,
     ) -> list[dict[str, str]]:
         system_prompt = (
             "You rewrite SQL workloads from an original PostgreSQL schema to a normalized target schema. "
             "Return JSON only and keep each rewritten query logically equivalent to the source query."
         )
         user_prompt = (
-            "Rewrite the source workload so it targets db-new instead of db-original.\n\n"
-            "Rules:\n"
+            (
+                f"Rewrite workload query batch {batch_index} so it targets db-new instead of db-original.\n\n"
+                if batch_index is not None
+                else "Rewrite the source workload so it targets db-new instead of db-original.\n\n"
+            )
+            + "Rules:\n"
             "1. Return one rewritten statement for each source statement, in the same order.\n"
             "2. Preserve the SQL operation type when possible so the rewritten workload remains benchmarkable.\n"
             "3. Use the normalized target-table names exactly as given.\n"
             "4. Preserve the filtering intent, joins, projected information, and operand data types as closely as possible.\n"
             "5. Do not compare varchar/text columns to bare numeric literals; use a matching literal type or an explicit cast if needed.\n"
             "6. Do not prefix table names with database names like db-new, db_new, or the target database name. Use plain table names or public.table only.\n"
-            "7. Do not include markdown fences, comments, EXPLAIN, CREATE, ALTER, DROP, TRUNCATE, GRANT, or REVOKE statements.\n"
-            "8. Return JSON only.\n\n"
+            "7. WITH queries are allowed when they lead to SELECT/INSERT/UPDATE/DELETE.\n"
+            "8. Do not include markdown fences, comments, EXPLAIN, CREATE, ALTER, DROP, TRUNCATE, GRANT, or REVOKE statements.\n"
+            "9. Return JSON only.\n\n"
             "Return JSON with this shape:\n"
             "{\n"
             '  "status": "planned|no_rewrite_needed",\n'
@@ -148,6 +272,47 @@ class WorkloadPlanner:
             {"role": "user", "content": user_prompt},
         ]
 
+    def _build_repair_messages(
+        self,
+        source_statements: list[str],
+        target_tables: list[dict],
+        migration_statements: list[dict],
+        invalid_response: str,
+        parser_error: str,
+    ) -> list[dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You repair malformed query-migration output. Return one JSON object only. "
+                    "No prose, no markdown, no code fences."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "The previous answer could not be parsed by IlvesBench.\n\n"
+                    f"Parser error:\n{parser_error}\n\n"
+                    "Convert the previous answer into this exact JSON shape:\n"
+                    "{\n"
+                    '  "status": "planned",\n'
+                    '  "summary": "short summary",\n'
+                    '  "reasoning": ["..."],\n'
+                    '  "statements": ["SELECT ...", "WITH ... SELECT ..."]\n'
+                    "}\n\n"
+                    "Rules:\n"
+                    "1. Include exactly one rewritten SQL statement per source statement when possible.\n"
+                    "2. Statements may start with WITH, SELECT, INSERT, UPDATE, or DELETE only.\n"
+                    "3. Do not include comments, markdown, EXPLAIN, CREATE, ALTER, DROP, TRUNCATE, GRANT, or REVOKE.\n"
+                    "4. Use target table names exactly as given.\n\n"
+                    f"Source workload statements:\n{json.dumps(source_statements, ensure_ascii=True, indent=2)}\n\n"
+                    f"Target tables:\n{json.dumps(target_tables, ensure_ascii=True, indent=2)}\n\n"
+                    f"Migration statements:\n{json.dumps(migration_statements, ensure_ascii=True, indent=2)}\n\n"
+                    f"Previous invalid response:\n{invalid_response}"
+                ),
+            },
+        ]
+
     def _extract_json_object(self, text: str) -> dict:
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
@@ -155,6 +320,7 @@ class WorkloadPlanner:
         return json.loads(match.group(0))
 
     def _split_statements(self, text: str) -> list[str]:
+        text = self._preprocess_workload_sql(text)
         statements: list[str] = []
         current: list[str] = []
         in_single = False
@@ -179,6 +345,11 @@ class WorkloadPlanner:
         if tail:
             statements.append(tail)
         return statements
+
+    def _preprocess_workload_sql(self, text: str) -> str:
+        without_block_comments = BLOCK_COMMENT_RE.sub("", text)
+        without_line_comments = LINE_COMMENT_RE.sub("", without_block_comments)
+        return PGBENCH_META_COMMAND_RE.sub("", without_line_comments)
 
     def _summary_table_candidates(self, log_summary: LogSummary) -> list[dict]:
         candidates: list[dict] = []
@@ -217,8 +388,8 @@ class WorkloadPlanner:
         if not normalized:
             return ""
         normalized = self._strip_database_qualifiers(normalized, target_table_names)
-        if not re.match(r"^(SELECT|INSERT|UPDATE|DELETE)\b", normalized, re.IGNORECASE):
-            raise ValueError("Rewritten workload must contain SELECT, INSERT, UPDATE, or DELETE statements only.")
+        if not re.match(r"^(WITH|SELECT|INSERT|UPDATE|DELETE)\b", normalized, re.IGNORECASE):
+            raise ValueError("Rewritten workload must contain WITH, SELECT, INSERT, UPDATE, or DELETE statements only.")
         return normalized + ";"
 
     def _strip_database_qualifiers(self, sql: str, target_table_names: set[str]) -> str:

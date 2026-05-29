@@ -16,7 +16,7 @@ class LLMConfig:
     api_key: str | None = None
     api_key_file: str | None = None
     model: str = DEFAULT_LLM_MODEL
-    timeout_seconds: int = 60
+    timeout_seconds: int = 180
 
 
 @dataclass(slots=True)

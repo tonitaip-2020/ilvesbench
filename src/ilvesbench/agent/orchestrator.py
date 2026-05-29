@@ -14,7 +14,7 @@ from ilvesbench.benchmark.migration_planner import MigrationPlanner
 from ilvesbench.benchmark.pgbench import PgBenchRunner
 from ilvesbench.benchmark.schema_transformer import SchemaTransformer
 from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
-from ilvesbench.benchmark.workload import WorkloadPlanner
+from ilvesbench.benchmark.workload import WorkloadPlanner, WorkloadRewriteError
 from ilvesbench.config import IlvesBenchConfig
 from ilvesbench.db.postgres import PostgresInspector
 from ilvesbench.llm.gateway import LLMGateway
@@ -89,6 +89,38 @@ class PipelineOrchestrator:
             "target": self._postgres.profile_database(self._config.postgres.new_database),
         }
 
+    def workload_source_status(self) -> dict:
+        workload_input = (self._config.workload.path or "").strip()
+        workload_path = self._resolve_workload_path()
+        log_path = self._config.resolve_path(self._config.logs.path)
+        workload_exists = workload_path is not None and workload_path.exists()
+        log_exists = log_path.exists()
+        if log_exists:
+            selected_kind = "postgresql_log"
+            selected_label = "PostgreSQL query log"
+            selected_path = str(log_path)
+        elif workload_exists:
+            selected_kind = "workload_file"
+            selected_label = "SQL workload file"
+            selected_path = str(workload_path)
+        else:
+            selected_kind = "missing"
+            selected_label = "No query source found"
+            selected_path = ""
+        return {
+            "status": "ok" if selected_kind != "missing" else "missing",
+            "selected_kind": selected_kind,
+            "selected_label": selected_label,
+            "selected_path": selected_path,
+            "configured_workload_path": workload_input or "data/workload.sql",
+            "configured_workload_path_was_blank": not workload_input,
+            "resolved_workload_path": str(workload_path) if workload_path is not None else "",
+            "workload_file_exists": workload_exists,
+            "log_path": str(log_path),
+            "log_file_exists": log_exists,
+            "path_resolution": "Relative workload paths resolve from the selected config file directory.",
+        }
+
     def load_run_record(self, run_id: str) -> BenchmarkRunRecord:
         record = self._store.get_run_record(run_id)
         if record is None:
@@ -120,9 +152,130 @@ class PipelineOrchestrator:
                 "original_database": self._config.postgres.original_database,
                 "new_database": self._config.postgres.new_database,
                 "schemas": list(self._config.postgres.schemas),
+                "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
+                "resolved_workload_path": str(self._resolve_workload_path() or ""),
             },
         )
         self._store.upsert_run(record)
+        return record
+
+    def create_state_resume_record(self) -> BenchmarkRunRecord:
+        now = datetime.now(UTC).isoformat()
+        record = BenchmarkRunRecord(
+            run_id=f"run-{uuid.uuid4().hex[:12]}",
+            created_at=now,
+            updated_at=now,
+            status="running",
+            config_path=self._config.config_path,
+            steps=self._pipeline_template(),
+            summary={
+                "mode": "state_resume",
+                "original_database": self._config.postgres.original_database,
+                "new_database": self._config.postgres.new_database,
+                "schemas": list(self._config.postgres.schemas),
+                "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
+                "resolved_workload_path": str(self._resolve_workload_path() or ""),
+            },
+        )
+        self._store.upsert_run(record)
+        return record
+
+    def execute_query_migration_from_current_state(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        try:
+            schema = self._run_schema_step(record)
+            log_summary = self._run_logs_step(record)
+            record = self._plan_pgbench_original_step(record)
+            target_tables = self._existing_target_tables()
+            if not target_tables:
+                record = self._fail_step(
+                    record,
+                    "create_target_schema",
+                    f"{self._config.postgres.new_database} does not have an inspectable target schema yet.",
+                )
+                raise ValueError(
+                    f"{self._config.postgres.new_database} needs structure before queries can be migrated."
+                )
+
+            normalization_details = {
+                "status": "existing_target_schema",
+                "summary": (
+                    f"Skipped normalization. Using {len(target_tables)} table(s) already present in "
+                    f"{self._config.postgres.new_database}."
+                ),
+                "target_tables": target_tables,
+                "sql_statements": [],
+                "source": "existing_target_schema",
+            }
+            record.artifacts["propose_3nf_schema"] = self._store.write_artifact(
+                record.run_id,
+                "existing_target_schema",
+                normalization_details,
+            )
+            record = self._complete_step(record, "propose_3nf_schema", normalization_details)
+            record = self._complete_step(
+                record,
+                "create_target_schema",
+                {
+                    "summary": (
+                        f"Using existing structure in {self._config.postgres.new_database}; "
+                        "normalization and DDL generation were skipped."
+                    ),
+                    "target_table_count": len(target_tables),
+                    "source": "existing_target_schema",
+                },
+            )
+
+            target_profile = self._postgres.profile_database(self._config.postgres.new_database)
+            counts = target_profile.get("counts", {}) if isinstance(target_profile, dict) else {}
+            has_data = int(counts.get("estimated_rows") or 0) > 0 or int(counts.get("populated_tables") or 0) > 0
+            record = (
+                self._complete_step(
+                    record,
+                    "migrate_data",
+                    {
+                        "summary": (
+                            f"{self._config.postgres.new_database} already appears populated; "
+                            "data migration was skipped."
+                        ),
+                        "source": "existing_target_database",
+                    },
+                )
+                if has_data
+                else self._mark_planned(
+                    record,
+                    "migrate_data",
+                    {
+                        "summary": (
+                            f"{self._config.postgres.new_database} has structure but no row estimates were observed."
+                        ),
+                        "source": "existing_target_database",
+                    },
+                )
+            )
+
+            record = self._plan_rewrite_queries_step(record, log_summary)
+            record = self._plan_query_validation_step(record)
+            record = self._plan_benchmark_workload_step(record)
+            record = self._plan_pgbench_new_step(record)
+            record.summary.pop("error", None)
+            record.summary.update(self._summary_counts(record))
+            record.status = self._overall_status(record)
+        except Exception as exc:
+            rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
+            if rewrite_step is None or rewrite_step.status not in {"failed", "completed"}:
+                record = self._replace_step(
+                    record,
+                    "rewrite_queries",
+                    status="failed",
+                    details=rewrite_step.details if rewrite_step else {},
+                    error=str(exc),
+                    planned_only=False,
+                )
+            record.status = "failed"
+            record.summary["error"] = str(exc)
+        finally:
+            record.updated_at = datetime.now(UTC).isoformat()
+            self._store.upsert_run(record)
         return record
 
     def execute_mvp_collection(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
@@ -209,6 +362,8 @@ class PipelineOrchestrator:
             record = self._plan_target_schema_step(record)
             record = self._plan_migration_step(record, schema)
             record = self._plan_rewrite_queries_step(record, log_summary)
+            record = self._plan_query_validation_step(record)
+            record = self._plan_benchmark_workload_step(record)
             record = self._plan_index_recommendations_step(record, schema, log_summary)
             record = self._run_tuning_step(record, log_summary)
             record = self._plan_pgbench_new_step(record)
@@ -415,6 +570,8 @@ class PipelineOrchestrator:
             log_summary = self._load_log_summary_artifact(record)
             schema = self._load_schema_artifact(record)
             record = self._plan_rewrite_queries_step(record, log_summary)
+            record = self._plan_query_validation_step(record)
+            record = self._plan_benchmark_workload_step(record)
             record = self._plan_index_recommendations_step(record, schema, log_summary)
             record = self._plan_pgbench_new_step(record)
             record.summary.pop("error", None)
@@ -637,6 +794,8 @@ class PipelineOrchestrator:
         record = self._plan_migration_step(record, schema)
         log_summary = self._load_log_summary_artifact(record)
         record = self._plan_rewrite_queries_step(record, log_summary)
+        record = self._plan_query_validation_step(record)
+        record = self._plan_benchmark_workload_step(record)
         record = self._plan_index_recommendations_step(record, schema, log_summary)
         record = self._plan_pgbench_new_step(record)
         record.summary.pop("error", None)
@@ -693,6 +852,8 @@ class PipelineOrchestrator:
             record = self._plan_target_schema_step(record)
             record = self._plan_migration_step(record, schema)
             record = self._plan_rewrite_queries_step(record, None)
+            record = self._plan_query_validation_step(record)
+            record = self._plan_benchmark_workload_step(record)
             record = self._plan_index_recommendations_step(record, schema, None)
             record = self._plan_pgbench_new_step(record)
             record.summary.pop("error", None)
@@ -821,6 +982,14 @@ class PipelineOrchestrator:
             elif resolved_workload_path is not None and resolved_workload_path.exists():
                 log_summary = self._workload_files.parse(resolved_workload_path)
             else:
+                record.summary.update(
+                    {
+                        "workload_source_kind": "missing",
+                        "workload_source_path": "",
+                        "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
+                        "resolved_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                    }
+                )
                 self._input_required_step(
                     record,
                     "extract_workload_logs",
@@ -834,6 +1003,14 @@ class PipelineOrchestrator:
                 return None
 
             log_dict = to_dict(log_summary)
+            record.summary.update(
+                {
+                    "workload_source_kind": log_summary.source_kind,
+                    "workload_source_path": log_summary.path,
+                    "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
+                    "resolved_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                }
+            )
             record.artifacts["extract_workload_logs"] = self._store.write_artifact(
                 record.run_id, "log_summary", log_dict
             )
@@ -843,6 +1020,11 @@ class PipelineOrchestrator:
                 {
                     "source_kind": log_summary.source_kind,
                     "source_path": log_summary.path,
+                    "checked_log_path": str(log_path),
+                    "checked_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                    "selected_query_source": (
+                        "PostgreSQL query log" if log_summary.source_kind == "postgres_log" else "SQL workload file"
+                    ),
                     "statements_detected": log_summary.statements_detected,
                     "transactions_detected": log_summary.transactions_detected,
                     "top_query_count": len(log_summary.top_queries),
@@ -1370,6 +1552,29 @@ class PipelineOrchestrator:
 
         try:
             workload_sql = self._load_source_workload_text(log_summary)
+        except WorkloadRewriteError as exc:
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new_failed",
+                {
+                    "status": "failed",
+                    "summary": str(exc),
+                    "raw_response_text": exc.raw_response_text,
+                    "target_table_count": len(target_tables),
+                },
+            )
+            return self._replace_step(
+                record,
+                "rewrite_queries",
+                status="failed",
+                details={
+                    "summary": str(exc),
+                    "raw_response_text": exc.raw_response_text,
+                    "target_table_count": len(target_tables),
+                },
+                error=str(exc),
+                planned_only=False,
+            )
         except Exception as exc:
             return self._fail_step(record, "rewrite_queries", str(exc))
 
@@ -1413,6 +1618,69 @@ class PipelineOrchestrator:
             return self._complete_step(record, "rewrite_queries", proposal_dict)
         except Exception as exc:
             return self._fail_step(record, "rewrite_queries", str(exc))
+
+    def _plan_query_validation_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
+        statement_count = int(rewrite_step.details.get("statement_count", 0) or 0) if rewrite_step else 0
+        if rewrite_step is None or rewrite_step.status != "completed" or statement_count == 0:
+            return self._mark_planned(
+                record,
+                "validate_query_results",
+                {
+                    "status": "placeholder",
+                    "summary": (
+                        "Query result validation will be available after query migration produces rewritten SQL."
+                    ),
+                    "scope": "planned_result_equivalence_check",
+                    "implemented": False,
+                },
+            )
+        return self._mark_planned(
+            record,
+            "validate_query_results",
+            {
+                "status": "placeholder",
+                "summary": (
+                    "Placeholder: compare sampled db-original query results with rewritten db-new query results. "
+                    "Current prototype only performs limited SQL/schema validation during rewrite."
+                ),
+                "source_statement_count": statement_count,
+                "scope": "planned_result_equivalence_check",
+                "implemented": False,
+            },
+        )
+
+    def _plan_benchmark_workload_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
+        extract_step = next((step for step in record.steps if step.name == "extract_workload_logs"), None)
+        statement_count = int(rewrite_step.details.get("statement_count", 0) or 0) if rewrite_step else 0
+        source_kind = extract_step.details.get("source_kind", "pending") if extract_step else "pending"
+        if rewrite_step is None or rewrite_step.status != "completed" or statement_count == 0:
+            return self._mark_planned(
+                record,
+                "generate_benchmark_workload",
+                {
+                    "status": "placeholder",
+                    "summary": "Benchmark workload generation waits for migrated queries.",
+                    "implemented_mix_model": False,
+                    "source_kind": source_kind,
+                },
+            )
+        return self._mark_planned(
+            record,
+            "generate_benchmark_workload",
+            {
+                "status": "placeholder",
+                "summary": (
+                    "Placeholder: build pgbench-ready scripts with relative query proportions. "
+                    "For now, IlvesBench reuses the migrated query SQL as the benchmark input."
+                ),
+                "query_statement_count": statement_count,
+                "workload_path": rewrite_step.details.get("workload_path", ""),
+                "implemented_mix_model": False,
+                "source_kind": source_kind,
+            },
+        )
 
     def _existing_target_tables(self) -> list[dict]:
         try:
@@ -1664,11 +1932,13 @@ class PipelineOrchestrator:
             StepResult(name="llm_gateway", title="Test LLM gateway", status="pending"),
             StepResult(name="inspect_source_schema", title="Inspect source PostgreSQL schema", status="pending"),
             StepResult(name="scan_first_normal_form", title="Scan sampled data for 1NF warnings", status="pending"),
-            StepResult(name="extract_workload_logs", title="Extract workload from PostgreSQL logs or workload file", status="pending"),
+            StepResult(name="extract_workload_logs", title="Choose query source and extract query profile", status="pending"),
             StepResult(name="propose_3nf_schema", title="Propose 3NF normalization plan", status="pending"),
             StepResult(name="create_target_schema", title=f"Create {self._config.postgres.new_database} schema", status="pending", requires_approval=True),
             StepResult(name="migrate_data", title=f"Migrate data into {self._config.postgres.new_database}", status="pending", requires_approval=True),
-            StepResult(name="rewrite_queries", title=f"Rewrite workload for {self._config.postgres.new_database}", status="pending"),
+            StepResult(name="rewrite_queries", title=f"Migrate queries for {self._config.postgres.new_database}", status="pending"),
+            StepResult(name="validate_query_results", title="Validate migrated query results", status="pending"),
+            StepResult(name="generate_benchmark_workload", title="Generate benchmark workload mix", status="pending"),
             StepResult(name="suggest_summary_tables", title="Suggest summary tables", status="pending"),
             StepResult(name="optimize_indexes", title="Recommend workload-aware indexes", status="pending"),
             StepResult(name="create_secondary_indexes", title="Create secondary indexes", status="pending", requires_approval=True),
@@ -1703,8 +1973,10 @@ class PipelineOrchestrator:
         planned_only: bool,
     ) -> BenchmarkRunRecord:
         new_steps: list[StepResult] = []
+        replaced_step = False
         for step in record.steps:
             if step.name == name:
+                replaced_step = True
                 new_steps.append(
                     replace(
                         step,
@@ -1716,6 +1988,19 @@ class PipelineOrchestrator:
                 )
             else:
                 new_steps.append(step)
+        if not replaced_step:
+            template_step = next((step for step in self._pipeline_template() if step.name == name), None)
+            new_steps.append(
+                StepResult(
+                    name=name,
+                    title=template_step.title if template_step else name.replace("_", " ").title(),
+                    status=status,
+                    requires_approval=template_step.requires_approval if template_step else False,
+                    planned_only=planned_only,
+                    details=details,
+                    error=error,
+                )
+            )
         record.steps = new_steps
         record.updated_at = datetime.now(UTC).isoformat()
         self._store.upsert_run(record)
@@ -1850,11 +2135,17 @@ class PipelineOrchestrator:
         return self._config.resolve_path(workload_value)
 
     def _load_source_workload_text(self, log_summary) -> str:
-        workload_path = self._resolve_workload_path()
-        if workload_path is not None and workload_path.exists():
-            return workload_path.read_text(encoding="utf-8", errors="replace")
         if log_summary is None:
+            workload_path = self._resolve_workload_path()
+            if workload_path is not None and workload_path.exists():
+                return workload_path.read_text(encoding="utf-8", errors="replace")
             raise ValueError(f"No workload source was available to rewrite for {self._config.postgres.new_database}.")
+
+        if log_summary.source_kind == "workload_file":
+            source_path = Path(log_summary.path).expanduser().resolve()
+            if not source_path.exists():
+                raise ValueError(f"Captured workload file is missing: {source_path}")
+            return source_path.read_text(encoding="utf-8", errors="replace")
 
         statements: list[str] = []
         for query in log_summary.top_queries:

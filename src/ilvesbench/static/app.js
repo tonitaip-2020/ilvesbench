@@ -2,6 +2,7 @@ const statusBox = document.getElementById("statusBox");
 const runsContainer = document.getElementById("runs");
 const configPathInput = document.getElementById("configPath");
 const workloadPathInput = document.getElementById("workloadPath");
+const workloadSourceStatusBox = document.getElementById("workloadSourceStatus");
 const originalDatabaseSelect = document.getElementById("originalDatabase");
 const newDatabaseInput = document.getElementById("newDatabase");
 const schemasInput = document.getElementById("schemas");
@@ -13,6 +14,7 @@ let activeTab = "setup";
 let latestProfiles = null;
 let latestLlmStatus = null;
 let latestPostgresStatus = null;
+let latestWorkloadStatus = null;
 let discoveredDatabases = [];
 let lastAutoTargetDatabase = newDatabaseInput.value.trim();
 let profileLoading = false;
@@ -24,11 +26,32 @@ const WORKSPACE_TABS = [
   { id: "profile", label: "Profile", steps: ["inspect_source_schema", "scan_first_normal_form", "collect_extended_metrics"] },
   { id: "normalize", label: "Normalize", steps: ["scan_first_normal_form", "propose_3nf_schema"] },
   { id: "migrate", label: "Migrate", steps: ["create_target_schema", "migrate_data"] },
-  { id: "workload", label: "Workload", steps: ["rewrite_queries", "suggest_summary_tables"] },
+  { id: "workload", label: "Workload", steps: ["extract_workload_logs", "rewrite_queries", "validate_query_results", "generate_benchmark_workload", "suggest_summary_tables"] },
   { id: "physical", label: "Physical design", steps: ["optimize_indexes", "create_secondary_indexes", "tune_postgresql_conf"] },
   { id: "benchmark", label: "Benchmark", steps: ["run_pgbench_original", "run_pgbench_new"] },
   { id: "compare", label: "Compare", steps: ["compare_disk_usage"] },
 ];
+
+const STEP_TITLES = {
+  llm_gateway: "Test LLM gateway",
+  inspect_source_schema: "Inspect source PostgreSQL schema",
+  scan_first_normal_form: "Scan sampled data for 1NF warnings",
+  extract_workload_logs: "Choose query source and extract query profile",
+  propose_3nf_schema: "Propose normalization plan",
+  create_target_schema: "Create target schema",
+  migrate_data: "Migrate data",
+  rewrite_queries: "Migrate queries",
+  validate_query_results: "Validate migrated query results",
+  generate_benchmark_workload: "Generate benchmark workload mix",
+  suggest_summary_tables: "Suggest summary tables",
+  optimize_indexes: "Recommend workload-aware indexes",
+  create_secondary_indexes: "Create secondary indexes",
+  tune_postgresql_conf: "Recommend postgresql.conf tuning",
+  run_pgbench_original: "Run source benchmark",
+  run_pgbench_new: "Run target benchmark",
+  compare_disk_usage: "Compare benchmark results",
+  collect_extended_metrics: "Collect advanced PostgreSQL metrics",
+};
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -68,6 +91,7 @@ function requestContextKey() {
   const context = requestContext();
   return JSON.stringify({
     config_path: context.config_path,
+    workload_path: context.workload_path,
     original_database: context.original_database,
     new_database: context.new_database,
     schemas: context.schemas,
@@ -86,8 +110,14 @@ function selectedTargetDatabase(run = null) {
 
 function runMatchesSelection(run) {
   if (!run || !run.summary) return false;
-  return run.summary.original_database === selectedOriginalDatabase()
-    && run.summary.new_database === selectedTargetDatabase();
+  if (run.summary.original_database !== selectedOriginalDatabase()
+    || run.summary.new_database !== selectedTargetDatabase()) {
+    return false;
+  }
+  const selectedWorkloadPath = workloadSourcePath(latestWorkloadStatus);
+  if (!selectedWorkloadPath) return true;
+  const runWorkloadPath = runWorkloadSourcePath(run);
+  return Boolean(runWorkloadPath) && normalizePathForCompare(runWorkloadPath) === normalizePathForCompare(selectedWorkloadPath);
 }
 
 function selectionOnlyRun(sourceRun = null) {
@@ -100,12 +130,32 @@ function selectionOnlyRun(sourceRun = null) {
     summary: {
       original_database: selectedOriginalDatabase(),
       new_database: selectedTargetDatabase(),
+      workload_source_kind: latestWorkloadStatus?.selected_kind || "",
+      workload_source_path: workloadSourcePath(latestWorkloadStatus),
+      configured_workload_path: latestWorkloadStatus?.configured_workload_path || workloadPathInput.value.trim() || "data/workload.sql",
+      resolved_workload_path: latestWorkloadStatus?.resolved_workload_path || "",
     },
     steps: [],
     artifacts: {},
     selectionOnly: true,
     previousRunId: sourceRun?.run_id || "",
   };
+}
+
+function workloadSourcePath(status) {
+  if (!status || status.selected_kind === "missing") return "";
+  return status.selected_path || (status.selected_kind === "workload_file" ? status.resolved_workload_path : status.log_path) || "";
+}
+
+function runWorkloadSourcePath(run) {
+  const summaryPath = run?.summary?.workload_source_path || "";
+  if (summaryPath) return summaryPath;
+  const extractStep = step(run, "extract_workload_logs");
+  return extractStep.details?.source_path || "";
+}
+
+function normalizePathForCompare(path) {
+  return String(path || "").trim().replaceAll("\\", "/");
 }
 
 function updateDatabaseSelectionStatus() {
@@ -118,6 +168,29 @@ function updateDatabaseSelectionStatus() {
     <strong>Target database:</strong> ${escapeHtml(target)}
     <span aria-hidden="true"> | </span>
     <strong>Schemas:</strong> ${escapeHtml(schemas.length ? schemas.join(", ") : "config default")}
+  `;
+}
+
+function renderWorkloadSourceStatus(payload = latestWorkloadStatus) {
+  const typedPath = workloadPathInput.value.trim();
+  const configured = payload?.configured_workload_path || typedPath || "data/workload.sql";
+  const resolved = payload?.resolved_workload_path || "";
+  const selectedLabel = payload?.selected_label || "Not checked yet";
+  const selectedPath = payload?.selected_path || "";
+  const fileState = payload
+    ? (payload.workload_file_exists ? "file exists" : "file missing")
+    : "not checked";
+  const logState = payload
+    ? (payload.log_file_exists ? "log exists" : "log missing")
+    : "not checked";
+  workloadSourceStatusBox.innerHTML = `
+    <strong>Query source:</strong> ${escapeHtml(selectedLabel)}
+    ${selectedPath ? `<span>${escapeHtml(selectedPath)}</span>` : ""}
+    <span aria-hidden="true"> | </span>
+    <strong>Workload file:</strong> ${escapeHtml(configured)} (${escapeHtml(fileState)})
+    ${resolved ? `<span>Resolved: ${escapeHtml(resolved)}</span>` : ""}
+    <span aria-hidden="true"> | </span>
+    <strong>PostgreSQL log:</strong> ${escapeHtml(logState)}
   `;
 }
 
@@ -199,6 +272,36 @@ function statusRank(status) {
 
 function effectiveStep(run, name) {
   const item = step(run, name);
+  if (!item.name && !["validate_query_results", "generate_benchmark_workload"].includes(name)) {
+    return {
+      name,
+      title: STEP_TITLES[name] || name.replaceAll("_", " "),
+      status: "pending",
+      details: {},
+    };
+  }
+  if (!item.name && name === "validate_query_results") {
+    return {
+      name,
+      title: "Validate migrated query results",
+      status: "planned",
+      details: {
+        summary: "Placeholder: compare db-original query results with rewritten db-new query results.",
+        status: "placeholder",
+      },
+    };
+  }
+  if (!item.name && name === "generate_benchmark_workload") {
+    return {
+      name,
+      title: "Generate benchmark workload mix",
+      status: "planned",
+      details: {
+        summary: "Placeholder: build query proportions for pgbench. The prototype currently reuses migrated query SQL.",
+        status: "placeholder",
+      },
+    };
+  }
   if (name === "llm_gateway" && latestLlmStatus) {
     return {
       ...item,
@@ -499,8 +602,11 @@ function databaseFigure(kind, run, profile) {
   const profiling = profile.status === "running";
   const hasRows = readiness.hasRows;
   const hasMatchingRun = !run.selectionOnly;
-  const sourceWorkloadReady = hasMatchingRun && workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0;
+  const selectedQuerySourceReady = latestWorkloadStatus?.status === "ok";
+  const sourceWorkloadReady = selectedQuerySourceReady
+    || (hasMatchingRun && workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0);
   const targetWorkloadReady = hasMatchingRun && rewriteStep.status === "completed" && Boolean(rewriteStep.details?.workload_path);
+  const canMigrateQueries = readiness.structureReady && sourceWorkloadReady;
   const noIndexWorkNeeded = indexStep.status === "completed" && Number(indexStep.details?.recommendation_count || 0) === 0;
   const targetIndexesReady = indexCreateStep.status === "completed" || noIndexWorkNeeded;
   const summaryTableStatus = summaryStep.details?.creation_status || "not implemented";
@@ -516,13 +622,13 @@ function databaseFigure(kind, run, profile) {
       summary: profile.summary || "Source profile has not been collected yet.",
       ready,
       workloadReady: sourceWorkloadReady,
-      workloadStatus: sourceWorkloadReady ? "available" : hasMatchingRun ? "missing" : "needs run",
+      workloadStatus: sourceWorkloadReady ? "available" : hasMatchingRun ? "missing" : "not selected",
       actions: originalActions(run),
       items: [
         { label: "Database", value: profiling ? "profiling" : exists ? "exists" : "not profiled", status: profiling ? "pending" : exists ? "ok" : "warning" },
         { label: "Data", value: profiling ? "estimating..." : hasRows ? `${formatNumber(counts.estimated_rows)} estimated rows` : exists ? "no rows observed" : "unknown", status: profiling ? "pending" : hasRows ? "ok" : "warning" },
         { label: "Indexes", value: profiling ? "counting..." : exists ? `${formatNumber(counts.indexes || 0)} found` : "unknown", status: profiling ? "pending" : Number(counts.indexes || 0) > 0 ? "ok" : "warning" },
-        { label: "Workload", value: sourceWorkloadReady ? "available" : hasMatchingRun ? "missing" : "start a run", status: sourceWorkloadReady ? "ok" : "pending" },
+        { label: "Workload", value: sourceWorkloadReady ? "available" : hasMatchingRun ? "missing" : "not selected", status: sourceWorkloadReady ? "ok" : "pending" },
         { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
       ],
     };
@@ -537,13 +643,13 @@ function databaseFigure(kind, run, profile) {
     summary: exists ? (profile.summary || "Target profile is available.") : "Structure, data, indexes, and workload will appear here as they are created.",
     ready,
     workloadReady: targetWorkloadReady,
-    workloadStatus: targetWorkloadReady ? "created" : hasMatchingRun ? "not created" : "needs run",
+    workloadStatus: targetWorkloadReady ? "created" : canMigrateQueries ? "ready to migrate" : "not migrated",
     actions: targetActions(run, profile),
     items: [
       { label: "Database", value: profiling ? "profiling" : exists ? "exists" : "not created", status: profiling ? "pending" : exists ? "ok" : "missing" },
       { label: "Structure", value: profiling ? "checking..." : readiness.structureReady ? "created" : "not created", status: profiling ? "pending" : readiness.structureReady ? "ok" : "pending" },
       { label: "Data", value: profiling ? "estimating..." : readiness.dataReady ? "populated" : "not populated", status: profiling ? "pending" : readiness.dataReady ? "ok" : "pending" },
-      { label: "Query rewrite", value: targetWorkloadReady ? "created" : hasMatchingRun ? "not created" : "start a run", status: targetWorkloadReady ? "ok" : "pending" },
+      { label: "Query rewrite", value: targetWorkloadReady ? "created" : canMigrateQueries ? "ready to migrate" : "not migrated", status: targetWorkloadReady ? "ok" : canMigrateQueries ? "warning" : "pending" },
       { label: "Secondary indexes", value: targetIndexesReady ? "created" : indexCreateStep.status === "planned" ? "planned" : "not created", status: targetIndexesReady ? "ok" : "pending" },
       { label: "Summary tables", value: summaryTableStatus, status: summaryTablesReady ? "ok" : "pending" },
       { label: "Benchmark", value: ready ? "ready" : "not ready", status: ready ? "ok" : "pending" },
@@ -643,8 +749,8 @@ function renderRiskSignals(profile) {
   `;
 }
 
-function actionButton(run, action, label, tone = "", disabledReason = "") {
-  const effectiveReason = disabledReason || (!run.run_id ? "Start a run for this database pair first." : "");
+function actionButton(run, action, label, tone = "", disabledReason = "", allowWithoutRun = false) {
+  const effectiveReason = disabledReason || (!run.run_id && !allowWithoutRun ? "Start a run for this database pair first." : "");
   const disabled = effectiveReason ? "disabled" : "";
   const title = effectiveReason ? ` title="${escapeHtml(effectiveReason)}"` : "";
   const reason = effectiveReason ? `<small>${escapeHtml(effectiveReason)}</small>` : "";
@@ -687,6 +793,8 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const hasIndexSql = indexSqlCount > 0;
   const readiness = targetReadiness(run, profile);
   const selectionOnlyReason = run.selectionOnly ? `Start a run for ${selectedOriginalDatabase(run) || "the selected source database"} first.` : "";
+  const querySourceReady = latestWorkloadStatus?.status === "ok"
+    || (workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0);
   const noTargetReason = !readiness.exists && createStep.status !== "completed" ? `${targetName} does not exist yet.` : "";
   const canApplyCreateSql = hasCreateSql && ["planned", "failed", "pending"].includes(createStep.status || "");
   const migrationStatus = migrateStep.status || "";
@@ -728,9 +836,16 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   actions.push(actionButton(
     run,
     "regenerate-rewrite",
-    `Generate ${targetName} workload`,
+    `Migrate queries for ${targetName}`,
     "",
-    selectionOnlyReason || (normalizationStep.status === "completed" && workloadStep.status === "completed" && ["planned", "completed", "failed"].includes(rewriteStep.status || "") ? "" : "Needs normalization and source workload first."),
+    !readiness.structureReady
+      ? `Needs ${targetName} structure first.`
+      : !querySourceReady
+      ? "Needs a PostgreSQL log or workload SQL file first."
+      : (!run.selectionOnly && !["planned", "completed", "failed", "pending"].includes(rewriteStep.status || "pending"))
+      ? "Query migration is not ready yet."
+      : "",
+    true,
   ));
   actions.push(actionButton(
     run,
@@ -746,7 +861,7 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
     "primary-approval",
     selectionOnlyReason || (newBench.details?.workload_path && readiness.structureReady && readiness.dataReady && rewriteStep.status === "completed"
       ? ""
-      : !readiness.structureReady ? `Needs ${targetName} structure first.` : !readiness.dataReady ? `Needs ${targetName} data before benchmarking.` : rewriteStep.status !== "completed" || !newBench.details?.workload_path ? `Needs generated ${targetName} workload first.` : `${targetName} benchmark is not ready.`),
+      : !readiness.structureReady ? `Needs ${targetName} structure first.` : !readiness.dataReady ? `Needs ${targetName} data before benchmarking.` : rewriteStep.status !== "completed" || !newBench.details?.workload_path ? `Needs migrated ${targetName} queries before workload benchmarking.` : `${targetName} benchmark is not ready.`),
   ));
   return actions;
 }
@@ -907,23 +1022,56 @@ function renderMigrate(run, targetProfile) {
 
 function renderWorkload(run, artifacts) {
   const logs = artifacts.extract_workload_logs || {};
+  const extract = step(run, "extract_workload_logs");
   const rewrite = step(run, "rewrite_queries");
+  const validation = effectiveStep(run, "validate_query_results");
+  const generatedWorkload = effectiveStep(run, "generate_benchmark_workload");
   const summaryTables = step(run, "suggest_summary_tables");
   const candidates = summaryTables.details?.candidates || [];
   const rewrittenStatements = rewrite.details?.statements || [];
+  const topQueries = logs.top_queries || [];
+  const totalTopQueryCount = topQueries.reduce((total, query) => total + Number(query.count || 0), 0);
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
         <article class="workspace-panel">
-          <h2>Workload</h2>
+          <h2>Query Source</h2>
           <div class="metric-grid">
-            ${metricCard("Source", logs.source_kind || "pending")}
+            ${metricCard("Chosen source", extract.details?.selected_query_source || logs.source_kind || latestWorkloadStatus?.selected_label || "pending")}
             ${metricCard("Statements", formatNumber(logs.statements_detected || 0))}
             ${metricCard("Transactions", formatNumber(logs.transactions_detected || 0))}
-            ${metricCard("Rewrite statements", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
+            ${metricCard("Distinct top queries", formatNumber(logs.top_queries?.length || extract.details?.top_query_count || 0))}
           </div>
-          ${renderStepCards(run, ["extract_workload_logs", "rewrite_queries"])}
-          ${rawSqlBlock(`Raw rewritten SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
+          ${renderStepCards(run, ["extract_workload_logs"])}
+          <div class="workload-source-detail">
+            <span>Current UI selection: ${escapeHtml(latestWorkloadStatus?.selected_label || "not checked")}</span>
+            ${latestWorkloadStatus?.selected_path ? `<span>${escapeHtml(latestWorkloadStatus.selected_path)}</span>` : ""}
+            ${latestWorkloadStatus?.resolved_workload_path ? `<span>Workload file resolves to ${escapeHtml(latestWorkloadStatus.resolved_workload_path)}</span>` : ""}
+          </div>
+          ${topQueries.length ? `
+            <div class="candidate-list">
+              ${topQueries.map((query) => {
+                const share = totalTopQueryCount ? Math.round((Number(query.count || 0) / totalTopQueryCount) * 1000) / 10 : 0;
+                return `
+                  <article class="candidate-card">
+                    <strong>${escapeHtml(`${formatNumber(query.count || 0)} observed (${share}%)`)}</strong>
+                    <span>${escapeHtml(query.fingerprint || "query fingerprint")}</span>
+                  </article>
+                `;
+              }).join("")}
+            </div>
+          ` : `<div class="empty-inline">No query proportions have been extracted yet.</div>`}
+        </article>
+        <article class="workspace-panel">
+          <h2>Query Migration</h2>
+          <div class="metric-grid">
+            ${metricCard("Migrated queries", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
+            ${metricCard("Validation", validation.details?.status || validation.status || "placeholder")}
+            ${metricCard("Workload mix", generatedWorkload.details?.status || generatedWorkload.status || "placeholder")}
+          </div>
+          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("regenerate-rewrite")).join("")}</div>
+          ${renderStepCards(run, ["rewrite_queries", "validate_query_results", "generate_benchmark_workload"])}
+          ${rawSqlBlock(`Raw migrated query SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
         </article>
         <article class="workspace-panel">
           <h2>Summary Tables</h2>
@@ -1107,6 +1255,24 @@ async function discoverDatabases() {
   setStatus(`Discovered ${formatNumber((data.databases || []).length)} database(s).`);
 }
 
+async function refreshWorkloadSourceStatus() {
+  try {
+    latestWorkloadStatus = await api("/api/workload/status", {
+      method: "POST",
+      body: JSON.stringify(requestContext()),
+    });
+  } catch (error) {
+    latestWorkloadStatus = {
+      status: "missing",
+      selected_label: "Could not check query source",
+      configured_workload_path: workloadPathInput.value.trim() || "data/workload.sql",
+      workload_file_exists: false,
+      log_file_exists: false,
+    };
+  }
+  renderWorkloadSourceStatus(latestWorkloadStatus);
+}
+
 async function renderRuns(runs) {
   const latestRun = runs[0] || null;
   const currentRun = runMatchesSelection(latestRun) ? latestRun : selectionOnlyRun(latestRun);
@@ -1122,11 +1288,11 @@ async function renderRuns(runs) {
     ? `${selectedOriginalDatabase(currentRun) || "source"} -> ${selectedTargetDatabase(currentRun) || "target"}`
     : currentRun.run_id;
   const headerMeta = currentRun.selectionOnly
-    ? (latestRun ? `Latest saved run ${latestRun.run_id} uses a different database pair.` : "No run exists for this database pair yet.")
+    ? (latestRun ? `Latest saved run ${latestRun.run_id} uses a different database pair or query source.` : "No run exists for this database pair and query source yet.")
     : currentRun.created_at;
   const switchLatestButton = currentRun.selectionOnly && latestRun?.summary?.original_database && latestRun?.summary?.new_database
-    ? `<button class="action-button" type="button" data-use-run-selection data-original-database="${escapeHtml(latestRun.summary.original_database)}" data-new-database="${escapeHtml(latestRun.summary.new_database)}">
-        <span>Use latest run databases</span>
+    ? `<button class="action-button" type="button" data-use-run-selection data-original-database="${escapeHtml(latestRun.summary.original_database)}" data-new-database="${escapeHtml(latestRun.summary.new_database)}" data-workload-path="${escapeHtml(latestRun.summary.configured_workload_path || "")}">
+        <span>Use latest run settings</span>
       </button>`
     : "";
 
@@ -1150,6 +1316,7 @@ async function renderRuns(runs) {
 }
 
 async function refreshRuns() {
+  await refreshWorkloadSourceStatus();
   const data = await api("/api/runs");
   const runs = data.runs || [];
   const contextKey = requestContextKey();
@@ -1230,15 +1397,18 @@ async function triggerRunAction(runId, action) {
     "reset-target-db": `Dropping ${targetName}...`,
     "truncate-target-data": `Truncating ${targetName} data...`,
     "migrate-data": "Migrating data...",
-    "regenerate-rewrite": "Regenerating workload...",
+    "regenerate-rewrite": "Migrating queries...",
     "create-secondary-indexes": "Creating secondary indexes...",
     "run-pgbench-original": `Benchmarking ${sourceName}...`,
     "run-pgbench-new": `Benchmarking ${targetName}...`,
   };
   setStatus(labels[action] || "Starting action...");
-  const data = await api(`/api/runs/${runId}/actions/${action}`, {
+  const path = runId
+    ? `/api/runs/${runId}/actions/${action}`
+    : `/api/runs/actions/${action}`;
+  const data = await api(path, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify(runId ? {} : requestContext()),
   });
   setStatus(`Action ${data.action} accepted.`);
   await pollRun(data.run_id);
@@ -1351,11 +1521,16 @@ configPathInput.addEventListener("input", () => {
   latestProfiles = null;
   latestProfilesContext = "";
   latestPostgresStatus = null;
+  latestWorkloadStatus = null;
+  renderWorkloadSourceStatus();
 });
 
 workloadPathInput.addEventListener("input", () => {
   latestProfiles = null;
   latestProfilesContext = "";
+  latestWorkloadStatus = null;
+  renderWorkloadSourceStatus();
+  refreshRuns().catch((error) => setStatus(error.message, true));
 });
 
 runsContainer.addEventListener("click", (event) => {
@@ -1380,6 +1555,7 @@ runsContainer.addEventListener("click", (event) => {
   if (useRunSelection) {
     const original = useRunSelection.dataset.originalDatabase || "";
     const target = useRunSelection.dataset.newDatabase || "";
+    const workloadPath = useRunSelection.dataset.workloadPath || "";
     if (original) {
       let option = [...originalDatabaseSelect.options].find((item) => item.value === original);
       if (!option) {
@@ -1391,6 +1567,9 @@ runsContainer.addEventListener("click", (event) => {
     if (target) {
       newDatabaseInput.value = target;
       lastAutoTargetDatabase = target;
+    }
+    if (workloadPath) {
+      workloadPathInput.value = workloadPath === "data/workload.sql" ? "" : workloadPath;
     }
     latestProfiles = null;
     latestProfilesContext = "";

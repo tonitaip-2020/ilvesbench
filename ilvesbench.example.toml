@@ -3,7 +3,7 @@ backend = "aviary"
 base_url = "https://aviary.fgl.rd.tuni.fi/api/chat/completions"
 api_key = ""
 api_key_file = "secrets/aviary_api_key"
-timeout_seconds = 60
+timeout_seconds = 180
 
 [postgres]
 host = "127.0.0.1"

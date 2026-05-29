@@ -15,7 +15,7 @@ from ilvesbench.benchmark.migration_planner import MigrationPlanner
 from ilvesbench.benchmark.schema_transformer import SchemaTransformer
 from ilvesbench.benchmark.workload import WorkloadPlanner
 from ilvesbench.config import IlvesBenchConfig
-from ilvesbench.models import ColumnMetadata, LLMResult, SchemaSnapshot, TableMetadata, UniqueConstraintMetadata, to_dict
+from ilvesbench.models import ColumnMetadata, LLMResult, LogSummary, QueryObservation, SchemaSnapshot, TableMetadata, UniqueConstraintMetadata, to_dict
 
 
 class StaticGateway:
@@ -69,6 +69,39 @@ class RecordingPostgres:
             "database_activity": {},
             "statement_metrics": {},
         }
+
+    def inspect_schema(self, database: str) -> SchemaSnapshot:
+        return SchemaSnapshot(
+            database=database,
+            collected_at="2026-04-23T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="items_lookup",
+                    columns=[
+                        ColumnMetadata(name="id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="name", data_type="text", is_nullable=False),
+                    ],
+                    unique_constraints=[
+                        UniqueConstraintMetadata(name="items_lookup_pkey", columns=["id"]),
+                    ],
+                )
+            ],
+        )
+
+    def profile_database(self, database: str) -> dict:
+        return {
+            "database": database,
+            "status": "completed",
+            "counts": {
+                "tables": 1,
+                "estimated_rows": 10,
+                "populated_tables": 1,
+            },
+        }
+
+    def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
+        return []
 
 
 class FailingPgBench:
@@ -520,6 +553,100 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(log_summary)
             self.assertEqual(log_summary.source_kind, "workload_file")
             self.assertEqual(log_summary.statements_detected, 1)
+
+    def test_query_rewrite_uses_captured_workload_file_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            selected_workload = root / "selected.sql"
+            default_workload = root / "data" / "workload.sql"
+            default_workload.parent.mkdir()
+            selected_workload.write_text("SELECT id, name FROM selected_items;", encoding="utf-8")
+            default_workload.write_text("SELECT id, name FROM stale_items;", encoding="utf-8")
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            log_summary = LogSummary(
+                path=str(selected_workload),
+                lines_processed=1,
+                statements_detected=1,
+                transactions_detected=0,
+                multi_statement_transactions=0,
+                top_queries=[
+                    QueryObservation(
+                        fingerprint="SELECT id, name FROM selected_items",
+                        sample_sql="SELECT id, name FROM selected_items",
+                        count=1,
+                    )
+                ],
+                sampled_transactions=[],
+                source_kind="workload_file",
+            )
+
+            workload_sql = orchestrator._load_source_workload_text(log_summary)
+
+            self.assertIn("selected_items", workload_sql)
+            self.assertNotIn("stale_items", workload_sql)
+
+    def test_state_resume_migrates_queries_against_existing_target_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workload_path = root / "workload.sql"
+            workload_path.write_text("SELECT id, name FROM items WHERE id = 1;", encoding="utf-8")
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f"""
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [workload]
+                path = "{workload_path.name}"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            orchestrator._postgres = RecordingPostgres()
+
+            record = orchestrator.create_state_resume_record()
+            updated = orchestrator.execute_query_migration_from_current_state(record)
+
+            normalize_step = next(step for step in updated.steps if step.name == "propose_3nf_schema")
+            create_step = next(step for step in updated.steps if step.name == "create_target_schema")
+            migrate_step = next(step for step in updated.steps if step.name == "migrate_data")
+            rewrite_step = next(step for step in updated.steps if step.name == "rewrite_queries")
+            self.assertEqual(normalize_step.details["source"], "existing_target_schema")
+            self.assertIn("Skipped normalization", normalize_step.details["summary"])
+            self.assertEqual(create_step.status, "completed")
+            self.assertEqual(migrate_step.status, "completed")
+            self.assertEqual(rewrite_step.status, "completed")
+            self.assertTrue(rewrite_step.details["workload_path"].endswith(".sql"))
 
     def test_create_secondary_indexes_uses_legacy_index_recommendation_sql(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

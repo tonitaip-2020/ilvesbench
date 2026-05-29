@@ -167,6 +167,19 @@ select {
   font-size: 0.92rem;
 }
 
+.workload-source-status {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  background: #edf2f8;
+}
+
+.workload-source-status span,
+.workload-source-detail span {
+  color: var(--muted);
+}
+
 button {
   min-height: 38px;
   padding: 8px 12px;
@@ -580,6 +593,14 @@ code {
   display: grid;
   gap: 8px;
   margin-top: 12px;
+}
+
+.workload-source-detail {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  overflow-wrap: anywhere;
+  font-size: 0.86rem;
 }
 
 .signal-list {
