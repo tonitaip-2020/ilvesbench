@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -9,15 +8,12 @@ import re
 import traceback
 import uuid
 
-from ilvesbench.benchmark.energy import BenchmarkComparator, EnergyEstimator
-from ilvesbench.benchmark.index_advisor import IndexAdvisor
-from ilvesbench.benchmark.migration_planner import MigrationPlanner
-from ilvesbench.benchmark.pgbench import PgBenchRunner
-from ilvesbench.benchmark.schema_transformer import SchemaTransformer
-from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
-from ilvesbench.benchmark.workload import WorkloadPlanner, WorkloadRewriteError
+from ilvesbench.benchmark.workload import WorkloadRewriteError
+from ilvesbench.benchmarker.service import BenchmarkerService
 from ilvesbench.config import IlvesBenchConfig
-from ilvesbench.db.postgres import PostgresInspector
+from ilvesbench.core.components import ComponentBundle
+from ilvesbench.core.run_state import RunStateService
+from ilvesbench.dbops.service import DBOpsService
 from ilvesbench.llm.gateway import LLMGateway
 from ilvesbench.models import (
     BenchmarkRunRecord,
@@ -28,9 +24,8 @@ from ilvesbench.models import (
     TransactionObservation,
     to_dict,
 )
-from ilvesbench.osops.hardware import HardwareInspector
-from ilvesbench.osops.logs import PostgresLogParser
-from ilvesbench.osops.workload_files import WorkloadFileParser
+from ilvesbench.orchestrator.llm_tasks import LLMTaskService
+from ilvesbench.osops.service import OSOpsService
 from ilvesbench.store.repository import RunRepository
 
 
@@ -44,25 +39,33 @@ class PipelineOrchestrator:
             config.resolve_path(config.storage.sqlite_path),
             config.resolve_path(config.storage.artifact_dir),
         )
+        self._run_state = RunStateService()
         self._llm = LLMGateway.from_config(config.llm)
-        self._postgres = PostgresInspector(config.postgres)
-        self._hardware = HardwareInspector(config.docker)
-        self._logs = PostgresLogParser()
-        self._workload_files = WorkloadFileParser()
-        self._pgbench = PgBenchRunner()
-        self._schema_transformer = SchemaTransformer(
-            llm=self._llm,
-            target_database=self._config.postgres.new_database,
+        self._components = ComponentBundle(
+            dbops=DBOpsService(config.postgres),
+            osops=OSOpsService(config),
+            benchmarker=BenchmarkerService(config, llm=self._llm),
+            llm_tasks=LLMTaskService(config, llm=self._llm),
         )
-        self._migration_planner = MigrationPlanner(llm=self._llm)
-        self._workload_planner = WorkloadPlanner(
-            llm=self._llm,
-            target_database=self._config.postgres.new_database,
-        )
-        self._index_advisor = IndexAdvisor()
-        self._tuning_advisor = PostgresTuningAdvisor()
-        self._energy_estimator = EnergyEstimator()
-        self._benchmark_comparator = BenchmarkComparator()
+        self._dbops = self._components.dbops
+        self._osops = self._components.osops
+        self._benchmarker = self._components.benchmarker
+        self._llm_tasks = self._components.llm_tasks
+
+        # Compatibility aliases while the old workflow coordinator is being
+        # thinned. Existing tests and some action methods still patch these.
+        self._postgres = self._dbops.postgres
+        self._hardware = self._osops.hardware
+        self._logs = self._osops.logs
+        self._workload_files = self._osops.workload_files
+        self._pgbench = self._benchmarker.pgbench
+        self._schema_transformer = self._llm_tasks.schema_transformer
+        self._migration_planner = self._llm_tasks.migration_planner
+        self._workload_planner = self._benchmarker.workload_planner
+        self._index_advisor = self._benchmarker.index_advisor
+        self._tuning_advisor = self._benchmarker.tuning_advisor
+        self._energy_estimator = self._benchmarker.energy_estimator
+        self._benchmark_comparator = self._benchmarker.benchmark_comparator
 
     @property
     def store(self) -> RunRepository:
@@ -76,7 +79,7 @@ class PipelineOrchestrator:
         return to_dict(result)
 
     def check_postgres_connection(self) -> dict:
-        return self._postgres.check_connection_status()
+        return self._dbops.check_connection_status()
 
     def discover_postgres_databases(self) -> dict:
         return {
@@ -84,76 +87,17 @@ class PipelineOrchestrator:
             "original_database": self._config.postgres.original_database,
             "new_database": self._config.postgres.new_database,
             "schemas": self._config.postgres.schemas,
-            "databases": self._postgres.discover_databases(),
+            "databases": self._dbops.discover_databases(),
         }
 
     def profile_databases(self) -> dict:
-        return {
-            "original": self._postgres.profile_database(self._config.postgres.original_database),
-            "target": self._postgres.profile_database(self._config.postgres.new_database),
-        }
+        return self._dbops.profile_databases()
 
     def workload_source_status(self) -> dict:
-        workload_input = (self._config.workload.path or "").strip()
-        workload_path = self._resolve_workload_path()
-        log_path = self._config.resolve_path(self._config.logs.path)
-        workload_exists = workload_path is not None and workload_path.exists()
-        log_exists = log_path.exists()
-        if log_exists:
-            selected_kind = "postgresql_log"
-            selected_label = "PostgreSQL query log"
-            selected_path = str(log_path)
-        elif workload_exists:
-            selected_kind = "workload_file"
-            selected_label = "SQL workload file"
-            selected_path = str(workload_path)
-        else:
-            selected_kind = "missing"
-            selected_label = "No query source found"
-            selected_path = ""
-        return {
-            "status": "ok" if selected_kind != "missing" else "missing",
-            "selected_kind": selected_kind,
-            "selected_label": selected_label,
-            "selected_path": selected_path,
-            "configured_workload_path": workload_input or "data/workload.sql",
-            "configured_workload_path_was_blank": not workload_input,
-            "resolved_workload_path": str(workload_path) if workload_path is not None else "",
-            "workload_file_exists": workload_exists,
-            "log_path": str(log_path),
-            "log_file_exists": log_exists,
-            "path_resolution": "Relative workload paths resolve from the selected config file directory.",
-        }
+        return self._osops.workload_source_status()
 
     def workload_source_preview(self) -> dict:
-        log_path = self._config.resolve_path(self._config.logs.path)
-        workload_path = self._resolve_workload_path()
-        if log_path.exists():
-            log_summary = self._logs.parse(log_path, max_lines=self._config.logs.max_lines)
-        elif workload_path is not None and workload_path.exists():
-            log_summary = self._workload_files.parse(workload_path)
-        else:
-            return {
-                "status": "missing",
-                "summary": "No PostgreSQL log file or workload SQL file was found.",
-                "checked_log_path": str(log_path),
-                "checked_workload_path": str(workload_path) if workload_path else "",
-            }
-        staged_query_text = "\n\n".join(
-            f"-- observed query {index} | count {query.count}\n{query.sample_sql.strip().rstrip(';')};"
-            for index, query in enumerate(log_summary.top_queries, start=1)
-            if query.sample_sql.strip()
-        )
-        return {
-            "status": "ok",
-            "source_kind": log_summary.source_kind,
-            "source_path": log_summary.path,
-            "statements_detected": log_summary.statements_detected,
-            "transactions_detected": log_summary.transactions_detected,
-            "top_queries": [to_dict(query) for query in log_summary.top_queries],
-            "sampled_transactions": [to_dict(transaction) for transaction in log_summary.sampled_transactions],
-            "staged_query_text": staged_query_text,
-        }
+        return self._osops.workload_source_preview()
 
     def load_run_record(self, run_id: str) -> BenchmarkRunRecord:
         record = self._store.get_run_record(run_id)
@@ -2663,37 +2607,16 @@ class PipelineOrchestrator:
         error: str | None,
         planned_only: bool,
     ) -> BenchmarkRunRecord:
-        new_steps: list[StepResult] = []
-        replaced_step = False
-        for step in record.steps:
-            if step.name == name:
-                replaced_step = True
-                new_steps.append(
-                    replace(
-                        step,
-                        status=status,
-                        details=details,
-                        error=error,
-                        planned_only=planned_only,
-                    )
-                )
-            else:
-                new_steps.append(step)
-        if not replaced_step:
-            template_step = next((step for step in self._pipeline_template() if step.name == name), None)
-            new_steps.append(
-                StepResult(
-                    name=name,
-                    title=template_step.title if template_step else name.replace("_", " ").title(),
-                    status=status,
-                    requires_approval=template_step.requires_approval if template_step else False,
-                    planned_only=planned_only,
-                    details=details,
-                    error=error,
-                )
-            )
-        record.steps = new_steps
-        record.updated_at = datetime.now(UTC).isoformat()
+        template_step = next((step for step in self._pipeline_template() if step.name == name), None)
+        record = self._run_state.replace_step(
+            record,
+            name,
+            status=status,
+            details=details,
+            error=error,
+            planned_only=planned_only,
+            template_step=template_step,
+        )
         self._store.upsert_run(record)
         return record
 
@@ -2822,8 +2745,7 @@ class PipelineOrchestrator:
         ]
 
     def _resolve_workload_path(self) -> Path | None:
-        workload_value = (self._config.workload.path or "").strip() or "data/workload.sql"
-        return self._config.resolve_path(workload_value)
+        return self._osops.resolve_workload_path()
 
     def _load_source_workload_text(self, log_summary) -> str:
         if log_summary is None:

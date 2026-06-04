@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from ilvesbench.config import IlvesBenchConfig
+from ilvesbench.models import LogSummary, to_dict
+from ilvesbench.osops.hardware import HardwareInspector
+from ilvesbench.osops.logs import PostgresLogParser
+from ilvesbench.osops.workload_files import WorkloadFileParser
+
+
+class OSOpsService:
+    """Operating-system boundary for IlvesBench.
+
+    OSOps owns filesystem and host/container inspection: PostgreSQL logs,
+    workload files, hardware snapshots, and future postgresql.conf access.
+    """
+
+    def __init__(
+        self,
+        config: IlvesBenchConfig,
+        *,
+        hardware: HardwareInspector | None = None,
+        logs: PostgresLogParser | None = None,
+        workload_files: WorkloadFileParser | None = None,
+    ) -> None:
+        self._config = config
+        self.hardware = hardware or HardwareInspector(config.docker)
+        self.logs = logs or PostgresLogParser()
+        self.workload_files = workload_files or WorkloadFileParser()
+
+    def collect_hardware(self) -> object:
+        return self.hardware.collect(self._config.resolve_path("."))
+
+    def resolve_workload_path(self) -> Path | None:
+        configured = (self._config.workload.path or "").strip()
+        candidates: list[Path] = []
+        if configured:
+            candidates.append(self._config.resolve_path(configured))
+        candidates.append(self._config.resolve_path("data/workload.sql"))
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0] if candidates else None
+
+    def workload_source_status(self) -> dict:
+        workload_input = (self._config.workload.path or "").strip()
+        workload_path = self.resolve_workload_path()
+        log_path = self._config.resolve_path(self._config.logs.path)
+        workload_exists = workload_path is not None and workload_path.exists()
+        log_exists = log_path.exists()
+        if log_exists:
+            selected_kind = "postgresql_log"
+            selected_label = "PostgreSQL query log"
+            selected_path = str(log_path)
+        elif workload_exists:
+            selected_kind = "workload_file"
+            selected_label = "SQL workload file"
+            selected_path = str(workload_path)
+        else:
+            selected_kind = "missing"
+            selected_label = "No query source found"
+            selected_path = ""
+        return {
+            "status": "ok" if selected_kind != "missing" else "missing",
+            "selected_kind": selected_kind,
+            "selected_label": selected_label,
+            "selected_path": selected_path,
+            "configured_workload_path": workload_input or "data/workload.sql",
+            "configured_workload_path_was_blank": not workload_input,
+            "resolved_workload_path": str(workload_path) if workload_path is not None else "",
+            "workload_file_exists": workload_exists,
+            "log_path": str(log_path),
+            "log_file_exists": log_exists,
+            "path_resolution": "Relative workload paths resolve from the selected config file directory.",
+        }
+
+    def load_workload_source(self) -> LogSummary | None:
+        log_path = self._config.resolve_path(self._config.logs.path)
+        workload_path = self.resolve_workload_path()
+        if log_path.exists():
+            return self.logs.parse(log_path, max_lines=self._config.logs.max_lines)
+        if workload_path is not None and workload_path.exists():
+            return self.workload_files.parse(workload_path)
+        return None
+
+    def workload_source_preview(self) -> dict:
+        log_path = self._config.resolve_path(self._config.logs.path)
+        workload_path = self.resolve_workload_path()
+        log_summary = self.load_workload_source()
+        if log_summary is None:
+            return {
+                "status": "missing",
+                "summary": "No PostgreSQL log file or workload SQL file was found.",
+                "checked_log_path": str(log_path),
+                "checked_workload_path": str(workload_path) if workload_path else "",
+            }
+        staged_query_text = "\n\n".join(
+            f"-- observed query {index} | count {query.count}\n{query.sample_sql.strip().rstrip(';')};"
+            for index, query in enumerate(log_summary.top_queries, start=1)
+            if query.sample_sql.strip()
+        )
+        return {
+            "status": "ok",
+            "source_kind": log_summary.source_kind,
+            "source_path": log_summary.path,
+            "statements_detected": log_summary.statements_detected,
+            "transactions_detected": log_summary.transactions_detected,
+            "top_queries": [to_dict(query) for query in log_summary.top_queries],
+            "sampled_transactions": [to_dict(transaction) for transaction in log_summary.sampled_transactions],
+            "staged_query_text": staged_query_text,
+        }
+
