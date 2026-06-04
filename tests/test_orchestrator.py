@@ -31,6 +31,36 @@ class StaticGateway:
         )
 
 
+class TimeoutGateway:
+    def generate(self, messages, model=None, max_tokens=256) -> LLMResult:
+        raise TimeoutError("The read operation timed out")
+
+
+class RewriteGateway:
+    def generate(self, messages, model=None, max_tokens=256) -> LLMResult:
+        user_prompt = messages[-1]["content"] if messages else ""
+        count = max(1, user_prompt.count("-- query "))
+        statements = ["SELECT id, name FROM items_lookup WHERE id = 1"]
+        if count > 1:
+            statements.extend(
+                "UPDATE items_lookup SET name = name WHERE id = 1"
+                for _ in range(count - 1)
+            )
+        return LLMResult(
+            backend="aviary",
+            model=model or "fake-model",
+            response_text=json.dumps(
+                {
+                    "status": "planned",
+                    "summary": "Synthetic rewritten workload.",
+                    "reasoning": ["Synthetic test response."],
+                    "statements": statements,
+                }
+            ),
+            raw_response={},
+        )
+
+
 class FailingPostgres:
     def database_exists(self, database: str) -> bool:
         return True
@@ -103,6 +133,38 @@ class RecordingPostgres:
     def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
         return []
 
+    def compare_query_results(
+        self,
+        original_database: str,
+        target_database: str,
+        original_statement: str,
+        rewritten_statement: str,
+        *,
+        row_limit: int = 100,
+        random_seed: float = 0.314159,
+    ) -> dict:
+        return {
+            "status": "passed",
+            "exact_order_match": True,
+            "unordered_match": True,
+            "original_row_count": 1,
+            "rewritten_row_count": 1,
+            "row_limit": row_limit,
+            "random_seed": random_seed,
+        }
+
+
+class ValidationFailingPostgres(RecordingPostgres):
+    def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
+        return [{"statement": statements[0] if statements else "", "error": "relation does not exist"}]
+
+
+class PartiallyValidationFailingPostgres(RecordingPostgres):
+    def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
+        if len(statements) < 2:
+            return []
+        return [{"index": 1, "statement": statements[1], "error": "column does not exist"}]
+
 
 class FailingPgBench:
     def run(self, config, postgres, database, workload_path=None):
@@ -130,6 +192,7 @@ class FakeOrchestrator(PipelineOrchestrator):
     def __init__(self, config: IlvesBenchConfig, normalization_response_text: str | None = None) -> None:
         super().__init__(config)
         self._llm = StaticGateway()
+        self._postgres = RecordingPostgres()
         response_text = normalization_response_text or json.dumps(
             {
                 "assessment": {
@@ -159,18 +222,7 @@ class FakeOrchestrator(PipelineOrchestrator):
                 )
             )
         )
-        self._workload_planner = WorkloadPlanner(
-            llm=StaticGateway(
-                json.dumps(
-                    {
-                        "status": "planned",
-                        "summary": "Synthetic rewritten workload.",
-                        "reasoning": ["Synthetic test response."],
-                        "statements": ["SELECT id, name FROM items_lookup WHERE id = 1"],
-                    }
-                )
-            )
-        )
+        self._workload_planner = WorkloadPlanner(llm=RewriteGateway())
         self._fake_schema = SchemaSnapshot(
             database=config.postgres.original_database,
             collected_at="2026-04-23T00:00:00+00:00",
@@ -426,6 +478,57 @@ class OrchestratorTests(unittest.TestCase):
             self.assertNotIn("stderr", pgbench_step.details)
             self.assertNotIn("command", pgbench_step.details)
 
+    def test_pgbench_new_filters_invalid_rewritten_workload_statements(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workload_path = root / "workload.sql"
+            workload_path.write_text(
+                "SELECT id, name FROM items WHERE id = 1; UPDATE items SET name = name WHERE id = 1;",
+                encoding="utf-8",
+            )
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f"""
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [logs]
+                path = "missing.log"
+
+                [workload]
+                path = "{workload_path.name}"
+
+                [pgbench]
+                enabled = false
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+
+            record = orchestrator.run_mvp_collection()
+            orchestrator._postgres = PartiallyValidationFailingPostgres()
+            orchestrator.begin_pgbench_new(record.run_id)
+            result = orchestrator.execute_pgbench_new(record.run_id)
+
+            pgbench_step = next(step for step in result.steps if step.name == "run_pgbench_new")
+            self.assertEqual(pgbench_step.status, "completed")
+            self.assertEqual(pgbench_step.details["workload_validation"]["status"], "warning")
+            self.assertFalse(pgbench_step.details["workload_validation"]["blocking"])
+            self.assertEqual(pgbench_step.details["workload_validation"]["error_count"], 1)
+            self.assertEqual(pgbench_step.details["workload_validation"]["valid_statement_count"], 1)
+            self.assertIn("rewritten_workload_db_new_validated", pgbench_step.details["workload_path"])
+
     def test_regenerate_rewrite_resets_db_new_benchmark_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -603,6 +706,47 @@ class OrchestratorTests(unittest.TestCase):
 
             self.assertIn("selected_items", workload_sql)
             self.assertNotIn("stale_items", workload_sql)
+
+    def test_query_rewrite_failure_artifact_keeps_debug_context_without_llm_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workload_path = root / "workload.sql"
+            workload_path.write_text("SELECT id, name FROM items WHERE id = 1;", encoding="utf-8")
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f"""
+                [llm]
+                backend = "aviary"
+                base_url = "https://example.invalid/v1/chat/completions"
+                model = "fake-model"
+
+                [postgres]
+                original_database = "source_db"
+                new_database = "target_db"
+
+                [workload]
+                path = "{workload_path.name}"
+
+                [storage]
+                sqlite_path = "runs.sqlite3"
+                artifact_dir = "artifacts"
+                """,
+                encoding="utf-8",
+            )
+            config = IlvesBenchConfig.from_toml(config_path)
+            orchestrator = FakeOrchestrator(config)
+            orchestrator._postgres = RecordingPostgres()
+            orchestrator._workload_planner = WorkloadPlanner(llm=TimeoutGateway())
+
+            record = orchestrator.create_state_resume_record()
+            updated = orchestrator.execute_query_migration_from_current_state(record)
+            rewrite_step = next(step for step in updated.steps if step.name == "rewrite_queries")
+            artifact = json.loads(Path(updated.artifacts["rewrite_queries"]).read_text(encoding="utf-8"))
+
+            self.assertEqual(rewrite_step.status, "failed")
+            self.assertIn("No LLM response text was received", artifact["raw_response_text"])
+            self.assertIn("SELECT id, name FROM items", artifact["source_query_text"])
+            self.assertEqual(artifact["llm_request"]["source_statements"], ["SELECT id, name FROM items WHERE id = 1;"])
 
     def test_state_resume_migrates_queries_against_existing_target_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -6,7 +6,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_LLM_MODEL = "Qwen3.6-35B-A3B"
+DEFAULT_LLM_MODEL = "llama3.2-3b"
 
 
 @dataclass(slots=True)

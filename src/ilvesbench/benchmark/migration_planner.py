@@ -16,6 +16,7 @@ class MigrationProposal:
     statements: list[dict] = field(default_factory=list)
     source: str = "unavailable"
     raw_response_text: str | None = None
+    request_payload: dict | None = None
 
 
 class MigrationPlanner:
@@ -32,6 +33,7 @@ class MigrationPlanner:
             )
         deterministic = self._deterministic_first_normal_form_plan(schema, target_tables)
         if deterministic is not None:
+            deterministic.request_payload = self._request_payload(schema, target_tables)
             return deterministic
         if self._llm is None:
             return MigrationProposal(
@@ -40,10 +42,24 @@ class MigrationPlanner:
                 source="fallback",
             )
 
+        request_payload = self._request_payload(schema, target_tables)
         llm_result = self._llm.generate(self._build_messages(schema, target_tables), max_tokens=1800)
         proposal = self._proposal_from_response(llm_result.response_text, target_tables)
         proposal.raw_response_text = llm_result.response_text
+        proposal.request_payload = request_payload
         return proposal
+
+    def _request_payload(self, schema: SchemaSnapshot | None, target_tables: list[dict]) -> dict:
+        return {
+            "source_tables": [
+                {
+                    "table": f"{table.schema}.{table.name}",
+                    "columns": [column.name for column in table.columns],
+                }
+                for table in (schema.tables if schema is not None else [])
+            ],
+            "target_tables": target_tables,
+        }
 
     def _proposal_from_response(self, response_text: str, target_tables: list[dict]) -> MigrationProposal:
         payload = self._extract_json_object(response_text)

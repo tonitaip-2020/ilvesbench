@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import UTC, datetime
+import json
+import re
 
 from ilvesbench.benchmark.normal_form import FirstNormalFormFinding, FirstNormalFormScanner
 from ilvesbench.config import PostgresConfig
@@ -50,7 +52,10 @@ class PostgresInspector:
                     ORDER BY d.datname
                     """
                 )
-                rows = [dict(row) for row in cur.fetchall()]
+                rows = [
+                    json.loads(json.dumps(dict(row), ensure_ascii=True, default=str))
+                    for row in cur.fetchall()
+                ]
         finally:
             conn.close()
 
@@ -322,21 +327,124 @@ class PostgresInspector:
         errors: list[dict] = []
         try:
             with conn.cursor() as cur:
-                for statement in statements:
+                for index, statement in enumerate(statements):
                     sql_text = statement.strip().rstrip(";")
                     if not sql_text:
                         continue
+                    kind = self._statement_kind(sql_text)
                     try:
-                        cur.execute("EXPLAIN " + sql_text)
-                        cur.fetchall()
+                        cur.execute("SET LOCAL statement_timeout = '5s'")
+                        cur.execute("SET LOCAL lock_timeout = '2s'")
+                        if kind in {"select", "with"}:
+                            cur.execute(
+                                f"SELECT * FROM ({sql_text}) AS ilvesbench_validation_sample LIMIT 1"
+                            )
+                            cur.fetchone()
+                        elif kind in {"insert", "update", "delete"}:
+                            cur.execute(sql_text)
+                        else:
+                            raise ValueError(
+                                "Rewritten workload must contain SELECT, WITH, INSERT, UPDATE, or DELETE statements only."
+                            )
                     except Exception as exc:
                         conn.rollback()
-                        errors.append({"statement": statement, "error": str(exc)})
+                        errors.append({"index": index, "statement": statement, "kind": kind, "error": str(exc)})
                     else:
                         conn.rollback()
         finally:
             conn.close()
         return errors
+
+    def compare_query_results(
+        self,
+        original_database: str,
+        target_database: str,
+        original_statement: str,
+        rewritten_statement: str,
+        *,
+        row_limit: int = 100,
+        random_seed: float = 0.314159,
+    ) -> dict:
+        if not self._is_result_query(original_statement) or not self._is_result_query(rewritten_statement):
+            return {
+                "status": "skipped",
+                "reason": "Result comparison currently runs SELECT/WITH queries only.",
+                "original_row_count": None,
+                "rewritten_row_count": None,
+                "row_limit": row_limit,
+                "random_seed": random_seed,
+            }
+
+        original_rows = self._fetch_query_sample(
+            original_database,
+            original_statement,
+            row_limit=row_limit,
+            random_seed=random_seed,
+        )
+        rewritten_rows = self._fetch_query_sample(
+            target_database,
+            rewritten_statement,
+            row_limit=row_limit,
+            random_seed=random_seed,
+        )
+        original_canonical = [self._canonical_row(row) for row in original_rows]
+        rewritten_canonical = [self._canonical_row(row) for row in rewritten_rows]
+        exact_order_match = original_canonical == rewritten_canonical
+        unordered_match = sorted(original_canonical) == sorted(rewritten_canonical)
+        return {
+            "status": "passed" if exact_order_match or unordered_match else "failed",
+            "exact_order_match": exact_order_match,
+            "unordered_match": unordered_match,
+            "original_row_count": len(original_rows),
+            "rewritten_row_count": len(rewritten_rows),
+            "row_limit": row_limit,
+            "random_seed": random_seed,
+            "original_sample": original_rows[:10],
+            "rewritten_sample": rewritten_rows[:10],
+        }
+
+    def _fetch_query_sample(
+        self,
+        database: str,
+        statement: str,
+        *,
+        row_limit: int,
+        random_seed: float,
+    ) -> list[dict]:
+        conn = self._connect(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '15s'")
+                cur.execute("SELECT setseed(%s)", (random_seed,))
+                cur.execute(
+                    f"SELECT * FROM ({statement.strip().rstrip(';')}) AS ilvesbench_validation_sample LIMIT %s",
+                    (row_limit,),
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+            conn.rollback()
+            return rows
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _canonical_row(self, row: dict) -> str:
+        return json.dumps(row, sort_keys=True, ensure_ascii=True, default=str)
+
+    def _is_result_query(self, statement: str) -> bool:
+        return bool(re.match(r"^\s*(WITH|SELECT)\b", statement, re.IGNORECASE))
+
+    def _statement_kind(self, statement: str) -> str:
+        text = statement.strip()
+        while True:
+            stripped = re.sub(r"^\s*--[^\n]*(?:\n|$)", "", text, count=1)
+            stripped = re.sub(r"^\s*/\*.*?\*/", "", stripped, count=1, flags=re.DOTALL)
+            if stripped == text:
+                break
+            text = stripped.strip()
+        match = re.match(r"^([A-Za-z]+)\b", text)
+        return match.group(1).lower() if match else "unknown"
 
     def _sample_column_values(
         self,
@@ -1004,7 +1112,20 @@ class PostgresInspector:
                 pg_indexes_size(c.oid) AS index_bytes,
                 COALESCE(s.seq_scan, 0) AS seq_scan,
                 COALESCE(s.idx_scan, 0) AS idx_scan,
-                COALESCE(s.n_live_tup, 0) AS n_live_tup,
+                CASE
+                    WHEN COALESCE(s.n_live_tup, 0) > 0 THEN COALESCE(s.n_live_tup, 0)
+                    WHEN c.reltuples > 0 THEN c.reltuples::bigint
+                    WHEN pg_relation_size(c.oid) > 0 THEN GREATEST(1, (pg_relation_size(c.oid) / 200)::bigint)
+                    ELSE 0
+                END AS n_live_tup,
+                COALESCE(s.n_live_tup, 0) AS stats_live_tup,
+                CASE WHEN c.reltuples > 0 THEN c.reltuples::bigint ELSE 0 END AS planner_rows,
+                CASE
+                    WHEN COALESCE(s.n_live_tup, 0) > 0 THEN 'pg_stat_user_tables'
+                    WHEN c.reltuples > 0 THEN 'pg_class_reltuples'
+                    WHEN pg_relation_size(c.oid) > 0 THEN 'relation_size_heuristic'
+                    ELSE 'none'
+                END AS row_estimate_source,
                 COALESCE(s.n_dead_tup, 0) AS n_dead_tup
             FROM pg_class AS c
             JOIN pg_namespace AS n ON n.oid = c.relnamespace

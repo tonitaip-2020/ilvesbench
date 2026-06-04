@@ -58,6 +58,7 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok", "config_path": self.server.config_path})
             return
         if parsed.path == "/api/runs":
+            self.server.orchestrator.recover_stale_running_runs()
             self._send_json({"runs": self.server.orchestrator.store.list_runs()})
             return
         if "/artifacts/" in parsed.path and parsed.path.startswith("/api/runs/"):
@@ -81,6 +82,7 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 return
         if parsed.path.startswith("/api/runs/"):
             run_id = parsed.path.rsplit("/", 1)[-1]
+            self.server.orchestrator.recover_stale_running_runs()
             payload = self.server.orchestrator.store.get_run(run_id)
             if payload is None:
                 self._send_json({"error": "Run not found."}, status=HTTPStatus.NOT_FOUND)
@@ -226,6 +228,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             thread.start()
             self._send_json({"status": "accepted", "run_id": run_id, "action": "regenerate-rewrite"}, status=HTTPStatus.ACCEPTED)
             return
+        if parsed.path.endswith("/actions/create-summary-tables"):
+            run_id = parsed.path.split("/")[-3]
+            self.server.orchestrator.begin_create_summary_tables(run_id)
+            thread = threading.Thread(
+                target=self.server.orchestrator.execute_create_summary_tables,
+                args=(run_id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"status": "accepted", "run_id": run_id, "action": "create-summary-tables"}, status=HTTPStatus.ACCEPTED)
+            return
         if parsed.path.endswith("/actions/run-pgbench-original"):
             run_id = parsed.path.split("/")[-3]
             self.server.orchestrator.begin_pgbench_original(run_id)
@@ -311,6 +324,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 schemas=body.get("schemas"),
             )
             self._send_json(self.server.orchestrator.workload_source_status())
+            return
+        if parsed.path == "/api/workload/preview":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+            )
+            self._send_json(self.server.orchestrator.workload_source_preview())
             return
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 

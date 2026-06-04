@@ -41,6 +41,8 @@ class OpenAICompatibleGateway(LLMGateway):
                 "model": model or self._config.model,
                 "messages": messages,
                 "max_tokens": max_tokens,
+                "temperature": 0,
+                "stream": False,
             }
         ).encode("utf-8")
         req = request.Request(
@@ -52,7 +54,12 @@ class OpenAICompatibleGateway(LLMGateway):
         with request.urlopen(req, timeout=self._config.timeout_seconds) as response:
             raw = json.loads(response.read().decode("utf-8"))
 
-        content = raw["choices"][0]["message"]["content"]
+        message = raw["choices"][0].get("message", {})
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+        if content is None:
+            content = ""
         return LLMResult(
             backend=self._config.backend,
             model=model or self._config.model,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path, PureWindowsPath
 import re
@@ -31,6 +32,9 @@ from ilvesbench.osops.hardware import HardwareInspector
 from ilvesbench.osops.logs import PostgresLogParser
 from ilvesbench.osops.workload_files import WorkloadFileParser
 from ilvesbench.store.repository import RunRepository
+
+
+QUERY_REWRITE_BATCH_SIZE = 25
 
 
 class PipelineOrchestrator:
@@ -121,12 +125,91 @@ class PipelineOrchestrator:
             "path_resolution": "Relative workload paths resolve from the selected config file directory.",
         }
 
+    def workload_source_preview(self) -> dict:
+        log_path = self._config.resolve_path(self._config.logs.path)
+        workload_path = self._resolve_workload_path()
+        if log_path.exists():
+            log_summary = self._logs.parse(log_path, max_lines=self._config.logs.max_lines)
+        elif workload_path is not None and workload_path.exists():
+            log_summary = self._workload_files.parse(workload_path)
+        else:
+            return {
+                "status": "missing",
+                "summary": "No PostgreSQL log file or workload SQL file was found.",
+                "checked_log_path": str(log_path),
+                "checked_workload_path": str(workload_path) if workload_path else "",
+            }
+        staged_query_text = "\n\n".join(
+            f"-- observed query {index} | count {query.count}\n{query.sample_sql.strip().rstrip(';')};"
+            for index, query in enumerate(log_summary.top_queries, start=1)
+            if query.sample_sql.strip()
+        )
+        return {
+            "status": "ok",
+            "source_kind": log_summary.source_kind,
+            "source_path": log_summary.path,
+            "statements_detected": log_summary.statements_detected,
+            "transactions_detected": log_summary.transactions_detected,
+            "top_queries": [to_dict(query) for query in log_summary.top_queries],
+            "sampled_transactions": [to_dict(transaction) for transaction in log_summary.sampled_transactions],
+            "staged_query_text": staged_query_text,
+        }
+
     def load_run_record(self, run_id: str) -> BenchmarkRunRecord:
         record = self._store.get_run_record(run_id)
         if record is None:
             raise ValueError(f"Run not found: {run_id}")
         self._apply_run_database_context(record)
         return record
+
+    def recover_stale_running_runs(self, *, max_age_seconds: int = 3600) -> int:
+        now = datetime.now(UTC)
+        recovered = 0
+        for payload in self._store.list_runs():
+            if payload.get("status") != "running":
+                continue
+            try:
+                updated_at = datetime.fromisoformat(str(payload.get("updated_at", "")).replace("Z", "+00:00"))
+            except ValueError:
+                updated_at = now
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=UTC)
+            if (now - updated_at).total_seconds() < max_age_seconds:
+                continue
+            record = self._store.get_run_record(str(payload.get("run_id", "")))
+            if record is None:
+                continue
+            running_steps = [step for step in record.steps if step.status == "running"]
+            if not running_steps:
+                record.status = self._overall_status(record)
+                self._store.upsert_run(record)
+                recovered += 1
+                continue
+            for running_step in running_steps:
+                stale_details = dict(running_step.details)
+                stale_details["stale_recovered"] = True
+                stale_details["summary"] = (
+                    stale_details.get("summary")
+                    or "This action was interrupted before it finished."
+                )
+                record = self._replace_step(
+                    record,
+                    running_step.name,
+                    status="failed",
+                    details=stale_details,
+                    error=(
+                        "This action was interrupted or orphaned by a server restart. "
+                        "Start it again to retry."
+                    ),
+                    planned_only=False,
+                )
+            record.status = self._overall_status(record)
+            record.summary["error"] = "A previously running action was interrupted and can be retried."
+            record.summary.update(self._summary_counts(record))
+            record.updated_at = datetime.now(UTC).isoformat()
+            self._store.upsert_run(record)
+            recovered += 1
+        return recovered
 
     def _apply_run_database_context(self, record: BenchmarkRunRecord) -> None:
         original_database = str(record.summary.get("original_database") or "").strip()
@@ -205,6 +288,7 @@ class PipelineOrchestrator:
                 "target_tables": target_tables,
                 "sql_statements": [],
                 "source": "existing_target_schema",
+                "llm_request": {},
             }
             record.artifacts["propose_3nf_schema"] = self._store.write_artifact(
                 record.run_id,
@@ -253,6 +337,7 @@ class PipelineOrchestrator:
                 )
             )
 
+            record = self._plan_summary_tables_step(record, log_summary)
             record = self._plan_rewrite_queries_step(record, log_summary)
             record = self._plan_query_validation_step(record)
             record = self._plan_benchmark_workload_step(record)
@@ -304,6 +389,7 @@ class PipelineOrchestrator:
                     "target_tables": proposal.target_tables,
                     "sql_statements": proposal.sql_statements,
                     "source": proposal.source,
+                    "llm_request": proposal.request_payload or {},
                 }
                 review_candidates = self._normalization_review_candidates(
                     schema,
@@ -346,21 +432,9 @@ class PipelineOrchestrator:
                     "3NF planning is blocked until schema inspection succeeds.",
                 )
 
-            workload_plan = self._workload_planner.build_plan(log_summary)
-            record = self._mark_planned(
-                record,
-                "suggest_summary_tables",
-                {
-                    "status": workload_plan.status,
-                    "summary": workload_plan.summary,
-                    "candidate_count": len(workload_plan.candidate_summary_tables),
-                    "candidates": workload_plan.candidate_summary_tables,
-                    "creation_status": "placeholder",
-                },
-            )
-
             record = self._plan_target_schema_step(record)
             record = self._plan_migration_step(record, schema)
+            record = self._plan_summary_tables_step(record, log_summary)
             record = self._plan_rewrite_queries_step(record, log_summary)
             record = self._plan_query_validation_step(record)
             record = self._plan_benchmark_workload_step(record)
@@ -569,6 +643,7 @@ class PipelineOrchestrator:
         try:
             log_summary = self._load_log_summary_artifact(record)
             schema = self._load_schema_artifact(record)
+            record = self._plan_summary_tables_step(record, log_summary)
             record = self._plan_rewrite_queries_step(record, log_summary)
             record = self._plan_query_validation_step(record)
             record = self._plan_benchmark_workload_step(record)
@@ -581,6 +656,71 @@ class PipelineOrchestrator:
                 "rewrite_queries",
                 status="failed",
                 details=next((step.details for step in record.steps if step.name == "rewrite_queries"), {}),
+                error=str(exc),
+                planned_only=False,
+            )
+            record.summary["error"] = str(exc)
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
+        return record
+
+    def begin_create_summary_tables(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        record.status = "running"
+        summary_step = next((step for step in record.steps if step.name == "suggest_summary_tables"), None)
+        if summary_step is not None:
+            record = self._replace_step(
+                record,
+                "suggest_summary_tables",
+                status="running",
+                details=summary_step.details,
+                error=None,
+                planned_only=False,
+            )
+        record.summary.update(self._summary_counts(record))
+        self._store.upsert_run(record)
+        return record
+
+    def execute_create_summary_tables(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        try:
+            summary_step = next(step for step in record.steps if step.name == "suggest_summary_tables")
+            statements = [
+                str(statement).strip()
+                for statement in summary_step.details.get("sql_statements", [])
+                if str(statement).strip()
+            ]
+            if not statements:
+                raise ValueError("No summary-table CREATE TABLE SQL is available.")
+            executed = self._postgres.execute_statements(self._config.postgres.new_database, statements)
+            details = dict(summary_step.details)
+            details.update(
+                {
+                    "creation_status": "created",
+                    "executed_statement_count": len(executed),
+                    "executed_sql": statements,
+                    "summary": f"Created {len(executed)} summary table structure(s) in {self._config.postgres.new_database}.",
+                }
+            )
+            record.artifacts["suggest_summary_tables"] = self._store.write_artifact(
+                record.run_id,
+                "summary_table_recommendations",
+                details,
+            )
+            record = self._complete_step(record, "suggest_summary_tables", details)
+            record = self._plan_rewrite_queries_step(record, self._load_log_summary_artifact(record))
+            record = self._plan_query_validation_step(record)
+            record = self._plan_benchmark_workload_step(record)
+            record = self._plan_pgbench_new_step(record)
+            record.summary.pop("error", None)
+        except Exception as exc:
+            record = self._replace_step(
+                record,
+                "suggest_summary_tables",
+                status="failed",
+                details=next((step.details for step in record.steps if step.name == "suggest_summary_tables"), {}),
                 error=str(exc),
                 planned_only=False,
             )
@@ -767,6 +907,7 @@ class PipelineOrchestrator:
                     "sql_statements": proposal.sql_statements,
                     "source": "human_reviewed_1nf",
                     "review_status": "completed",
+                    "llm_request": proposal.request_payload or {},
                 }
             )
         else:
@@ -781,6 +922,7 @@ class PipelineOrchestrator:
                     "sql_statements": [],
                     "source": "human_review",
                     "review_status": "completed",
+                    "llm_request": {},
                 }
             )
 
@@ -793,6 +935,7 @@ class PipelineOrchestrator:
         record = self._plan_target_schema_step(record)
         record = self._plan_migration_step(record, schema)
         log_summary = self._load_log_summary_artifact(record)
+        record = self._plan_summary_tables_step(record, log_summary)
         record = self._plan_rewrite_queries_step(record, log_summary)
         record = self._plan_query_validation_step(record)
         record = self._plan_benchmark_workload_step(record)
@@ -851,6 +994,7 @@ class PipelineOrchestrator:
             record = self._complete_step(record, "propose_3nf_schema", proposal_dict)
             record = self._plan_target_schema_step(record)
             record = self._plan_migration_step(record, schema)
+            record = self._plan_summary_tables_step(record, None)
             record = self._plan_rewrite_queries_step(record, None)
             record = self._plan_query_validation_step(record)
             record = self._plan_benchmark_workload_step(record)
@@ -1063,9 +1207,14 @@ class PipelineOrchestrator:
             )
         return record
 
-    def _run_pgbench_new_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+    def _run_pgbench_new_step(
+        self,
+        record: BenchmarkRunRecord,
+        validation_warning: dict | None = None,
+        workload_path_override: Path | None = None,
+    ) -> BenchmarkRunRecord:
         step = next(step for step in record.steps if step.name == "run_pgbench_new")
-        workload_path = self._rewritten_workload_path(record)
+        workload_path = workload_path_override or self._rewritten_workload_path(record)
         try:
             benchmark = self._pgbench.run(
                 self._config.pgbench,
@@ -1079,6 +1228,7 @@ class PipelineOrchestrator:
                 artifact_name="pgbench_new",
                 benchmark=benchmark,
                 workload_path=workload_path,
+                extra_details={"workload_validation": validation_warning} if validation_warning else None,
             )
         except Exception as exc:
             record = self._replace_step(
@@ -1166,21 +1316,12 @@ class PipelineOrchestrator:
             if rewrite_step.status != "completed" or not rewrite_step.details.get("workload_path"):
                 raise ValueError(f"Rewritten {self._config.postgres.new_database} workload must be completed before benchmarking.")
             workload_path = Path(str(rewrite_step.details.get("workload_path"))).resolve()
-            if workload_path.exists():
-                validation_errors = self._validate_db_new_workload(
-                    self._split_sql_statements(workload_path.read_text(encoding="utf-8", errors="replace"))
-                )
-                if validation_errors:
-                    sample_errors = " | ".join(
-                        str(item.get("error", "")).splitlines()[0]
-                        for item in validation_errors[:3]
-                    )
-                    raise ValueError(
-                        f"The current {self._config.postgres.new_database} workload does not validate against "
-                        f"{self._config.postgres.new_database}. "
-                        f"Regenerate it before benchmarking. {sample_errors}"
-                    )
-            record = self._run_pgbench_new_step(record)
+            workload_path, validation_warning = self._prepare_pgbench_new_workload(record, workload_path)
+            record = self._run_pgbench_new_step(
+                record,
+                validation_warning=validation_warning,
+                workload_path_override=workload_path,
+            )
             record = self._run_extended_metrics_step(
                 record,
                 [self._config.postgres.original_database, self._config.postgres.new_database],
@@ -1311,6 +1452,7 @@ class PipelineOrchestrator:
         artifact_name: str,
         benchmark,
         workload_path: Path | None,
+        extra_details: dict | None = None,
     ) -> BenchmarkRunRecord:
         benchmark_dict = to_dict(benchmark)
         record.artifacts[step_name] = self._store.write_artifact(
@@ -1332,6 +1474,8 @@ class PipelineOrchestrator:
             "energy_joules": energy_dict.get("energy_joules"),
             "joules_per_transaction": energy_dict.get("joules_per_transaction"),
         }
+        if extra_details:
+            details.update(extra_details)
         if benchmark.status == "completed":
             details["summary"] = (
                 f'pgbench completed against "{benchmark.database}" with '
@@ -1354,6 +1498,94 @@ class PipelineOrchestrator:
             error=fatal_error or "pgbench did not run.",
             planned_only=False,
         )
+
+    def _prepare_pgbench_new_workload(self, record: BenchmarkRunRecord, workload_path: Path) -> tuple[Path, dict | None]:
+        if not workload_path.exists():
+            return workload_path, None
+        statements = self._split_sql_statements(workload_path.read_text(encoding="utf-8", errors="replace"))
+        validation_errors = self._validate_db_new_workload(statements)
+        if not validation_errors:
+            return workload_path, {
+                "status": "passed",
+                "summary": f"Rewritten workload dry-run validates against {self._config.postgres.new_database}.",
+                "statement_count": len(statements),
+                "valid_statement_count": len(statements),
+                "error_count": 0,
+                "errors": [],
+                "blocking": False,
+            }
+        invalid_indexes = {
+            int(item["index"])
+            for item in validation_errors
+            if str(item.get("index", "")).isdigit()
+        }
+        invalid_texts = {
+            self._normalize_sql_for_compare(str(item.get("statement", "")))
+            for item in validation_errors
+            if item.get("statement")
+        }
+        valid_statements = [
+            statement
+            for index, statement in enumerate(statements)
+            if index not in invalid_indexes
+            and self._normalize_sql_for_compare(statement) not in invalid_texts
+        ]
+        if not valid_statements:
+            raise ValueError(
+                f"None of the rewritten {self._config.postgres.new_database} workload statements passed "
+                "PostgreSQL dry-run validation, so pgbench was not started."
+            )
+        filtered_path = Path(
+            self._store.write_text_artifact(
+                record.run_id,
+                "rewritten_workload_db_new_validated",
+                "\n\n".join(valid_statements) + "\n",
+                suffix=".sql",
+            )
+        )
+        record.artifacts["run_pgbench_new_validated_workload"] = str(filtered_path)
+        return filtered_path, {
+            "status": "warning",
+            "summary": (
+                f"{len(validation_errors)} rewritten workload statement(s) failed PostgreSQL dry-run validation "
+                f"against {self._config.postgres.new_database}. pgbench will use "
+                f"{len(valid_statements)} validated statement(s)."
+            ),
+            "statement_count": len(statements),
+            "valid_statement_count": len(valid_statements),
+            "error_count": len(validation_errors),
+            "errors": validation_errors[:10],
+            "filtered_workload_path": str(filtered_path),
+            "blocking": False,
+        }
+
+    def _pgbench_new_validation_warning(self, workload_path: Path) -> dict | None:
+        if not workload_path.exists():
+            return None
+        validation_errors = self._validate_db_new_workload(
+            self._split_sql_statements(workload_path.read_text(encoding="utf-8", errors="replace"))
+        )
+        if not validation_errors:
+            return {
+                "status": "passed",
+                "summary": f"Rewritten workload validates against {self._config.postgres.new_database}.",
+                "error_count": 0,
+                "errors": [],
+                "blocking": False,
+            }
+        return {
+            "status": "warning",
+            "summary": (
+                f"{len(validation_errors)} rewritten workload statement(s) did not validate against "
+                f"{self._config.postgres.new_database}. pgbench is still allowed to run."
+            ),
+            "error_count": len(validation_errors),
+            "errors": validation_errors[:10],
+            "blocking": False,
+        }
+
+    def _normalize_sql_for_compare(self, statement: str) -> str:
+        return re.sub(r"\s+", " ", statement.strip().rstrip(";")).strip().lower()
 
     def _store_energy_estimate(self, record: BenchmarkRunRecord, step_name: str, benchmark) -> dict:
         hardware = self._load_optional_artifact(record, "capture_hardware") or {}
@@ -1520,6 +1752,7 @@ class PipelineOrchestrator:
                 "statements": proposal.statements,
                 "target_tables": target_tables,
                 "source": proposal.source,
+                "llm_request": proposal.request_payload or {},
             }
             if proposal.statements:
                 migration_sql = "\n\n".join(statement["sql"] for statement in proposal.statements) + "\n"
@@ -1542,6 +1775,39 @@ class PipelineOrchestrator:
         except Exception as exc:
             return self._fail_step(record, "migrate_data", str(exc))
 
+    def _plan_summary_tables_step(self, record: BenchmarkRunRecord, log_summary) -> BenchmarkRunRecord:
+        workload_plan = self._workload_planner.build_plan(log_summary)
+        sql_statements = [
+            str(candidate.get("sql_statement", "")).strip()
+            for candidate in workload_plan.candidate_summary_tables
+            if str(candidate.get("sql_statement", "")).strip()
+        ]
+        details = {
+            "status": workload_plan.status,
+            "summary": workload_plan.summary,
+            "candidate_count": len(workload_plan.candidate_summary_tables),
+            "candidates": workload_plan.candidate_summary_tables,
+            "creation_status": "approval_required" if sql_statements else "not_recommended",
+            "sql_statements": sql_statements,
+            "implemented": True,
+            "source": "workload_heuristic",
+        }
+        if sql_statements:
+            sql_path = self._store.write_text_artifact(
+                record.run_id,
+                "summary_table_recommendations",
+                "\n\n".join(sql_statements) + "\n",
+                suffix=".sql",
+            )
+            details["sql_path"] = sql_path
+            record.artifacts["suggest_summary_tables_sql"] = sql_path
+        record.artifacts["suggest_summary_tables"] = self._store.write_artifact(
+            record.run_id,
+            "summary_table_recommendations",
+            details,
+        )
+        return self._mark_planned(record, "suggest_summary_tables", details)
+
     def _plan_rewrite_queries_step(self, record: BenchmarkRunRecord, log_summary) -> BenchmarkRunRecord:
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
         migrate_step = next((step for step in record.steps if step.name == "migrate_data"), None)
@@ -1549,6 +1815,7 @@ class PipelineOrchestrator:
         migration_statements = migrate_step.details.get("statements", []) if migrate_step else []
         if not target_tables:
             target_tables = self._existing_target_tables()
+        prompt_target_tables = target_tables + self._summary_table_target_tables(record)
 
         try:
             workload_sql = self._load_source_workload_text(log_summary)
@@ -1578,50 +1845,448 @@ class PipelineOrchestrator:
         except Exception as exc:
             return self._fail_step(record, "rewrite_queries", str(exc))
 
-        try:
-            proposal = self._workload_planner.rewrite(workload_sql, target_tables, migration_statements)
-            proposal_dict = {
-                "status": proposal.status,
-                "summary": proposal.summary,
-                "reasoning": proposal.rationale,
-                "statement_count": len(proposal.statements),
-                "statements": proposal.statements,
-                "source": proposal.source,
+        source_statements = self._workload_planner.source_statements(workload_sql)
+        if not source_statements:
+            details = {
+                "status": "no_queries",
+                "summary": "No workload queries were available to rewrite for db-new.",
+                "statement_count": 0,
+                "total_query_count": 0,
+                "source_query_text": workload_sql,
                 "target_table_count": len(target_tables),
             }
-            if proposal.statements:
-                validation_errors = self._validate_db_new_workload(proposal.statements)
-                if validation_errors:
-                    sample_errors = " | ".join(
-                        str(item.get("error", "")).splitlines()[0]
-                        for item in validation_errors[:3]
-                    )
-                    raise ValueError(
-                        f"Generated {self._config.postgres.new_database} workload does not validate against the current "
-                        f"{self._config.postgres.new_database} schema. "
-                        f"{sample_errors}"
-                    )
-                sql_text = "\n\n".join(proposal.statements) + "\n"
-                sql_path = self._store.write_text_artifact(
-                    record.run_id,
-                    "rewritten_workload_db_new",
-                    sql_text,
-                    suffix=".sql",
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new",
+                details,
+            )
+            return self._complete_step(record, "rewrite_queries", details)
+
+        if not prompt_target_tables:
+            sql_path = self._store.write_text_artifact(
+                record.run_id,
+                "rewritten_workload_db_new",
+                "\n\n".join(source_statements) + "\n",
+                suffix=".sql",
+            )
+            details = {
+                "status": "no_rewrite_needed",
+                "summary": "No normalized target tables were proposed, so no db-new workload rewrite was generated.",
+                "statement_count": len(source_statements),
+                "total_query_count": len(source_statements),
+                "statements": source_statements,
+                "workload_path": sql_path,
+                "source": "fallback",
+                "source_query_text": workload_sql,
+                "target_table_count": 0,
+            }
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new",
+                details,
+            )
+            return self._complete_step(record, "rewrite_queries", details)
+
+        cache = self._load_query_rewrite_cache()
+        progress = self._query_rewrite_progress_payload(
+            workload_sql,
+            source_statements,
+            prompt_target_tables,
+            migration_statements,
+        )
+        record = self._save_query_rewrite_progress(record, progress, status="running")
+
+        try:
+            pending: list[tuple[int, str, str]] = []
+            for index, source_statement in enumerate(source_statements, start=1):
+                progress["current_query_index"] = index
+                progress["current_stage"] = "checking rewrite cache"
+                record = self._save_query_rewrite_progress(record, progress, status="running")
+
+                cache_key = self._query_rewrite_cache_key(source_statement, prompt_target_tables)
+                cached = cache.get(cache_key)
+                if cached:
+                    query_result = dict(cached)
+                    rewritten_statement = str(query_result.get("rewritten_statement", "")).strip()
+                    validation = self._validate_rewritten_query_statement(rewritten_statement)
+                    if validation.get("status") == "failed":
+                        cache.pop(cache_key, None)
+                        self._save_query_rewrite_cache(cache)
+                        pending.append((index, source_statement, cache_key))
+                        continue
+                    query_result.update({
+                        "query_index": index,
+                        "cache_hit": True,
+                        "stage": "cached",
+                        "validation": validation,
+                    })
+                    progress["query_results"].append(query_result)
+                    progress["statements"].append(rewritten_statement)
+                    progress["completed_query_count"] = len(progress["statements"])
+                    progress["cache_hit_count"] = int(progress.get("cache_hit_count", 0)) + 1
+                    progress["current_stage"] = "cached rewrite reused"
+                    record = self._save_query_rewrite_progress(record, progress, status="running")
+                    continue
+                pending.append((index, source_statement, cache_key))
+
+            for batch_number, pending_batch in enumerate(self._query_rewrite_batches(pending), start=1):
+                progress["current_query_index"] = pending_batch[0][0]
+                progress["current_stage"] = (
+                    f"sending rewrite batch {batch_number} "
+                    f"({len(pending_batch)} query statement(s)) to the LLM"
                 )
-                proposal_dict["workload_path"] = sql_path
-                record.artifacts["rewrite_queries"] = self._store.write_artifact(
-                    record.run_id,
-                    "rewritten_workload_db_new",
-                    proposal_dict | {"raw_response_text": proposal.raw_response_text},
+                record = self._save_query_rewrite_progress(record, progress, status="running")
+                pending_sql = "\n\n".join(statement for _, statement, _ in pending_batch)
+                proposal = self._workload_planner.rewrite(
+                    pending_sql,
+                    prompt_target_tables,
+                    migration_statements,
+                    batch_size=QUERY_REWRITE_BATCH_SIZE,
                 )
-                return self._complete_step(record, "rewrite_queries", proposal_dict)
-            return self._complete_step(record, "rewrite_queries", proposal_dict)
+                if len(proposal.statements) != len(pending_batch):
+                    raise WorkloadRewriteError(
+                        (
+                            f"The LLM returned {len(proposal.statements)} rewritten statement(s), "
+                            f"but IlvesBench expected {len(pending_batch)} for batch {batch_number}."
+                        ),
+                        raw_response_text=proposal.raw_response_text or "",
+                        request_payload=proposal.request_payload or {},
+                    )
+                if proposal.request_payload:
+                    progress["llm_requests"].append(proposal.request_payload)
+                if proposal.raw_response_text:
+                    progress["raw_responses"].append(f"Rewrite batch {batch_number} response:\n{proposal.raw_response_text}")
+
+                for offset, (index, source_statement, cache_key) in enumerate(pending_batch):
+                    rewritten_statement = proposal.statements[offset]
+                    progress["current_query_index"] = index
+                    progress["current_stage"] = f"validating rewritten query {index} against {self._config.postgres.new_database}"
+                    progress["last_rewritten_statement"] = rewritten_statement
+                    record = self._save_query_rewrite_progress(record, progress, status="running")
+                    validation = self._validate_rewritten_query_statement(rewritten_statement)
+                    validation_passed = validation.get("status") == "passed"
+                    query_result = {
+                        "query_index": index,
+                        "source_statement": source_statement,
+                        "rewritten_statement": rewritten_statement,
+                        "status": "completed" if validation_passed else "failed",
+                        "stage": "target_validation_passed" if validation_passed else "target_validation_failed",
+                        "source": proposal.source,
+                        "reasoning": proposal.rationale,
+                        "cache_hit": False,
+                        "validation": validation,
+                        "raw_response_text": proposal.raw_response_text or "",
+                        "llm_request": proposal.request_payload or {},
+                    }
+                    progress["query_results"].append(query_result)
+                    progress["processed_query_count"] = len(progress["query_results"])
+                    if validation_passed:
+                        progress["statements"].append(rewritten_statement)
+                        progress["completed_query_count"] = len(progress["statements"])
+                        progress["current_stage"] = f"query {index} validated and saved"
+                        cache[cache_key] = {
+                            "source_statement": source_statement,
+                            "rewritten_statement": rewritten_statement,
+                            "source": proposal.source,
+                            "reasoning": proposal.rationale,
+                            "validation": validation,
+                            "target_table_count": len(prompt_target_tables),
+                            "saved_at": datetime.now(UTC).isoformat(),
+                        }
+                        self._save_query_rewrite_cache(cache)
+                    else:
+                        progress["current_stage"] = f"query {index} failed target validation"
+                    record = self._save_query_rewrite_progress(record, progress, status="running")
+
+            ordered_results = sorted(progress["query_results"], key=lambda item: int(item.get("query_index", 0) or 0))
+            ordered_statements = [
+                str(item.get("rewritten_statement", "")).strip()
+                for item in ordered_results
+                if str(item.get("rewritten_statement", "")).strip()
+                and item.get("validation", {}).get("status") == "passed"
+            ]
+            invalid_count = sum(1 for item in ordered_results if item.get("validation", {}).get("status") == "failed")
+            progress["query_results"] = ordered_results
+            progress["statements"] = ordered_statements
+            sql_text = "\n\n".join(ordered_statements) + "\n"
+            sql_path = self._store.write_text_artifact(
+                record.run_id,
+                "rewritten_workload_db_new",
+                sql_text,
+                suffix=".sql",
+            )
+            if not ordered_statements:
+                raise WorkloadRewriteError(
+                    (
+                        f"None of the {len(source_statements)} rewritten query statement(s) validated against "
+                        f"{self._config.postgres.new_database}; no pgbench workload was generated."
+                    ),
+                    raw_response_text="\n\n".join(progress["raw_responses"]),
+                    request_payload=self._query_rewrite_request_summary(progress, len(source_statements)),
+                )
+            completed_details = progress | {
+                "status": "planned",
+                "summary": (
+                    f"Rewrote {len(ordered_statements)} target-resolvable query statement(s) for "
+                    f"{self._config.postgres.new_database}."
+                    + (f" Excluded {invalid_count} query statement(s) that PostgreSQL could not resolve." if invalid_count else "")
+                ),
+                "statement_count": len(ordered_statements),
+                "completed_query_count": len(ordered_statements),
+                "failed_query_count": invalid_count,
+                "current_stage": "completed",
+                "workload_path": sql_path,
+                "raw_response_text": "\n\n".join(progress["raw_responses"]),
+                "llm_request": self._query_rewrite_request_summary(progress, len(source_statements)),
+                "source": "llm_incremental",
+            }
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new",
+                completed_details,
+            )
+            return self._complete_step(record, "rewrite_queries", completed_details)
+        except WorkloadRewriteError as exc:
+            raw_response_text = exc.raw_response_text or (
+                "\n\n".join(progress["raw_responses"])
+                or "[No LLM response text was received before query migration failed.]"
+            )
+            if exc.raw_response_text and exc.raw_response_text not in "\n\n".join(progress["raw_responses"]):
+                progress["raw_responses"].append(exc.raw_response_text)
+            failure_details = progress | {
+                "status": "failed",
+                "summary": str(exc),
+                "raw_response_text": raw_response_text,
+                "target_table_count": len(target_tables),
+                "prompt_target_table_count": len(prompt_target_tables),
+                "source_query_text": workload_sql,
+                "target_tables": prompt_target_tables,
+                "migration_statements": migration_statements,
+                "llm_request": exc.request_payload or self._query_rewrite_request_summary(progress, len(source_statements)),
+            }
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new_failed",
+                failure_details,
+            )
+            return self._replace_step(
+                record,
+                "rewrite_queries",
+                status="failed",
+                details=failure_details,
+                error=str(exc),
+                planned_only=False,
+            )
         except Exception as exc:
-            return self._fail_step(record, "rewrite_queries", str(exc))
+            failure_details = progress | {
+                "status": "failed",
+                "summary": str(exc),
+                "raw_response_text": "\n\n".join(progress["raw_responses"])
+                or "[No LLM response text was received before query migration failed.]",
+                "llm_request": self._query_rewrite_request_summary(progress, len(source_statements)),
+            }
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new_failed",
+                failure_details,
+            )
+            return self._replace_step(
+                record,
+                "rewrite_queries",
+                status="failed",
+                details=failure_details,
+                error=str(exc),
+                planned_only=False,
+            )
+
+    def _query_rewrite_progress_payload(
+        self,
+        workload_sql: str,
+        source_statements: list[str],
+        target_tables: list[dict],
+        migration_statements: list[dict],
+    ) -> dict:
+        return {
+            "status": "running",
+            "summary": (
+                f"Rewriting {len(source_statements)} query statement(s) for "
+                f"{self._config.postgres.new_database} in batches of up to {QUERY_REWRITE_BATCH_SIZE}."
+            ),
+            "mode": "incremental",
+            "total_query_count": len(source_statements),
+            "completed_query_count": 0,
+            "cache_hit_count": 0,
+            "current_query_index": 0,
+            "current_stage": "starting",
+            "statement_count": 0,
+            "statements": [],
+            "query_results": [],
+            "raw_responses": [],
+            "raw_response_text": "",
+            "llm_requests": [],
+            "llm_request": {
+                "mode": "incremental",
+                "total_query_count": len(source_statements),
+                "batches": [],
+            },
+            "source_query_text": workload_sql,
+            "target_tables": target_tables,
+            "target_table_count": len(target_tables),
+            "migration_statements": migration_statements,
+        }
+
+    def _save_query_rewrite_progress(
+        self,
+        record: BenchmarkRunRecord,
+        progress: dict,
+        *,
+        status: str,
+    ) -> BenchmarkRunRecord:
+        statements = [str(statement) for statement in progress.get("statements", []) if str(statement).strip()]
+        artifact_payload = dict(progress)
+        artifact_payload["statement_count"] = len(statements)
+        artifact_payload["completed_query_count"] = len(statements)
+        artifact_payload["raw_response_text"] = "\n\n".join(progress.get("raw_responses", []))
+        artifact_payload["llm_request"] = self._query_rewrite_request_summary(
+            progress,
+            int(progress.get("total_query_count", 0) or 0),
+        )
+        if statements:
+            artifact_payload["partial_workload_path"] = self._store.write_text_artifact(
+                record.run_id,
+                "rewritten_workload_db_new_partial",
+                "\n\n".join(statements) + "\n",
+                suffix=".sql",
+            )
+        record.artifacts["rewrite_queries"] = self._store.write_artifact(
+            record.run_id,
+            "rewritten_workload_db_new_progress",
+            artifact_payload,
+        )
+        return self._replace_step(
+            record,
+            "rewrite_queries",
+            status=status,
+            details=artifact_payload,
+            error=None,
+            planned_only=False,
+        )
+
+    def _query_rewrite_request_summary(self, progress: dict, total_query_count: int) -> dict:
+        return {
+            "mode": "incremental",
+            "total_query_count": total_query_count,
+            "batch_size": QUERY_REWRITE_BATCH_SIZE,
+            "batches": progress.get("llm_requests", []),
+        }
+
+    def _query_rewrite_batches(self, pending: list[tuple[int, str, str]]) -> list[list[tuple[int, str, str]]]:
+        return [
+            pending[index : index + QUERY_REWRITE_BATCH_SIZE]
+            for index in range(0, len(pending), QUERY_REWRITE_BATCH_SIZE)
+        ]
+
+    def _summary_table_target_tables(self, record: BenchmarkRunRecord) -> list[dict]:
+        summary_step = next((step for step in record.steps if step.name == "suggest_summary_tables"), None)
+        if not summary_step or summary_step.details.get("creation_status") != "created":
+            return []
+        candidates = summary_step.details.get("candidates", []) if summary_step else []
+        tables: list[dict] = []
+        for candidate in candidates:
+            table_name = str(candidate.get("table_name", "")).strip()
+            sql_statement = str(candidate.get("sql_statement", "")).strip()
+            if not table_name or not sql_statement:
+                continue
+            columns = [
+                {"source_table": "", "source_column": column, "name": column}
+                for column in re.findall(r'"([^"]+)"\s+text', sql_statement)
+            ]
+            tables.append(
+                {
+                    "name": table_name,
+                    "purpose": f"Recommended summary table: {candidate.get('reason', '')}",
+                    "source_tables": [],
+                    "columns": columns,
+                    "primary_key": [],
+                    "uniques": [],
+                    "foreign_keys": [],
+                    "summary_candidate": True,
+                }
+            )
+        return tables
+
+    def _compare_rewritten_query_results(self, source_statement: str, rewritten_statement: str) -> dict:
+        try:
+            return self._postgres.compare_query_results(
+                self._config.postgres.original_database,
+                self._config.postgres.new_database,
+                source_statement,
+                rewritten_statement,
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "error": str(exc),
+                "original_database": self._config.postgres.original_database,
+                "target_database": self._config.postgres.new_database,
+            }
+
+    def _validate_rewritten_query_statement(self, rewritten_statement: str) -> dict:
+        statement = rewritten_statement.strip()
+        if not statement:
+            return {
+                "status": "failed",
+                "scope": "target_postgresql_resolution_check",
+                "error": "Rewritten statement is empty.",
+                "target_database": self._config.postgres.new_database,
+            }
+        errors = self._validate_db_new_workload([statement])
+        if not errors:
+            return {
+                "status": "passed",
+                "scope": "target_postgresql_resolution_check",
+                "summary": f"PostgreSQL resolved the rewritten statement against {self._config.postgres.new_database}.",
+                "target_database": self._config.postgres.new_database,
+            }
+        return {
+            "status": "failed",
+            "scope": "target_postgresql_resolution_check",
+            "error": str(errors[0].get("error", "")),
+            "errors": errors,
+            "target_database": self._config.postgres.new_database,
+        }
+
+    def _query_rewrite_cache_path(self) -> Path:
+        return self._config.resolve_path(self._config.storage.artifact_dir) / "query_rewrite_cache.json"
+
+    def _load_query_rewrite_cache(self) -> dict:
+        path = self._query_rewrite_cache_path()
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_query_rewrite_cache(self, cache: dict) -> None:
+        path = self._query_rewrite_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    def _query_rewrite_cache_key(self, source_statement: str, target_tables: list[dict]) -> str:
+        payload = {
+            "original_database": self._config.postgres.original_database,
+            "new_database": self._config.postgres.new_database,
+            "schemas": list(self._config.postgres.schemas),
+            "source_statement": re.sub(r"\s+", " ", source_statement).strip(),
+            "target_tables": target_tables,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
 
     def _plan_query_validation_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
         statement_count = int(rewrite_step.details.get("statement_count", 0) or 0) if rewrite_step else 0
+        query_results = rewrite_step.details.get("query_results", []) if rewrite_step else []
         if rewrite_step is None or rewrite_step.status != "completed" or statement_count == 0:
             return self._mark_planned(
                 record,
@@ -1629,25 +2294,51 @@ class PipelineOrchestrator:
                 {
                     "status": "placeholder",
                     "summary": (
-                        "Query result validation will be available after query migration produces rewritten SQL."
+                        "Target-side PostgreSQL query validation waits for migrated queries."
                     ),
-                    "scope": "planned_result_equivalence_check",
-                    "implemented": False,
+                    "scope": "target_postgresql_resolution_check",
+                    "implemented": True,
                 },
             )
-        return self._mark_planned(
+        validated_results = []
+        for item in query_results:
+            rewritten_statement = str(item.get("rewritten_statement", "")).strip()
+            validation = self._validate_rewritten_query_statement(rewritten_statement)
+            validated_results.append(dict(item) | {"validation": validation})
+        query_results = validated_results
+        passed_count = sum(1 for item in query_results if item.get("validation", {}).get("status") == "passed")
+        skipped_count = sum(1 for item in query_results if item.get("validation", {}).get("status") == "skipped")
+        failed_count = sum(1 for item in query_results if item.get("validation", {}).get("status") == "failed")
+        status = "failed" if failed_count else "completed"
+        summary = (
+            f"Checked {passed_count + failed_count} rewritten query statement(s) against "
+            f"{self._config.postgres.new_database}: {passed_count} resolvable, "
+            f"{failed_count} failed, {skipped_count} skipped."
+        )
+        details = {
+            "status": status,
+            "summary": summary,
+            "source_statement_count": statement_count,
+            "passed_count": passed_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "scope": "target_postgresql_resolution_check",
+            "implemented": True,
+            "query_results": query_results,
+        }
+        if failed_count:
+            return self._replace_step(
+                record,
+                "validate_query_results",
+                status="failed",
+                details=details,
+                error=summary,
+                planned_only=False,
+            )
+        return self._complete_step(
             record,
             "validate_query_results",
-            {
-                "status": "placeholder",
-                "summary": (
-                    "Placeholder: compare sampled db-original query results with rewritten db-new query results. "
-                    "Current prototype only performs limited SQL/schema validation during rewrite."
-                ),
-                "source_statement_count": statement_count,
-                "scope": "planned_result_equivalence_check",
-                "implemented": False,
-            },
+            details,
         )
 
     def _plan_benchmark_workload_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
@@ -1937,7 +2628,7 @@ class PipelineOrchestrator:
             StepResult(name="create_target_schema", title=f"Create {self._config.postgres.new_database} schema", status="pending", requires_approval=True),
             StepResult(name="migrate_data", title=f"Migrate data into {self._config.postgres.new_database}", status="pending", requires_approval=True),
             StepResult(name="rewrite_queries", title=f"Migrate queries for {self._config.postgres.new_database}", status="pending"),
-            StepResult(name="validate_query_results", title="Validate migrated query results", status="pending"),
+            StepResult(name="validate_query_results", title="Validate migrated queries", status="pending"),
             StepResult(name="generate_benchmark_workload", title="Generate benchmark workload mix", status="pending"),
             StepResult(name="suggest_summary_tables", title="Suggest summary tables", status="pending"),
             StepResult(name="optimize_indexes", title="Recommend workload-aware indexes", status="pending"),

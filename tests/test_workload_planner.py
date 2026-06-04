@@ -85,7 +85,7 @@ class WorkloadPlannerTests(unittest.TestCase):
                 migration_statements=[],
             )
 
-        self.assertIn("SELECT, INSERT, UPDATE, or DELETE", str(ctx.exception))
+        self.assertIn("executable rewritten SQL", str(ctx.exception))
 
     def test_rewrite_strips_database_qualifiers_for_target_tables(self) -> None:
         planner = WorkloadPlanner(
@@ -156,8 +156,7 @@ class WorkloadPlannerTests(unittest.TestCase):
         planner = WorkloadPlanner(
             llm=StaticGateway(
                 [
-                    "SELECT primarytitle FROM title_basics;",
-                    "SELECT averagerating FROM title_ratings;",
+                    "SELECT primarytitle FROM title_basics; SELECT averagerating FROM title_ratings;",
                 ]
             )
         )
@@ -168,29 +167,20 @@ class WorkloadPlannerTests(unittest.TestCase):
             migration_statements=[],
         )
 
-        self.assertEqual(proposal.source, "llm_batched_fallback")
+        self.assertEqual(proposal.source, "llm_sql_fallback")
         self.assertEqual(len(proposal.statements), 2)
 
-    def test_rewrite_batches_multiple_source_queries(self) -> None:
+    def test_rewrite_sends_multiple_source_queries_in_one_call(self) -> None:
         gateway = StaticGateway(
-            [
-                json.dumps(
-                    {
-                        "status": "planned",
-                        "summary": "Q1.",
-                        "reasoning": [],
-                        "statements": ["SELECT primarytitle FROM title_basics"],
-                    }
-                ),
-                json.dumps(
-                    {
-                        "status": "planned",
-                        "summary": "Q2.",
-                        "reasoning": [],
-                        "statements": ["SELECT averagerating FROM title_ratings"],
-                    }
-                ),
-            ]
+            {
+                "status": "planned",
+                "summary": "Both queries.",
+                "reasoning": [],
+                "statements": [
+                    "SELECT primarytitle FROM title_basics",
+                    "SELECT averagerating FROM title_ratings",
+                ],
+            }
         )
         planner = WorkloadPlanner(llm=gateway)
 
@@ -200,9 +190,36 @@ class WorkloadPlannerTests(unittest.TestCase):
             migration_statements=[],
         )
 
-        self.assertEqual(proposal.source, "llm_batched")
+        self.assertEqual(proposal.source, "llm")
         self.assertEqual(len(proposal.statements), 2)
-        self.assertEqual(len(gateway.messages), 2)
+        self.assertEqual(len(gateway.messages), 1)
+
+    def test_rewrite_splits_large_workloads_into_limited_batches(self) -> None:
+        responses = []
+        for batch_start in (1, 11, 21):
+            responses.append(
+                " ".join(
+                    f"SELECT {value} FROM rewritten_table;"
+                    for value in range(batch_start, batch_start + 10)
+                )
+            )
+        gateway = StaticGateway(responses)
+        planner = WorkloadPlanner(llm=gateway)
+        workload_sql = " ".join(
+            f"SELECT {value} FROM source_table;"
+            for value in range(1, 31)
+        )
+
+        proposal = planner.rewrite(
+            workload_sql,
+            target_tables=[{"name": "rewritten_table"}],
+            migration_statements=[],
+            batch_size=10,
+        )
+
+        self.assertEqual(len(proposal.statements), 30)
+        self.assertEqual(len(gateway.messages), 3)
+        self.assertEqual(proposal.request_payload["batch_count"], 3)
 
     def test_rewrite_reports_batch_timeout_with_context(self) -> None:
         planner = WorkloadPlanner(llm=TimeoutGateway())
@@ -216,33 +233,23 @@ class WorkloadPlannerTests(unittest.TestCase):
 
         self.assertIn("query batch 1", str(ctx.exception))
         self.assertIn("timed out", str(ctx.exception))
+        self.assertEqual(ctx.exception.request_payload["source_statements"], ["SELECT primarytitle FROM public.title_basics;"])
 
-    def test_rewrite_retries_with_repair_prompt_when_llm_returns_prose(self) -> None:
+    def test_rewrite_rejects_prose_without_executable_sql(self) -> None:
         gateway = StaticGateway(
             [
                 "I can rewrite these queries, but here is an explanation instead of JSON.",
-                json.dumps(
-                    {
-                        "status": "planned",
-                        "summary": "Repaired.",
-                        "reasoning": ["Converted to JSON."],
-                        "statements": ["SELECT primarytitle FROM title_basics"],
-                    }
-                ),
             ]
         )
         planner = WorkloadPlanner(llm=gateway)
 
-        proposal = planner.rewrite(
-            "SELECT primarytitle FROM public.title_basics;",
-            target_tables=[{"name": "title_basics"}],
-            migration_statements=[],
-        )
-
-        self.assertEqual(proposal.status, "planned")
-        self.assertEqual(proposal.statements, ["SELECT primarytitle FROM title_basics;"])
-        self.assertEqual(len(gateway.messages), 2)
-        self.assertIn("Initial response:", proposal.raw_response_text)
+        with self.assertRaises(WorkloadRewriteError):
+            planner.rewrite(
+                "SELECT primarytitle FROM public.title_basics;",
+                target_tables=[{"name": "title_basics"}],
+                migration_statements=[],
+            )
+        self.assertEqual(len(gateway.messages), 1)
 
     def test_build_plan_recommends_summary_table_candidates_for_aggregate_workload(self) -> None:
         planner = WorkloadPlanner()

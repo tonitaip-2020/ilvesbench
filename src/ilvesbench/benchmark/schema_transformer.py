@@ -20,6 +20,7 @@ class NormalizationProposal:
     sql_statements: list[str] = field(default_factory=list)
     source: str = "metadata_fallback"
     raw_response_text: str | None = None
+    request_payload: dict | None = None
 
 
 class SchemaTransformer:
@@ -43,16 +44,19 @@ class SchemaTransformer:
 
         if self._llm is not None:
             try:
+                request_payload = self._request_payload(schema, first_normal_form_findings)
                 llm_result = self._llm.generate(
                     self._build_messages(schema, first_normal_form_findings),
                     max_tokens=1800,
                 )
                 proposal = self._proposal_from_llm_response(schema, llm_result.response_text)
                 proposal.raw_response_text = llm_result.response_text
+                proposal.request_payload = request_payload
                 if first_normal_form_findings and not proposal.target_tables:
                     fallback = self._first_normal_form_decomposition(schema, first_normal_form_findings)
                     if fallback is not None:
                         fallback.raw_response_text = llm_result.response_text
+                        fallback.request_payload = request_payload
                         fallback.rationale.insert(0, "LLM returned no target tables despite deterministic 1NF warnings.")
                         fallback.source = "deterministic_1nf_fallback_after_llm"
                         return fallback
@@ -62,6 +66,7 @@ class SchemaTransformer:
                 fallback.summary = (
                     "LLM normalization proposal could not be validated, so IlvesBench fell back to metadata-only analysis."
                 )
+                fallback.request_payload = self._request_payload(schema, first_normal_form_findings)
                 fallback.rationale.insert(0, f"LLM proposal fallback reason: {exc}")
                 return fallback
 
@@ -95,6 +100,12 @@ class SchemaTransformer:
             sql_statements=sql_statements,
             source="llm_repair",
             raw_response_text=llm_result.response_text,
+            request_payload={
+                "source_schema": self._schema_summary(schema),
+                "existing_target_tables": existing_target_tables,
+                "existing_sql_statements": existing_sql_statements,
+                "error_message": error_message,
+            },
         )
 
     def build_first_normal_form_decomposition(
@@ -132,6 +143,31 @@ class SchemaTransformer:
             sql_statements=sql_statements,
             source="llm",
         )
+
+    def _request_payload(self, schema: SchemaSnapshot, first_normal_form_findings: list[dict]) -> dict:
+        return {
+            "source_schema": self._schema_summary(schema),
+            "first_normal_form_findings": first_normal_form_findings,
+            "target_database": self._target_database,
+        }
+
+    def _schema_summary(self, schema: SchemaSnapshot) -> list[dict]:
+        return [
+            {
+                "table": f"{table.schema}.{table.name}",
+                "columns": [column.name for column in table.columns],
+                "unique_constraints": [constraint.columns for constraint in table.unique_constraints],
+                "foreign_keys": [
+                    {
+                        "columns": foreign_key.columns,
+                        "references_table": foreign_key.referenced_table,
+                        "references_columns": foreign_key.referenced_columns,
+                    }
+                    for foreign_key in table.foreign_keys
+                ],
+            }
+            for table in schema.tables
+        ]
 
     def _metadata_fallback(
         self,

@@ -15,6 +15,7 @@ let latestProfiles = null;
 let latestLlmStatus = null;
 let latestPostgresStatus = null;
 let latestWorkloadStatus = null;
+let latestWorkloadPreview = null;
 let discoveredDatabases = [];
 let lastAutoTargetDatabase = newDatabaseInput.value.trim();
 let profileLoading = false;
@@ -26,7 +27,7 @@ const WORKSPACE_TABS = [
   { id: "profile", label: "Profile", steps: ["inspect_source_schema", "scan_first_normal_form", "collect_extended_metrics"] },
   { id: "normalize", label: "Normalize", steps: ["scan_first_normal_form", "propose_3nf_schema"] },
   { id: "migrate", label: "Migrate", steps: ["create_target_schema", "migrate_data"] },
-  { id: "workload", label: "Workload", steps: ["extract_workload_logs", "rewrite_queries", "validate_query_results", "generate_benchmark_workload", "suggest_summary_tables"] },
+  { id: "workload", label: "Workload", steps: ["extract_workload_logs", "suggest_summary_tables", "rewrite_queries", "validate_query_results", "generate_benchmark_workload"] },
   { id: "physical", label: "Physical design", steps: ["optimize_indexes", "create_secondary_indexes", "tune_postgresql_conf"] },
   { id: "benchmark", label: "Benchmark", steps: ["run_pgbench_original", "run_pgbench_new"] },
   { id: "compare", label: "Compare", steps: ["compare_disk_usage"] },
@@ -41,7 +42,7 @@ const STEP_TITLES = {
   create_target_schema: "Create target schema",
   migrate_data: "Migrate data",
   rewrite_queries: "Migrate queries",
-  validate_query_results: "Validate migrated query results",
+  validate_query_results: "Validate migrated queries",
   generate_benchmark_workload: "Generate benchmark workload mix",
   suggest_summary_tables: "Suggest summary tables",
   optimize_indexes: "Recommend workload-aware indexes",
@@ -214,6 +215,24 @@ function rawSqlBlock(title, statements, path = "") {
   `;
 }
 
+function rawJsonBlock(title, payload) {
+  if (payload === undefined || payload === null || payload === "") return "";
+  if (Array.isArray(payload) && payload.length === 0) return "";
+  if (typeof payload === "object" && !Array.isArray(payload) && Object.keys(payload).length === 0) return "";
+  const text = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+  return rawSqlBlock(title, text);
+}
+
+function observedQuerySql(logs) {
+  return (logs.top_queries || [])
+    .map((query, index) => `-- observed query ${index + 1} | count ${query.count || 0}\n${query.sample_sql || query.fingerprint || ""}`)
+    .filter(Boolean);
+}
+
+function artifactOrStep(artifacts, artifactName, run, stepName = artifactName) {
+  return artifacts?.[artifactName] || step(run, stepName).details || {};
+}
+
 function renderNormalizationReviews(run, reviews) {
   if (!reviews.length) return "";
   return `
@@ -283,10 +302,10 @@ function effectiveStep(run, name) {
   if (!item.name && name === "validate_query_results") {
     return {
       name,
-      title: "Validate migrated query results",
+      title: "Validate migrated queries",
       status: "planned",
       details: {
-        summary: "Placeholder: compare db-original query results with rewritten db-new query results.",
+        summary: "Placeholder: ask PostgreSQL to resolve rewritten db-new queries before benchmarking.",
         status: "placeholder",
       },
     };
@@ -537,7 +556,18 @@ async function fetchArtifact(runId, artifactName) {
 
 async function loadCurrentArtifacts(run) {
   const artifacts = {};
-  const names = ["inspect_source_schema", "extract_workload_logs", "collect_extended_metrics", "compare_disk_usage"];
+  const names = [
+    "inspect_source_schema",
+    "extract_workload_logs",
+    "propose_3nf_schema",
+    "migrate_data",
+    "suggest_summary_tables",
+    "rewrite_queries",
+    "optimize_indexes",
+    "create_secondary_indexes",
+    "collect_extended_metrics",
+    "compare_disk_usage",
+  ];
   await Promise.all(
     names
       .filter((name) => run.artifacts?.[name])
@@ -775,6 +805,12 @@ function originalActions(run) {
   return actions;
 }
 
+function newBenchmarkWorkloadPath(run) {
+  const newBench = step(run, "run_pgbench_new");
+  const rewriteStep = step(run, "rewrite_queries");
+  return newBench.details?.workload_path || rewriteStep.details?.workload_path || "";
+}
+
 function targetActions(run, profile = latestProfiles?.target || {}) {
   const actions = [];
   const targetName = selectedTargetDatabase(run) || "target database";
@@ -786,6 +822,7 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const indexRecommendStep = step(run, "optimize_indexes");
   const indexCreateStep = step(run, "create_secondary_indexes");
   const newBench = step(run, "run_pgbench_new");
+  const benchmarkWorkloadPath = newBenchmarkWorkloadPath(run);
   const hasCreateSql = (createStep.details?.sql_statements || []).length > 0;
   const hasMigrationSql = (migrateStep.details?.statements || []).length > 0;
   const hasTargetTables = (normalizationStep.details?.target_tables || []).length > 0;
@@ -859,9 +896,9 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
     "run-pgbench-new",
     `Run pgbench on ${targetName}`,
     "primary-approval",
-    selectionOnlyReason || (newBench.details?.workload_path && readiness.structureReady && readiness.dataReady && rewriteStep.status === "completed"
+    selectionOnlyReason || (benchmarkWorkloadPath && rewriteStep.status === "completed"
       ? ""
-      : !readiness.structureReady ? `Needs ${targetName} structure first.` : !readiness.dataReady ? `Needs ${targetName} data before benchmarking.` : rewriteStep.status !== "completed" || !newBench.details?.workload_path ? `Needs migrated ${targetName} queries before workload benchmarking.` : `${targetName} benchmark is not ready.`),
+      : rewriteStep.status !== "completed" || !benchmarkWorkloadPath ? `Needs migrated ${targetName} queries before workload benchmarking.` : `${targetName} benchmark is not ready.`),
   ));
   return actions;
 }
@@ -945,10 +982,11 @@ function renderProfile(run, sourceProfile, targetProfile) {
   `;
 }
 
-function renderNormalize(run, targetProfile = latestProfiles?.target || {}) {
+function renderNormalize(run, targetProfile = latestProfiles?.target || {}, artifacts = {}) {
   const firstNormalForm = step(run, "scan_first_normal_form");
   const normalize = step(run, "propose_3nf_schema");
   const details = normalize.details || {};
+  const normalizationArtifact = artifactOrStep(artifacts, "propose_3nf_schema", run);
   const firstNormalFormDetails = firstNormalForm.details || {};
   const firstNormalFormFindings = firstNormalFormDetails.findings || details.first_normal_form_findings || [];
   const reviews = details.normalization_reviews || [];
@@ -990,17 +1028,27 @@ function renderNormalize(run, targetProfile = latestProfiles?.target || {}) {
           </div>
         ` : ""}
         ${rawSqlBlock("Raw CREATE TABLE SQL", details.sql_statements || [], step(run, "create_target_schema").details?.sql_path || "")}
+        ${rawJsonBlock("Normalization data sent to LLM", normalizationArtifact.llm_request || details.llm_request || "")}
+        ${rawJsonBlock("Normalization LLM/raw response", normalizationArtifact.raw_response_text || details.raw_response_text || "")}
+        ${rawJsonBlock("Normalization proposal data sent toward DDL generation", {
+          first_normal_form_findings: details.first_normal_form_findings || firstNormalFormFindings,
+          target_tables: details.target_tables || [],
+          draft_target_tables: details.draft_target_tables || [],
+          functional_dependencies: details.functional_dependencies || [],
+        })}
         ${renderStepCards(run, ["scan_first_normal_form", "propose_3nf_schema"])}
       </article>
     </section>
   `;
 }
 
-function renderMigrate(run, targetProfile) {
+function renderMigrate(run, targetProfile, artifacts = {}) {
   const targetActionHtml = targetActions(run, targetProfile);
   const targetName = selectedTargetDatabase(run) || "target database";
   const createStep = step(run, "create_target_schema");
   const migrateStep = step(run, "migrate_data");
+  const normalizationArtifact = artifactOrStep(artifacts, "propose_3nf_schema", run);
+  const migrationArtifact = artifactOrStep(artifacts, "migrate_data", run);
   const migrationSql = (migrateStep.details?.statements || []).map((statement) => statement.sql);
   return `
     <section class="tab-panel">
@@ -1010,6 +1058,14 @@ function renderMigrate(run, targetProfile) {
           ${renderStepCards(run, ["create_target_schema", "migrate_data"])}
           ${rawSqlBlock("Raw CREATE TABLE SQL", createStep.details?.sql_statements || [], createStep.details?.sql_path || "")}
           ${rawSqlBlock("Raw INSERT ... SELECT SQL", migrationSql, migrateStep.details?.sql_path || "")}
+          ${rawJsonBlock("Normalization data sent to LLM", normalizationArtifact.llm_request || "")}
+          ${rawJsonBlock("Normalization LLM/raw response", normalizationArtifact.raw_response_text || "")}
+          ${rawJsonBlock("Data migration data sent to LLM", migrationArtifact.llm_request || migrateStep.details?.llm_request || "")}
+          ${rawJsonBlock("Data migration LLM/raw response", migrationArtifact.raw_response_text || migrateStep.details?.raw_response_text || "")}
+          ${rawJsonBlock("Data migration staged inputs", {
+            target_tables: migrationArtifact.target_tables || migrateStep.details?.target_tables || [],
+            statements: migrationArtifact.statements || migrateStep.details?.statements || [],
+          })}
         </article>
         <article class="workspace-panel">
           <h2>${escapeHtml(targetName)} Actions</h2>
@@ -1020,16 +1076,53 @@ function renderMigrate(run, targetProfile) {
   `;
 }
 
+function renderQueryMigrationProgress(rewrite) {
+  const details = rewrite.details || {};
+  const total = Number(details.total_query_count || 0);
+  const completed = Number(details.completed_query_count || details.statement_count || 0);
+  const current = Number(details.current_query_index || 0);
+  const pct = total ? Math.max(0, Math.min(100, Math.round((completed / total) * 100))) : 0;
+  const results = details.query_results || [];
+  const passed = results.filter((item) => item.validation?.status === "passed").length;
+  const skipped = results.filter((item) => item.validation?.status === "skipped").length;
+  const failed = results.filter((item) => item.validation?.status === "failed").length;
+  if (!total && !details.current_stage && !results.length) return "";
+  return `
+    <div class="query-progress">
+      <div class="query-progress-head">
+        <strong>${escapeHtml(`${formatNumber(completed)} of ${formatNumber(total || completed)} queries rewritten`)}</strong>
+        ${pill((rewrite.status || "pending").replaceAll("_", " "), rewrite.status || "pending")}
+      </div>
+      <div class="query-progress-bar" aria-hidden="true">
+        <span style="width: ${pct}%"></span>
+      </div>
+      <div class="query-progress-meta">
+        <span>${escapeHtml(details.current_stage || (rewrite.status === "completed" ? "completed" : "waiting"))}</span>
+        ${current ? `<span>current query ${escapeHtml(String(current))}</span>` : ""}
+        ${details.cache_hit_count ? `<span>${escapeHtml(formatNumber(details.cache_hit_count))} cached</span>` : ""}
+        ${passed || skipped || failed ? `<span>${escapeHtml(`${passed} passed, ${skipped} skipped, ${failed} failed`)}</span>` : ""}
+      </div>
+    </div>
+  `;
+}
+
 function renderWorkload(run, artifacts) {
   const logs = artifacts.extract_workload_logs || {};
+  const preview = latestWorkloadPreview?.status === "ok" ? latestWorkloadPreview : {};
   const extract = step(run, "extract_workload_logs");
   const rewrite = step(run, "rewrite_queries");
+  const rewriteArtifact = artifactOrStep(artifacts, "rewrite_queries", run);
   const validation = effectiveStep(run, "validate_query_results");
   const generatedWorkload = effectiveStep(run, "generate_benchmark_workload");
   const summaryTables = step(run, "suggest_summary_tables");
-  const candidates = summaryTables.details?.candidates || [];
+  const summaryArtifact = artifactOrStep(artifacts, "suggest_summary_tables", run);
+  const candidates = summaryArtifact.candidates || summaryTables.details?.candidates || [];
+  const summarySql = summaryArtifact.sql_statements || summaryTables.details?.sql_statements || [];
   const rewrittenStatements = rewrite.details?.statements || [];
-  const topQueries = logs.top_queries || [];
+  const stagedQueryText = rewriteArtifact.source_query_text || rewrite.details?.source_query_text || "";
+  const llmRequest = rewriteArtifact.llm_request || rewrite.details?.llm_request || {};
+  const rawResponse = rewriteArtifact.raw_response_text || rewrite.details?.raw_response_text || "";
+  const topQueries = logs.top_queries || preview.top_queries || [];
   const totalTopQueryCount = topQueries.reduce((total, query) => total + Number(query.count || 0), 0);
   return `
     <section class="tab-panel">
@@ -1037,10 +1130,10 @@ function renderWorkload(run, artifacts) {
         <article class="workspace-panel">
           <h2>Query Source</h2>
           <div class="metric-grid">
-            ${metricCard("Chosen source", extract.details?.selected_query_source || logs.source_kind || latestWorkloadStatus?.selected_label || "pending")}
-            ${metricCard("Statements", formatNumber(logs.statements_detected || 0))}
-            ${metricCard("Transactions", formatNumber(logs.transactions_detected || 0))}
-            ${metricCard("Distinct top queries", formatNumber(logs.top_queries?.length || extract.details?.top_query_count || 0))}
+            ${metricCard("Chosen source", extract.details?.selected_query_source || logs.source_kind || preview.source_kind || latestWorkloadStatus?.selected_label || "pending")}
+            ${metricCard("Statements", formatNumber(logs.statements_detected || preview.statements_detected || 0))}
+            ${metricCard("Transactions", formatNumber(logs.transactions_detected || preview.transactions_detected || 0))}
+            ${metricCard("Distinct top queries", formatNumber(logs.top_queries?.length || preview.top_queries?.length || extract.details?.top_query_count || 0))}
           </div>
           ${renderStepCards(run, ["extract_workload_logs"])}
           <div class="workload-source-detail">
@@ -1067,10 +1160,16 @@ function renderWorkload(run, artifacts) {
           <div class="metric-grid">
             ${metricCard("Migrated queries", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
             ${metricCard("Validation", validation.details?.status || validation.status || "placeholder")}
+            ${metricCard("Validation failed", formatNumber(validation.details?.failed_count || 0))}
             ${metricCard("Workload mix", generatedWorkload.details?.status || generatedWorkload.status || "placeholder")}
           </div>
-          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("regenerate-rewrite")).join("")}</div>
+          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("regenerate-rewrite") || html.includes("run-pgbench-new")).join("")}</div>
+          ${renderQueryMigrationProgress(rewrite)}
           ${renderStepCards(run, ["rewrite_queries", "validate_query_results", "generate_benchmark_workload"])}
+          ${rawSqlBlock("Observed source queries staged for migration", stagedQueryText || preview.staged_query_text || observedQuerySql(logs) || observedQuerySql(preview))}
+          ${rawJsonBlock("Query migration data sent to LLM", llmRequest)}
+          ${rawJsonBlock("Query migration LLM raw response", rawResponse)}
+          ${rawJsonBlock("Query validation comparisons", validation.details?.query_results || [])}
           ${rawSqlBlock(`Raw migrated query SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
         </article>
         <article class="workspace-panel">
@@ -1079,6 +1178,22 @@ function renderWorkload(run, artifacts) {
             ${metricCard("Candidates", formatNumber(candidates.length))}
             ${metricCard("Creation", summaryTables.details?.creation_status || "placeholder")}
           </div>
+          <div class="action-shelf">
+            ${actionButton(
+              run,
+              "create-summary-tables",
+              `Create summary table structures${summarySql.length ? ` (${summarySql.length})` : ""}`,
+              "primary-approval",
+              run.selectionOnly
+                ? "Start a run for this database pair first."
+                : !summarySql.length
+                ? "No summary-table CREATE TABLE SQL is available."
+                : summaryTables.details?.creation_status === "created"
+                ? "Summary table structures have already been created."
+                : "",
+            )}
+          </div>
+          ${renderStepCards(run, ["suggest_summary_tables"])}
           ${candidates.length ? `
             <div class="candidate-list">
               ${candidates.map((candidate) => `
@@ -1090,16 +1205,18 @@ function renderWorkload(run, artifacts) {
               `).join("")}
             </div>
           ` : `<div class="empty-inline">No summary-table candidates yet.</div>`}
+          ${rawSqlBlock("Raw summary-table CREATE TABLE SQL", summarySql, summaryArtifact.sql_path || summaryTables.details?.sql_path || "")}
         </article>
       </div>
     </section>
   `;
 }
 
-function renderPhysical(run) {
+function renderPhysical(run, artifacts = {}) {
   const indexes = step(run, "optimize_indexes");
   const indexCreation = step(run, "create_secondary_indexes");
   const tuning = step(run, "tune_postgresql_conf");
+  const indexArtifact = artifactOrStep(artifacts, "optimize_indexes", run);
   const indexSql = secondaryIndexSqlStatements(run);
   return `
     <section class="tab-panel">
@@ -1114,6 +1231,11 @@ function renderPhysical(run) {
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("create-secondary-indexes")).join("")}</div>
           ${renderStepCards(run, ["optimize_indexes", "create_secondary_indexes"])}
           ${rawSqlBlock("Raw CREATE INDEX SQL", indexSql)}
+          ${rawJsonBlock("Index recommendation details", {
+            recommendations: indexArtifact.recommendations || indexes.details?.recommendations || [],
+            sql_statements: indexArtifact.sql_statements || indexes.details?.sql_statements || indexSql,
+            source: indexArtifact.source || indexes.details?.source || "",
+          })}
         </article>
         <article class="workspace-panel">
           <h2>PostgreSQL Tuning</h2>
@@ -1143,6 +1265,7 @@ function renderBenchmark(run) {
             ${metricCard("Latency", original.details?.average_latency_ms ? `${original.details.average_latency_ms} ms` : "pending")}
             ${metricCard("Energy", original.details?.joules_per_transaction ? `${original.details.joules_per_transaction} J/tx` : "pending")}
           </div>
+          <div class="action-shelf">${originalActions(run).join("")}</div>
           ${renderStepCards(run, ["run_pgbench_original"])}
         </article>
         <article class="workspace-panel">
@@ -1152,6 +1275,7 @@ function renderBenchmark(run) {
             ${metricCard("Latency", target.details?.average_latency_ms ? `${target.details.average_latency_ms} ms` : "pending")}
             ${metricCard("Energy", target.details?.joules_per_transaction ? `${target.details.joules_per_transaction} J/tx` : "pending")}
           </div>
+          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("run-pgbench-new")).join("")}</div>
           ${renderStepCards(run, ["run_pgbench_new"])}
         </article>
       </div>
@@ -1180,10 +1304,10 @@ function renderCompare(run, artifacts) {
 
 function renderActiveTab(run, artifacts, sourceProfile, targetProfile) {
   if (activeTab === "profile") return renderProfile(run, sourceProfile, targetProfile);
-  if (activeTab === "normalize") return renderNormalize(run, targetProfile);
-  if (activeTab === "migrate") return renderMigrate(run, targetProfile);
+  if (activeTab === "normalize") return renderNormalize(run, targetProfile, artifacts);
+  if (activeTab === "migrate") return renderMigrate(run, targetProfile, artifacts);
   if (activeTab === "workload") return renderWorkload(run, artifacts);
-  if (activeTab === "physical") return renderPhysical(run);
+  if (activeTab === "physical") return renderPhysical(run, artifacts);
   if (activeTab === "benchmark") return renderBenchmark(run);
   if (activeTab === "compare") return renderCompare(run, artifacts);
   return renderSetup(run, sourceProfile);
@@ -1271,6 +1395,14 @@ async function refreshWorkloadSourceStatus() {
     };
   }
   renderWorkloadSourceStatus(latestWorkloadStatus);
+  try {
+    latestWorkloadPreview = await api("/api/workload/preview", {
+      method: "POST",
+      body: JSON.stringify(requestContext()),
+    });
+  } catch (error) {
+    latestWorkloadPreview = null;
+  }
 }
 
 async function renderRuns(runs) {
@@ -1398,6 +1530,7 @@ async function triggerRunAction(runId, action) {
     "truncate-target-data": `Truncating ${targetName} data...`,
     "migrate-data": "Migrating data...",
     "regenerate-rewrite": "Migrating queries...",
+    "create-summary-tables": "Creating summary table structures...",
     "create-secondary-indexes": "Creating secondary indexes...",
     "run-pgbench-original": `Benchmarking ${sourceName}...`,
     "run-pgbench-new": `Benchmarking ${targetName}...`,
@@ -1522,6 +1655,7 @@ configPathInput.addEventListener("input", () => {
   latestProfilesContext = "";
   latestPostgresStatus = null;
   latestWorkloadStatus = null;
+  latestWorkloadPreview = null;
   renderWorkloadSourceStatus();
 });
 
@@ -1529,6 +1663,7 @@ workloadPathInput.addEventListener("input", () => {
   latestProfiles = null;
   latestProfilesContext = "";
   latestWorkloadStatus = null;
+  latestWorkloadPreview = null;
   renderWorkloadSourceStatus();
   refreshRuns().catch((error) => setStatus(error.message, true));
 });
