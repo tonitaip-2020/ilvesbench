@@ -1,0 +1,49 @@
+# macOS / editor noise
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python caches and local environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+*.crt
+
+# IlvesBench runtime state and generated artifacts
+data/artifacts/
+data/*.sqlite3
+data/*.sqlite3-*
+data/postgresql.log
+data/*.log
+postgres-config/postgresql.auto.conf
+
+# Local workload / benchmark scratch files
+workload-*.sql
+data/workload*.sql
+*.pgbench.log
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
