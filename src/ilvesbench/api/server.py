@@ -136,7 +136,7 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             )
             record = self.server.orchestrator.create_state_resume_record()
             thread = threading.Thread(
-                target=self.server.orchestrator.execute_query_migration_from_current_state,
+                target=self.server.orchestrator.execute_query_rewrite_from_current_state,
                 args=(record,),
                 daemon=True,
             )

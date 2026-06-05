@@ -8,7 +8,7 @@ import traceback
 import uuid
 
 from ilvesbench.benchmark.workload import WorkloadRewriteError
-from ilvesbench.benchmarker.query_migration import QueryMigrationExecutionError
+from ilvesbench.benchmarker.query_rewrite import QueryRewriteExecutionError
 from ilvesbench.benchmarker.service import BenchmarkerService
 from ilvesbench.config import IlvesBenchConfig
 from ilvesbench.core.components import ComponentBundle
@@ -219,6 +219,9 @@ class PipelineOrchestrator:
         return record
 
     def execute_query_migration_from_current_state(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        return self.execute_query_rewrite_from_current_state(record)
+
+    def execute_query_rewrite_from_current_state(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         try:
             schema = self._run_schema_step(record)
             log_summary = self._run_logs_step(record)
@@ -231,7 +234,7 @@ class PipelineOrchestrator:
                     f"{self._config.postgres.new_database} does not have an inspectable target schema yet.",
                 )
                 raise ValueError(
-                    f"{self._config.postgres.new_database} needs structure before queries can be migrated."
+                    f"{self._config.postgres.new_database} needs structure before queries can be rewritten."
                 )
 
             normalization_details = {
@@ -838,48 +841,133 @@ class PipelineOrchestrator:
             self._store.upsert_run(record)
             return record
 
-        approved_findings = [
-            finding
-            for review in reviews
-            if review.get("status") == "approved"
-            for finding in review.get("findings", [])
-        ]
-        if approved_findings:
-            self._sync_component_aliases()
-            proposal = self._llm_tasks.build_first_normal_form_decomposition(schema, approved_findings)
-            if proposal is None:
-                raise ValueError("Approved normalization reviews did not produce a target-table proposal.")
-            details.update(
-                {
-                    "status": proposal.status,
-                    "summary": (
-                        f"Generated final DDL from {len(approved_findings)} approved normalization finding(s)."
-                    ),
-                    "rationale": proposal.rationale,
-                    "table_findings": proposal.table_findings,
-                    "functional_dependencies": proposal.functional_dependencies,
-                    "target_tables": proposal.target_tables,
-                    "sql_statements": proposal.sql_statements,
-                    "source": "human_reviewed_1nf",
-                    "review_status": "completed",
-                    "llm_request": proposal.request_payload or {},
-                }
-            )
+        fd_reviews = [review for review in reviews if review.get("review_type") == "3nf_fd"]
+        if fd_reviews:
+            approved_fds = [
+                review.get("functional_dependency", {})
+                for review in fd_reviews
+                if review.get("status") == "approved"
+            ]
+            one_nf_target_tables = details.get("one_nf_target_tables") or details.get("target_tables", [])
+            one_nf_sql_statements = details.get("one_nf_sql_statements") or details.get("sql_statements", [])
+            if approved_fds:
+                self._sync_component_aliases()
+                proposal = self._llm_tasks.synthesize_third_normal_form(schema, one_nf_target_tables, approved_fds)
+                details.update(
+                    {
+                        "status": proposal.status,
+                        "summary": proposal.summary,
+                        "rationale": proposal.rationale,
+                        "table_findings": proposal.table_findings,
+                        "functional_dependencies": proposal.functional_dependencies,
+                        "target_tables": proposal.target_tables,
+                        "sql_statements": proposal.sql_statements,
+                        "source": proposal.source,
+                        "review_status": "completed",
+                        "normalization_target": "3NF",
+                        "approved_functional_dependency_count": len(approved_fds),
+                    }
+                )
+            else:
+                details.update(
+                    {
+                        "status": "candidate_normalization",
+                        "summary": "No 3NF functional dependencies were approved; using the approved 1NF decomposition.",
+                        "rationale": details.get("one_nf_rationale", []),
+                        "target_tables": one_nf_target_tables,
+                        "sql_statements": one_nf_sql_statements,
+                        "source": "human_reviewed_1nf",
+                        "review_status": "completed",
+                        "normalization_target": "1NF",
+                        "approved_functional_dependency_count": 0,
+                    }
+                )
         else:
-            details.update(
-                {
-                    "status": "appears_3nf",
-                    "summary": "All normalization candidates were rejected; no target DDL was generated.",
-                    "rationale": ["Human review rejected all suspicious-table normalization candidates."],
-                    "table_findings": [],
-                    "functional_dependencies": [],
-                    "target_tables": [],
-                    "sql_statements": [],
-                    "source": "human_review",
-                    "review_status": "completed",
-                    "llm_request": {},
-                }
-            )
+            approved_findings = [
+                finding
+                for review in reviews
+                if review.get("status") == "approved"
+                for finding in review.get("findings", [])
+            ]
+            if approved_findings:
+                self._sync_component_aliases()
+                proposal = self._llm_tasks.build_first_normal_form_decomposition(schema, approved_findings)
+                if proposal is None:
+                    raise ValueError("Approved normalization reviews did not produce a target-table proposal.")
+                fd_proposal = self._llm_tasks.discover_functional_dependencies(schema, proposal.target_tables)
+                fd_reviews = self._dbops.normalization.functional_dependency_review_candidates(
+                    target_tables=proposal.target_tables,
+                    functional_dependencies=fd_proposal.functional_dependencies,
+                    validate_fd=lambda schema_name, table_name, determinant, dependent: self._postgres.validate_functional_dependency(
+                        self._config.postgres.original_database,
+                        schema_name,
+                        table_name,
+                        determinant,
+                        dependent,
+                    ),
+                )
+                details.update(
+                    {
+                        "status": proposal.status,
+                        "summary": (
+                            f"Generated 1NF decomposition from {len(approved_findings)} approved finding(s). "
+                            + (
+                                f"{len(fd_reviews)} candidate functional dependenc(ies) need 3NF review."
+                                if fd_reviews
+                                else "No candidate 3NF functional dependencies were found."
+                            )
+                        ),
+                        "rationale": proposal.rationale,
+                        "table_findings": proposal.table_findings,
+                        "functional_dependencies": fd_proposal.functional_dependencies,
+                        "target_tables": [] if fd_reviews else proposal.target_tables,
+                        "sql_statements": [] if fd_reviews else proposal.sql_statements,
+                        "one_nf_target_tables": proposal.target_tables,
+                        "one_nf_sql_statements": proposal.sql_statements,
+                        "one_nf_rationale": proposal.rationale,
+                        "source": "human_reviewed_1nf",
+                        "review_status": "fd_pending" if fd_reviews else "completed",
+                        "normalization_target": "1NF" if not fd_reviews else "1NF_pending_3NF_review",
+                        "fd_discovery": {
+                            "status": fd_proposal.status,
+                            "summary": fd_proposal.summary,
+                            "rationale": fd_proposal.rationale,
+                            "source": fd_proposal.source,
+                            "llm_request": fd_proposal.request_payload or {},
+                            "raw_response_text": fd_proposal.raw_response_text or "",
+                        },
+                        "normalization_reviews": reviews + fd_reviews,
+                        "llm_request": fd_proposal.request_payload or proposal.request_payload or {},
+                        "raw_response_text": fd_proposal.raw_response_text or proposal.raw_response_text,
+                    }
+                )
+                if fd_reviews:
+                    record.artifacts["propose_3nf_schema"] = self._store.write_artifact(
+                        record.run_id,
+                        "normalization_proposal",
+                        details,
+                    )
+                    record = self._input_required_step(record, "propose_3nf_schema", details)
+                    record.summary.update(self._summary_counts(record))
+                    record.status = self._overall_status(record)
+                    self._store.upsert_run(record)
+                    return record
+            else:
+                details.update(
+                    {
+                        "status": "appears_3nf",
+                        "summary": "All 1NF normalization candidates were rejected; 3NF review was not offered for this run.",
+                        "rationale": ["Human review rejected all suspicious-table 1NF normalization candidates."],
+                        "table_findings": [],
+                        "functional_dependencies": [],
+                        "target_tables": [],
+                        "sql_statements": [],
+                        "source": "human_review",
+                        "review_status": "completed",
+                        "normalization_target": "none",
+                        "llm_request": {},
+                    }
+                )
 
         record.artifacts["propose_3nf_schema"] = self._store.write_artifact(
             record.run_id,
@@ -1638,6 +1726,8 @@ class PipelineOrchestrator:
     def _plan_rewrite_queries_step(self, record: BenchmarkRunRecord, log_summary) -> BenchmarkRunRecord:
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
         migrate_step = next((step for step in record.steps if step.name == "migrate_data"), None)
+        source_schema = self._load_schema_artifact(record)
+        source_tables = [to_dict(table) for table in source_schema.tables] if source_schema else []
         target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
         migration_statements = migrate_step.details.get("statements", []) if migrate_step else []
         if not target_tables:
@@ -1680,6 +1770,7 @@ class PipelineOrchestrator:
                 "statement_count": 0,
                 "total_query_count": 0,
                 "source_query_text": workload_sql,
+                "source_table_count": len(source_tables),
                 "target_table_count": len(target_tables),
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
@@ -1705,6 +1796,7 @@ class PipelineOrchestrator:
                 "workload_path": sql_path,
                 "source": "fallback",
                 "source_query_text": workload_sql,
+                "source_table_count": len(source_tables),
                 "target_table_count": 0,
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
@@ -1719,16 +1811,27 @@ class PipelineOrchestrator:
                 nonlocal record
                 record = self._save_query_rewrite_progress(record, progress, status="running")
 
-            result = self._benchmarker.query_migration.rewrite_incremental(
+            result = self._benchmarker.query_rewrite.rewrite_incremental(
                 workload_sql=workload_sql,
                 source_statements=source_statements,
+                source_tables=source_tables,
                 target_tables=prompt_target_tables,
                 migration_statements=migration_statements,
-                rewrite_batch=lambda pending_sql, target_tables, statements, batch_size: self._workload_planner.rewrite(
+                rewrite_batch=lambda pending_sql, source_tables, target_tables, statements, batch_size: self._workload_planner.rewrite(
                     pending_sql,
                     target_tables,
                     statements,
                     batch_size=batch_size,
+                    source_tables=source_tables,
+                ),
+                repair_rewrite=lambda source_statement, previous_rewrite, validation, source_tables, target_tables, statements, query_index, batch_size: self._workload_planner.repair_rewrite(
+                    source_statement,
+                    previous_rewrite,
+                    validation,
+                    target_tables,
+                    statements,
+                    query_index=query_index,
+                    source_tables=source_tables,
                 ),
                 validate_statement=self._validate_rewritten_query_statement,
                 on_progress=save_progress,
@@ -1755,8 +1858,8 @@ class PipelineOrchestrator:
                 "failed_query_count": invalid_count,
                 "current_stage": "completed",
                 "workload_path": sql_path,
-                "raw_response_text": self._benchmarker.query_migration.raw_response_text(progress),
-                "llm_request": self._benchmarker.query_migration.request_summary(progress, len(source_statements)),
+                "raw_response_text": self._benchmarker.query_rewrite.raw_response_text(progress),
+                "llm_request": self._benchmarker.query_rewrite.request_summary(progress, len(source_statements)),
                 "source": "llm_incremental",
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
@@ -1765,11 +1868,11 @@ class PipelineOrchestrator:
                 completed_details,
             )
             return self._complete_step(record, "rewrite_queries", completed_details)
-        except QueryMigrationExecutionError as exc:
+        except QueryRewriteExecutionError as exc:
             progress = exc.progress
             raw_response_text = exc.raw_response_text or (
-                self._benchmarker.query_migration.raw_response_text(progress)
-                or "[No LLM response text was received before query migration failed.]"
+                self._benchmarker.query_rewrite.raw_response_text(progress)
+                or "[No LLM response text was received before query rewrite failed.]"
             )
             failure_details = progress | {
                 "status": "failed",
@@ -1778,10 +1881,12 @@ class PipelineOrchestrator:
                 "target_table_count": len(target_tables),
                 "prompt_target_table_count": len(prompt_target_tables),
                 "source_query_text": workload_sql,
+                "source_tables": source_tables,
+                "source_table_count": len(source_tables),
                 "target_tables": prompt_target_tables,
                 "migration_statements": migration_statements,
                 "llm_request": exc.request_payload
-                or self._benchmarker.query_migration.request_summary(progress, len(source_statements)),
+                or self._benchmarker.query_rewrite.request_summary(progress, len(source_statements)),
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
                 record.run_id,
@@ -1797,18 +1902,19 @@ class PipelineOrchestrator:
                 planned_only=False,
             )
         except Exception as exc:
-            progress = self._benchmarker.query_migration.progress_payload(
+            progress = self._benchmarker.query_rewrite.progress_payload(
                 workload_sql,
                 source_statements,
+                source_tables,
                 prompt_target_tables,
                 migration_statements,
             )
             failure_details = progress | {
                 "status": "failed",
                 "summary": str(exc),
-                "raw_response_text": self._benchmarker.query_migration.raw_response_text(progress)
-                or "[No LLM response text was received before query migration failed.]",
-                "llm_request": self._benchmarker.query_migration.request_summary(progress, len(source_statements)),
+                "raw_response_text": self._benchmarker.query_rewrite.raw_response_text(progress)
+                or "[No LLM response text was received before query rewrite failed.]",
+                "llm_request": self._benchmarker.query_rewrite.request_summary(progress, len(source_statements)),
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
                 record.run_id,
@@ -1831,8 +1937,8 @@ class PipelineOrchestrator:
         *,
         status: str,
     ) -> BenchmarkRunRecord:
-        statements = self._benchmarker.query_migration.valid_progress_statements(progress)
-        artifact_payload = self._benchmarker.query_migration.artifact_payload(progress)
+        statements = self._benchmarker.query_rewrite.valid_progress_statements(progress)
+        artifact_payload = self._benchmarker.query_rewrite.artifact_payload(progress)
         if statements:
             artifact_payload["partial_workload_path"] = self._store.write_text_artifact(
                 record.run_id,
@@ -1935,7 +2041,7 @@ class PipelineOrchestrator:
                 {
                     "status": "placeholder",
                     "summary": (
-                        "Target-side PostgreSQL query validation waits for migrated queries."
+                        "Target-side PostgreSQL query validation waits for rewritten queries."
                     ),
                     "scope": "target_postgresql_resolution_check",
                     "implemented": True,
@@ -1993,7 +2099,7 @@ class PipelineOrchestrator:
                 "generate_benchmark_workload",
                 {
                     "status": "placeholder",
-                    "summary": "Benchmark workload generation waits for migrated queries.",
+                    "summary": "Benchmark workload generation waits for rewritten queries.",
                     "implemented_mix_model": False,
                     "source_kind": source_kind,
                 },
@@ -2005,7 +2111,7 @@ class PipelineOrchestrator:
                 "status": "placeholder",
                 "summary": (
                     "Placeholder: build pgbench-ready scripts with relative query proportions. "
-                    "For now, IlvesBench reuses the migrated query SQL as the benchmark input."
+                    "For now, IlvesBench reuses the rewritten query SQL as the benchmark input."
                 ),
                 "query_statement_count": statement_count,
                 "workload_path": rewrite_step.details.get("workload_path", ""),
@@ -2243,7 +2349,7 @@ class PipelineOrchestrator:
             "run_pgbench_new",
             {
                 "summary": (
-                    f"Approval-gated: benchmark {self._config.postgres.new_database} with the rewritten workload after schema creation and migration."
+                    f"Approval-gated: benchmark {self._config.postgres.new_database} with the rewritten workload after schema creation and data migration."
                     if workload_path
                     else f"Rewritten {self._config.postgres.new_database} workload is not ready yet, so benchmarking cannot start."
                 ),
@@ -2264,8 +2370,8 @@ class PipelineOrchestrator:
             StepResult(name="propose_3nf_schema", title="Propose 3NF normalization plan", status="pending"),
             StepResult(name="create_target_schema", title=f"Create {self._config.postgres.new_database} schema", status="pending", requires_approval=True),
             StepResult(name="migrate_data", title=f"Migrate data into {self._config.postgres.new_database}", status="pending", requires_approval=True),
-            StepResult(name="rewrite_queries", title=f"Migrate queries for {self._config.postgres.new_database}", status="pending"),
-            StepResult(name="validate_query_results", title="Validate migrated queries", status="pending"),
+            StepResult(name="rewrite_queries", title=f"Rewrite queries for {self._config.postgres.new_database}", status="pending"),
+            StepResult(name="validate_query_results", title="Validate rewritten queries", status="pending"),
             StepResult(name="generate_benchmark_workload", title="Generate benchmark workload mix", status="pending"),
             StepResult(name="suggest_summary_tables", title="Suggest summary tables", status="pending"),
             StepResult(name="optimize_indexes", title="Recommend workload-aware indexes", status="pending"),

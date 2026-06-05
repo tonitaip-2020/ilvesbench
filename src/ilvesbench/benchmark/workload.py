@@ -84,6 +84,7 @@ class WorkloadPlanner:
         migration_statements: list[dict],
         *,
         batch_size: int = DEFAULT_REWRITE_BATCH_SIZE,
+        source_tables: list[dict] | None = None,
     ) -> WorkloadRewriteProposal:
         normalized_source_statements = self._split_statements(workload_sql)
         if not normalized_source_statements:
@@ -112,8 +113,14 @@ class WorkloadPlanner:
                 target_tables,
                 migration_statements,
                 batch_size=batch_size,
+                source_tables=source_tables or [],
             )
-        return self._rewrite_statement_batch(normalized_source_statements, target_tables, migration_statements)
+        return self._rewrite_statement_batch(
+            normalized_source_statements,
+            target_tables,
+            migration_statements,
+            source_tables=source_tables or [],
+        )
 
     def source_statements(self, workload_sql: str) -> list[str]:
         return self._split_statements(workload_sql)
@@ -125,6 +132,7 @@ class WorkloadPlanner:
         migration_statements: list[dict],
         *,
         query_index: int,
+        source_tables: list[dict] | None = None,
     ) -> WorkloadRewriteProposal:
         if self._llm is None:
             return WorkloadRewriteProposal(
@@ -144,7 +152,68 @@ class WorkloadPlanner:
             target_tables,
             migration_statements,
             batch_index=query_index,
+            source_tables=source_tables or [],
         )
+
+    def repair_rewrite(
+        self,
+        source_statement: str,
+        previous_rewrite: str,
+        validation_error: dict,
+        target_tables: list[dict],
+        migration_statements: list[dict],
+        *,
+        query_index: int,
+        source_tables: list[dict] | None = None,
+    ) -> WorkloadRewriteProposal:
+        if self._llm is None:
+            return WorkloadRewriteProposal(
+                status="unavailable",
+                summary="Query rewrite repair is unavailable because no LLM gateway is configured.",
+                source="fallback",
+            )
+        source_tables = source_tables or []
+        request_payload = {
+            "mode": "validation_repair",
+            "query_index": query_index,
+            "source_statement": source_statement,
+            "previous_rewrite": previous_rewrite,
+            "validation_error": validation_error,
+            "source_tables": source_tables,
+            "target_tables": target_tables,
+            "migration_statements": migration_statements,
+        }
+        messages = self._build_validation_repair_messages(
+            source_statement,
+            previous_rewrite,
+            validation_error,
+            target_tables,
+            migration_statements,
+            query_index=query_index,
+            source_tables=source_tables,
+        )
+        try:
+            llm_result = self._llm.generate(messages, max_tokens=4096)
+        except Exception as exc:
+            raise WorkloadRewriteError(
+                f"LLM request failed while repairing rewritten query {query_index}: {exc}",
+                request_payload=request_payload,
+            ) from exc
+        proposal = self._proposal_from_direct_sql(llm_result.response_text, target_tables)
+        if proposal is None and llm_result.response_text.lstrip().startswith("{"):
+            try:
+                proposal = self._proposal_from_response(llm_result.response_text, target_tables)
+            except ValueError:
+                proposal = None
+        if proposal is None:
+            raise WorkloadRewriteError(
+                "LLM response did not contain executable repaired SQL.",
+                raw_response_text=llm_result.response_text,
+                request_payload=request_payload,
+            )
+        proposal.raw_response_text = llm_result.response_text
+        proposal.request_payload = request_payload
+        return proposal
 
     def _rewrite_statement_batches(
         self,
@@ -153,6 +222,7 @@ class WorkloadPlanner:
         migration_statements: list[dict],
         *,
         batch_size: int = DEFAULT_REWRITE_BATCH_SIZE,
+        source_tables: list[dict] | None = None,
     ) -> WorkloadRewriteProposal:
         statements: list[str] = []
         reasoning: list[str] = []
@@ -165,7 +235,13 @@ class WorkloadPlanner:
         ]
         for index, chunk in enumerate(chunks, start=1):
             try:
-                proposal = self._rewrite_statement_batch(chunk, target_tables, migration_statements, batch_index=index)
+                proposal = self._rewrite_statement_batch(
+                    chunk,
+                    target_tables,
+                    migration_statements,
+                    batch_index=index,
+                    source_tables=source_tables or [],
+                )
             except WorkloadRewriteError as exc:
                 request_batches.extend([exc.request_payload] if exc.request_payload else [])
                 combined_raw = "\n\n".join(
@@ -210,15 +286,24 @@ class WorkloadPlanner:
         target_tables: list[dict],
         migration_statements: list[dict],
         batch_index: int | None = None,
+        source_tables: list[dict] | None = None,
     ) -> WorkloadRewriteProposal:
+        source_tables = source_tables or []
         request_payload = {
             "mode": "single_query" if batch_index is not None else "all_queries",
             "batch_index": batch_index,
             "source_statements": source_statements,
+            "source_tables": source_tables,
             "target_tables": target_tables,
             "migration_statements": migration_statements,
         }
-        messages = self._build_rewrite_messages(source_statements, target_tables, migration_statements, batch_index=batch_index)
+        messages = self._build_rewrite_messages(
+            source_statements,
+            target_tables,
+            migration_statements,
+            batch_index=batch_index,
+            source_tables=source_tables,
+        )
         try:
             llm_result = self._llm.generate(messages, max_tokens=8192)
         except Exception as exc:
@@ -294,12 +379,14 @@ class WorkloadPlanner:
         target_tables: list[dict],
         migration_statements: list[dict],
         batch_index: int | None = None,
+        source_tables: list[dict] | None = None,
     ) -> list[dict[str, str]]:
         system_prompt = (
             "/no_think\n"
             "You rewrite SQL workloads from one PostgreSQL schema to another. "
             "Output only executable SQL statements."
         )
+        source_schema = self._schema_prompt(source_tables or [], include_schema=True)
         target_schema = self._target_schema_prompt(target_tables)
         user_prompt = (
             (
@@ -313,8 +400,10 @@ class WorkloadPlanner:
             "2. Do not output JSON, markdown, comments, explanations, EXPLAIN, CREATE, ALTER, DROP, TRUNCATE, GRANT, or REVOKE.\n"
             "3. Use target table and column names exactly as shown in the target schema.\n"
             "4. Preserve projections, filters, joins, ordering, limits, placeholders, random expressions, and literal types as closely as possible.\n"
-            "5. WITH queries are allowed when they lead to SELECT/INSERT/UPDATE/DELETE.\n\n"
+            "5. WITH queries are allowed when they lead to SELECT/INSERT/UPDATE/DELETE.\n"
+            "6. Use the source schema to understand the original table and column meanings before choosing target columns.\n\n"
             f"Source workload statements:\n{self._numbered_sql(source_statements)}\n\n"
+            f"Source schema:\n{source_schema}\n\n"
             f"Target schema:\n{target_schema}"
         )
         return [
@@ -323,19 +412,70 @@ class WorkloadPlanner:
         ]
 
     def _target_schema_prompt(self, target_tables: list[dict]) -> str:
+        return self._schema_prompt(target_tables, include_schema=False)
+
+    def _schema_prompt(self, tables: list[dict], *, include_schema: bool) -> str:
         blocks: list[str] = []
-        for table in target_tables:
+        for table in tables:
             table_name = str(table.get("name", "")).strip()
             if not table_name:
                 continue
+            schema = str(table.get("schema", "")).strip()
+            qualified_name = f"{schema}.{table_name}" if include_schema and schema else table_name
             columns = [
-                str(column.get("name", "")).strip()
+                self._column_prompt(column)
                 for column in table.get("columns", [])
                 if str(column.get("name", "")).strip()
             ]
-            column_sql = ", ".join(f'"{column}"' for column in columns) if columns else "/* columns unknown */"
-            blocks.append(f'CREATE TABLE "{table_name}" ({column_sql});')
-        return "\n".join(blocks)
+            column_sql = ", ".join(columns) if columns else "/* columns unknown */"
+            blocks.append(f"CREATE TABLE {qualified_name} ({column_sql});")
+        return "\n".join(blocks) if blocks else "/* schema unavailable */"
+
+    def _column_prompt(self, column: dict) -> str:
+        name = str(column.get("name", "")).strip()
+        data_type = str(column.get("data_type", "") or column.get("type", "") or "").strip()
+        return f'"{name}" {data_type}' if data_type else f'"{name}"'
+
+    def _build_validation_repair_messages(
+        self,
+        source_statement: str,
+        previous_rewrite: str,
+        validation_error: dict,
+        target_tables: list[dict],
+        migration_statements: list[dict],
+        *,
+        query_index: int,
+        source_tables: list[dict] | None = None,
+    ) -> list[dict[str, str]]:
+        source_schema = self._schema_prompt(source_tables or [], include_schema=True)
+        target_schema = self._target_schema_prompt(target_tables)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "/no_think\n"
+                    "You repair PostgreSQL query rewrites. Output only the corrected executable SQL statement."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Repair rewritten query {query_index}. PostgreSQL rejected the previous rewrite.\n\n"
+                    "Rules:\n"
+                    "1. Output only one corrected SQL statement.\n"
+                    "2. Do not output JSON, markdown, comments, explanations, EXPLAIN, CREATE, ALTER, DROP, TRUNCATE, GRANT, or REVOKE.\n"
+                    "3. The corrected statement must start with SELECT, WITH, INSERT, UPDATE, or DELETE.\n"
+                    "4. Use target table and column names exactly as shown in the target schema.\n"
+                    "5. Preserve the source query semantics as closely as the target schema permits.\n\n"
+                    f"Original source query:\n{source_statement.strip()}\n\n"
+                    f"Previous rejected rewrite:\n{previous_rewrite.strip()}\n\n"
+                    f"PostgreSQL validation error:\n{json.dumps(validation_error, ensure_ascii=True, indent=2)}\n\n"
+                    f"Source schema:\n{source_schema}\n\n"
+                    f"Target schema:\n{target_schema}\n\n"
+                    f"Data migration statements, if useful for mapping columns:\n{json.dumps(migration_statements, ensure_ascii=True, indent=2)}"
+                ),
+            },
+        ]
 
     def _numbered_sql(self, statements: list[str]) -> str:
         return "\n\n".join(
@@ -355,7 +495,7 @@ class WorkloadPlanner:
             {
                 "role": "system",
                 "content": (
-                    "You repair malformed query-migration output. Return one JSON object only. "
+                    "You repair malformed query rewrite output. Return one JSON object only. "
                     "No prose, no markdown, no code fences."
                 ),
             },

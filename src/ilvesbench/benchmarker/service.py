@@ -9,7 +9,7 @@ from ilvesbench.benchmark.index_advisor import IndexAdvisor
 from ilvesbench.benchmark.pgbench import PgBenchRunner
 from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
 from ilvesbench.benchmark.workload import WorkloadPlanner
-from ilvesbench.benchmarker.query_migration import QueryMigrationService
+from ilvesbench.benchmarker.query_rewrite import QueryRewriteService
 from ilvesbench.config import IlvesBenchConfig
 from ilvesbench.llm.gateway import LLMGateway
 
@@ -25,7 +25,8 @@ class BenchmarkerService:
         pgbench: PgBenchRunner | None = None,
     ) -> None:
         self.pgbench = pgbench or PgBenchRunner()
-        self.query_migration = QueryMigrationService(config)
+        self.query_rewrite = QueryRewriteService(config)
+        self.query_migration = self.query_rewrite
         self.workload_planner = WorkloadPlanner(
             llm=llm,
             target_database=config.postgres.new_database,

@@ -33,5 +33,11 @@ class LLMTaskService:
     def build_first_normal_form_decomposition(self, schema: SchemaSnapshot, approved_findings: list[dict]):
         return self.schema_transformer.build_first_normal_form_decomposition(schema, approved_findings)
 
+    def discover_functional_dependencies(self, schema: SchemaSnapshot, target_tables: list[dict]):
+        return self.schema_transformer.discover_functional_dependencies(schema, target_tables)
+
+    def synthesize_third_normal_form(self, schema: SchemaSnapshot, target_tables: list[dict], approved_fds: list[dict]):
+        return self.schema_transformer.synthesize_third_normal_form(schema, target_tables, approved_fds)
+
     def repair_schema(self, schema: SchemaSnapshot, target_tables: list[dict], sql_statements: list[str], error: str):
         return self.schema_transformer.repair(schema, target_tables, sql_statements, error)

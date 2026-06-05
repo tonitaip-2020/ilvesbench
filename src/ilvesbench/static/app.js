@@ -41,8 +41,8 @@ const STEP_TITLES = {
   propose_3nf_schema: "Propose normalization plan",
   create_target_schema: "Create target schema",
   migrate_data: "Migrate data",
-  rewrite_queries: "Migrate queries",
-  validate_query_results: "Validate migrated queries",
+  rewrite_queries: "Rewrite queries",
+  validate_query_results: "Validate rewritten queries",
   generate_benchmark_workload: "Generate benchmark workload mix",
   suggest_summary_tables: "Suggest summary tables",
   optimize_indexes: "Recommend workload-aware indexes",
@@ -240,6 +240,10 @@ function renderNormalizationReviews(run, reviews) {
       ${reviews.map((review) => {
         const targets = (review.proposed_target_tables || []).map((table) => table.name).filter(Boolean);
         const canDecide = run.run_id && review.status === "pending";
+        const isFdReview = review.review_type === "3nf_fd";
+        const validation = review.source_data_validation || {};
+        const determinant = (review.determinant || []).join(", ");
+        const dependent = (review.dependent || []).join(", ");
         return `
           <article class="normalization-review review-${escapeHtml(review.status || "pending")}">
             <div class="review-head">
@@ -251,8 +255,13 @@ function renderNormalizationReviews(run, reviews) {
             </div>
             <p>${escapeHtml(review.proposal_summary || "")}</p>
             <div class="review-facts">
-              <span>Columns: ${escapeHtml((review.suspicious_columns || []).join(", ") || "n/a")}</span>
-              <span>Proposed tables: ${escapeHtml(targets.length ? targets.join(", ") : "none")}</span>
+              ${isFdReview ? `
+                <span>FD: ${escapeHtml(determinant || "?")} -> ${escapeHtml(dependent || "?")}</span>
+                <span>Source-data check: ${escapeHtml(validation.status || "not checked")}</span>
+              ` : `
+                <span>Columns: ${escapeHtml((review.suspicious_columns || []).join(", ") || "n/a")}</span>
+                <span>Proposed tables: ${escapeHtml(targets.length ? targets.join(", ") : "none")}</span>
+              `}
             </div>
             <ul>
               ${(review.suspicion_reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}
@@ -260,7 +269,7 @@ function renderNormalizationReviews(run, reviews) {
             ${canDecide ? `
               <div class="review-actions">
                 <button type="button" class="action-button primary-approval" data-review-action="approved" data-review-id="${escapeHtml(review.id)}" data-run-id="${escapeHtml(run.run_id)}">
-                  <span>Approve decomposition</span>
+                  <span>${isFdReview ? "Approve FD" : "Approve decomposition"}</span>
                 </button>
                 <button type="button" class="action-button" data-review-action="rejected" data-review-id="${escapeHtml(review.id)}" data-run-id="${escapeHtml(run.run_id)}">
                   <span>Reject for this run</span>
@@ -302,7 +311,7 @@ function effectiveStep(run, name) {
   if (!item.name && name === "validate_query_results") {
     return {
       name,
-      title: "Validate migrated queries",
+      title: "Validate rewritten queries",
       status: "planned",
       details: {
         summary: "Placeholder: ask PostgreSQL to resolve rewritten db-new queries before benchmarking.",
@@ -316,7 +325,7 @@ function effectiveStep(run, name) {
       title: "Generate benchmark workload mix",
       status: "planned",
       details: {
-        summary: "Placeholder: build query proportions for pgbench. The prototype currently reuses migrated query SQL.",
+        summary: "Placeholder: build query proportions for pgbench. The prototype currently reuses rewritten query SQL.",
         status: "placeholder",
       },
     };
@@ -873,14 +882,14 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   actions.push(actionButton(
     run,
     "regenerate-rewrite",
-    `Migrate queries for ${targetName}`,
+    `Rewrite queries for ${targetName}`,
     "",
     !readiness.structureReady
       ? `Needs ${targetName} structure first.`
       : !querySourceReady
       ? "Needs a PostgreSQL log or workload SQL file first."
       : (!run.selectionOnly && !["planned", "completed", "failed", "pending"].includes(rewriteStep.status || "pending"))
-      ? "Query migration is not ready yet."
+      ? "Query rewrites are not ready yet."
       : "",
     true,
   ));
@@ -898,7 +907,7 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
     "primary-approval",
     selectionOnlyReason || (benchmarkWorkloadPath && rewriteStep.status === "completed"
       ? ""
-      : rewriteStep.status !== "completed" || !benchmarkWorkloadPath ? `Needs migrated ${targetName} queries before workload benchmarking.` : `${targetName} benchmark is not ready.`),
+      : rewriteStep.status !== "completed" || !benchmarkWorkloadPath ? `Needs rewritten ${targetName} queries before workload benchmarking.` : `${targetName} benchmark is not ready.`),
   ));
   return actions;
 }
@@ -991,6 +1000,7 @@ function renderNormalize(run, targetProfile = latestProfiles?.target || {}, arti
   const firstNormalFormFindings = firstNormalFormDetails.findings || details.first_normal_form_findings || [];
   const reviews = details.normalization_reviews || [];
   const pendingReviews = reviews.filter((review) => review.status === "pending").length;
+  const fdReviews = reviews.filter((review) => review.review_type === "3nf_fd");
   const targetTables = details.target_tables || [];
   const draftTargetTables = details.draft_target_tables || [];
   const targetColumns = targetTables.reduce((total, table) => total + (table.columns || []).length, 0);
@@ -1004,8 +1014,10 @@ function renderNormalize(run, targetProfile = latestProfiles?.target || {}, arti
         <div class="metric-grid">
           ${metricCard("Status", details.status || normalize.status || "pending")}
           ${metricCard("Table reviews", `${formatNumber(reviews.length)} total`, `${formatNumber(pendingReviews)} pending`)}
+          ${metricCard("3NF FD reviews", formatNumber(fdReviews.length))}
           ${metricCard("Findings", formatNumber((details.table_findings || []).length))}
           ${metricCard("1NF warnings", formatNumber(firstNormalFormDetails.finding_count || firstNormalFormFindings.length || 0))}
+          ${metricCard("Target NF", details.normalization_target || "pending")}
           ${metricCard("Dependencies", formatNumber((details.functional_dependencies || []).length))}
           ${metricCard("Target tables", formatNumber(targetTables.length), draftTargetTables.length && !targetTables.length ? `${formatNumber(draftTargetTables.length)} draft` : "")}
           ${metricCard("Target columns", formatNumber(targetColumns))}
@@ -1032,6 +1044,8 @@ function renderNormalize(run, targetProfile = latestProfiles?.target || {}, arti
         ${rawJsonBlock("Normalization LLM/raw response", normalizationArtifact.raw_response_text || details.raw_response_text || "")}
         ${rawJsonBlock("Normalization proposal data sent toward DDL generation", {
           first_normal_form_findings: details.first_normal_form_findings || firstNormalFormFindings,
+          fd_discovery: details.fd_discovery || {},
+          one_nf_target_tables: details.one_nf_target_tables || [],
           target_tables: details.target_tables || [],
           draft_target_tables: details.draft_target_tables || [],
           functional_dependencies: details.functional_dependencies || [],
@@ -1076,7 +1090,7 @@ function renderMigrate(run, targetProfile, artifacts = {}) {
   `;
 }
 
-function renderQueryMigrationProgress(rewrite) {
+function renderQueryRewriteProgress(rewrite) {
   const details = rewrite.details || {};
   const total = Number(details.total_query_count || 0);
   const completed = Number(details.completed_query_count || details.statement_count || 0);
@@ -1156,21 +1170,21 @@ function renderWorkload(run, artifacts) {
           ` : `<div class="empty-inline">No query proportions have been extracted yet.</div>`}
         </article>
         <article class="workspace-panel">
-          <h2>Query Migration</h2>
+          <h2>Query Rewrites</h2>
           <div class="metric-grid">
-            ${metricCard("Migrated queries", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
+            ${metricCard("Rewritten queries", formatNumber(rewrite.details?.statement_count || (rewrite.details?.statements || []).length || 0))}
             ${metricCard("Validation", validation.details?.status || validation.status || "placeholder")}
             ${metricCard("Validation failed", formatNumber(validation.details?.failed_count || 0))}
             ${metricCard("Workload mix", generatedWorkload.details?.status || generatedWorkload.status || "placeholder")}
           </div>
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("regenerate-rewrite") || html.includes("run-pgbench-new")).join("")}</div>
-          ${renderQueryMigrationProgress(rewrite)}
+          ${renderQueryRewriteProgress(rewrite)}
           ${renderStepCards(run, ["rewrite_queries", "validate_query_results", "generate_benchmark_workload"])}
-          ${rawSqlBlock("Observed source queries staged for migration", stagedQueryText || preview.staged_query_text || observedQuerySql(logs) || observedQuerySql(preview))}
-          ${rawJsonBlock("Query migration data sent to LLM", llmRequest)}
-          ${rawJsonBlock("Query migration LLM raw response", rawResponse)}
+          ${rawSqlBlock("Observed source queries staged for rewrite", stagedQueryText || preview.staged_query_text || observedQuerySql(logs) || observedQuerySql(preview))}
+          ${rawJsonBlock("Query rewrite data sent to LLM", llmRequest)}
+          ${rawJsonBlock("Query rewrite LLM raw response", rawResponse)}
           ${rawJsonBlock("Query validation comparisons", validation.details?.query_results || [])}
-          ${rawSqlBlock(`Raw migrated query SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
+          ${rawSqlBlock(`Raw rewritten query SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
         </article>
         <article class="workspace-panel">
           <h2>Summary Tables</h2>

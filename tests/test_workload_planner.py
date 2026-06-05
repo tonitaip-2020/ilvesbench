@@ -194,6 +194,63 @@ class WorkloadPlannerTests(unittest.TestCase):
         self.assertEqual(len(proposal.statements), 2)
         self.assertEqual(len(gateway.messages), 1)
 
+    def test_rewrite_prompt_includes_source_and_target_schema(self) -> None:
+        gateway = StaticGateway(
+            {
+                "status": "planned",
+                "summary": "Rewritten.",
+                "reasoning": [],
+                "statements": ["SELECT i.id FROM items_new i"],
+            }
+        )
+        planner = WorkloadPlanner(llm=gateway)
+
+        planner.rewrite(
+            "SELECT id FROM public.items;",
+            source_tables=[
+                {
+                    "schema": "public",
+                    "name": "items",
+                    "columns": [{"name": "id", "data_type": "integer"}],
+                }
+            ],
+            target_tables=[
+                {
+                    "name": "items_new",
+                    "columns": [{"name": "id", "data_type": "integer"}],
+                }
+            ],
+            migration_statements=[],
+        )
+
+        prompt = gateway.messages[0][1]["content"]
+        self.assertIn("Source schema:", prompt)
+        self.assertIn("CREATE TABLE public.items", prompt)
+        self.assertIn('"id" integer', prompt)
+        self.assertIn("Target schema:", prompt)
+        self.assertIn("CREATE TABLE items_new", prompt)
+
+    def test_repair_rewrite_prompt_includes_validation_error(self) -> None:
+        gateway = StaticGateway(["SELECT id FROM items_new;"])
+        planner = WorkloadPlanner(llm=gateway)
+
+        proposal = planner.repair_rewrite(
+            "SELECT id FROM public.items;",
+            "SELECT missing FROM items_new;",
+            {"status": "failed", "error": "column missing does not exist"},
+            target_tables=[{"name": "items_new", "columns": [{"name": "id"}]}],
+            migration_statements=[],
+            query_index=1,
+            source_tables=[{"schema": "public", "name": "items", "columns": [{"name": "id"}]}],
+        )
+
+        prompt = gateway.messages[0][1]["content"]
+        self.assertEqual(proposal.statements, ["SELECT id FROM items_new;"])
+        self.assertIn("PostgreSQL validation error", prompt)
+        self.assertIn("column missing does not exist", prompt)
+        self.assertIn("Previous rejected rewrite", prompt)
+        self.assertIn("SELECT missing FROM items_new", prompt)
+
     def test_rewrite_splits_large_workloads_into_limited_batches(self) -> None:
         responses = []
         for batch_start in (1, 11, 21):

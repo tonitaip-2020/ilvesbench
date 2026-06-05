@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from ilvesbench.benchmark.schema_transformer import SchemaTransformer
+from ilvesbench.dbops.normalization import NormalizationWorkflow
 from ilvesbench.models import ColumnMetadata, LLMResult, SchemaSnapshot, TableMetadata, UniqueConstraintMetadata
 
 
@@ -75,6 +76,156 @@ class SchemaTransformerTests(unittest.TestCase):
         proposal = SchemaTransformer().analyze(schema)
 
         self.assertEqual(proposal.status, "appears_3nf")
+
+    def test_discovers_candidate_functional_dependencies_with_llm(self) -> None:
+        schema = SchemaSnapshot(
+            database="demo",
+            collected_at="2026-04-23T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="orders",
+                    columns=[
+                        ColumnMetadata(name="order_id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="customer_id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="customer_name", data_type="text", is_nullable=False),
+                    ],
+                    unique_constraints=[
+                        UniqueConstraintMetadata(name="orders_pkey", columns=["order_id"]),
+                    ],
+                )
+            ],
+        )
+        transformer = SchemaTransformer(
+            llm=StaticGateway(
+                {
+                    "status": "candidate_normalization",
+                    "summary": "customer_id determines customer_name",
+                    "reasoning": ["customer identifiers normally determine names"],
+                    "table_findings": ["orders repeats customer names"],
+                    "functional_dependencies": [
+                        {
+                            "table": "orders",
+                            "determinant": ["customer_id"],
+                            "dependent": ["customer_name"],
+                            "confidence": "medium",
+                            "reason": "customer_id appears to identify a customer",
+                        }
+                    ],
+                }
+            )
+        )
+
+        proposal = transformer.discover_functional_dependencies(
+            schema,
+            [
+                {
+                    "name": "orders",
+                    "source_tables": ["public.orders"],
+                    "columns": [
+                        {"source_table": "public.orders", "source_column": "order_id", "name": "order_id"},
+                        {"source_table": "public.orders", "source_column": "customer_id", "name": "customer_id"},
+                        {"source_table": "public.orders", "source_column": "customer_name", "name": "customer_name"},
+                    ],
+                    "primary_key": ["order_id"],
+                    "uniques": [],
+                    "foreign_keys": [],
+                }
+            ],
+        )
+
+        self.assertEqual(proposal.source, "llm_fd_discovery")
+        self.assertEqual(proposal.functional_dependencies[0]["determinant"], ["customer_id"])
+
+    def test_synthesizes_3nf_tables_from_approved_functional_dependencies(self) -> None:
+        schema = SchemaSnapshot(
+            database="demo",
+            collected_at="2026-04-23T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="orders",
+                    columns=[
+                        ColumnMetadata(name="order_id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="customer_id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="customer_name", data_type="text", is_nullable=False),
+                    ],
+                    unique_constraints=[
+                        UniqueConstraintMetadata(name="orders_pkey", columns=["order_id"]),
+                    ],
+                )
+            ],
+        )
+        target_tables = [
+            {
+                "name": "orders",
+                "source_tables": ["public.orders"],
+                "columns": [
+                    {"source_table": "public.orders", "source_column": "order_id", "name": "order_id"},
+                    {"source_table": "public.orders", "source_column": "customer_id", "name": "customer_id"},
+                    {"source_table": "public.orders", "source_column": "customer_name", "name": "customer_name"},
+                ],
+                "primary_key": ["order_id"],
+                "uniques": [],
+                "foreign_keys": [],
+            }
+        ]
+
+        proposal = SchemaTransformer().synthesize_third_normal_form(
+            schema,
+            target_tables,
+            [
+                {
+                    "table": "orders",
+                    "determinant": ["customer_id"],
+                    "dependent": ["customer_name"],
+                    "confidence": "medium",
+                    "reason": "customer_id determines customer_name",
+                }
+            ],
+        )
+
+        orders = next(table for table in proposal.target_tables if table["name"] == "orders")
+        fd_table = next(table for table in proposal.target_tables if table["name"] != "orders")
+        self.assertEqual(proposal.source, "deterministic_3nf_synthesis")
+        self.assertNotIn("customer_name", [column["name"] for column in orders["columns"]])
+        self.assertEqual(fd_table["primary_key"], ["customer_id"])
+        self.assertIn("customer_name", [column["name"] for column in fd_table["columns"]])
+        self.assertTrue(any("FOREIGN KEY" in statement for statement in proposal.sql_statements))
+
+    def test_builds_fd_review_candidates_with_source_data_validation(self) -> None:
+        workflow = NormalizationWorkflow()
+        reviews = workflow.functional_dependency_review_candidates(
+            target_tables=[
+                {
+                    "name": "orders",
+                    "columns": [
+                        {"source_table": "public.orders", "source_column": "customer_id", "name": "customer_id"},
+                        {"source_table": "public.orders", "source_column": "customer_name", "name": "customer_name"},
+                    ],
+                }
+            ],
+            functional_dependencies=[
+                {
+                    "table": "orders",
+                    "determinant": ["customer_id"],
+                    "dependent": ["customer_name"],
+                    "confidence": "medium",
+                    "reason": "customer_id identifies a customer",
+                }
+            ],
+            validate_fd=lambda schema_name, table_name, determinant, dependent: {
+                "status": "consistent",
+                "summary": f"checked {schema_name}.{table_name}",
+                "determinant": determinant,
+                "dependent": dependent,
+            },
+        )
+
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["review_type"], "3nf_fd")
+        self.assertEqual(reviews[0]["source_data_validation"]["status"], "consistent")
+        self.assertEqual(reviews[0]["determinant"], ["customer_id"])
 
     def test_1nf_findings_make_metadata_fallback_candidate(self) -> None:
         schema = SchemaSnapshot(

@@ -115,6 +115,82 @@ class SchemaTransformer:
     ) -> NormalizationProposal | None:
         return self._first_normal_form_decomposition(schema, first_normal_form_findings)
 
+    def discover_functional_dependencies(self, schema: SchemaSnapshot, target_tables: list[dict]) -> NormalizationProposal:
+        if not target_tables:
+            return NormalizationProposal(
+                status="no_tables",
+                summary="No 1NF target tables were available for 3NF functional-dependency discovery.",
+                source="fd_discovery_skipped",
+            )
+        if self._llm is None:
+            return NormalizationProposal(
+                status="insufficient_evidence",
+                summary="Functional-dependency discovery requires an LLM gateway for semantic analysis.",
+                target_tables=target_tables,
+                source="fd_discovery_unavailable",
+                request_payload=self._fd_request_payload(schema, target_tables),
+            )
+
+        request_payload = self._fd_request_payload(schema, target_tables)
+        try:
+            llm_result = self._llm.generate(
+                self._build_fd_discovery_messages(schema, target_tables),
+                max_tokens=2400,
+            )
+            payload = self._extract_json_object(llm_result.response_text)
+            functional_dependencies = self._normalize_functional_dependencies(payload.get("functional_dependencies", []))
+            return NormalizationProposal(
+                status=str(payload.get("status", "candidate_normalization")),
+                summary=str(payload.get("summary", f"Found {len(functional_dependencies)} candidate functional dependenc(ies).")),
+                target_database=self._target_database,
+                rationale=self._to_string_list(payload.get("reasoning", [])),
+                table_findings=self._to_string_list(payload.get("table_findings", [])),
+                functional_dependencies=functional_dependencies,
+                target_tables=target_tables,
+                source="llm_fd_discovery",
+                raw_response_text=llm_result.response_text,
+                request_payload=request_payload,
+            )
+        except Exception as exc:
+            return NormalizationProposal(
+                status="insufficient_evidence",
+                summary="Functional-dependency discovery failed; IlvesBench will continue with the approved 1NF decomposition.",
+                target_tables=target_tables,
+                rationale=[f"FD discovery failure: {exc}"],
+                source="fd_discovery_failed",
+                request_payload=request_payload,
+            )
+
+    def synthesize_third_normal_form(
+        self,
+        schema: SchemaSnapshot,
+        target_tables: list[dict],
+        approved_functional_dependencies: list[dict],
+    ) -> NormalizationProposal:
+        synthesized_tables = self._synthesize_3nf_tables(target_tables, approved_functional_dependencies)
+        sql_statements = self._generate_sql(synthesized_tables, schema)
+        return NormalizationProposal(
+            status="candidate_normalization",
+            summary=(
+                f"Generated deterministic 3NF target schema with {len(synthesized_tables)} table(s) "
+                f"from {len(approved_functional_dependencies)} approved functional dependenc(ies)."
+            ),
+            target_database=self._target_database,
+            rationale=[
+                "Used approved candidate functional dependencies as input to a deterministic 3NF synthesis pass.",
+                "Each non-key determinant creates a relation containing determinant and dependent columns; dependent columns are removed from the original relation when safe.",
+            ],
+            table_findings=[
+                str(item.get("reason", ""))
+                for item in approved_functional_dependencies
+                if str(item.get("reason", "")).strip()
+            ],
+            functional_dependencies=approved_functional_dependencies,
+            target_tables=synthesized_tables,
+            sql_statements=sql_statements,
+            source="deterministic_3nf_synthesis",
+        )
+
     def _proposal_from_llm_response(self, schema: SchemaSnapshot, response_text: str) -> NormalizationProposal:
         payload = self._extract_json_object(response_text)
         target_tables = self._normalize_target_tables(schema, payload.get("target_tables", []))
@@ -148,6 +224,13 @@ class SchemaTransformer:
         return {
             "source_schema": self._schema_summary(schema),
             "first_normal_form_findings": first_normal_form_findings,
+            "target_database": self._target_database,
+        }
+
+    def _fd_request_payload(self, schema: SchemaSnapshot, target_tables: list[dict]) -> dict:
+        return {
+            "source_schema": self._schema_summary(schema),
+            "one_nf_target_tables": target_tables,
             "target_database": self._target_database,
         }
 
@@ -372,6 +455,47 @@ class SchemaTransformer:
             "}\n\n"
             f"Schema package:\n{json.dumps(schema_payload, ensure_ascii=True, indent=2)}\n\n"
             f"Deterministic 1NF findings from sampled data:\n{json.dumps(first_normal_form_findings, ensure_ascii=True, indent=2)}"
+        )
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _build_fd_discovery_messages(self, schema: SchemaSnapshot, target_tables: list[dict]) -> list[dict[str, str]]:
+        system_prompt = (
+            "You discover candidate functional dependencies for database normalization. "
+            "Use semantic reasoning conservatively. Return JSON only and do not include markdown fences."
+        )
+        user_prompt = (
+            "Given the original PostgreSQL schema and the current 1NF target tables, propose candidate functional "
+            "dependencies that may justify decomposition to 3NF. Focus on dependencies inside one target table. "
+            "Do not propose dependencies where the determinant is already a declared primary key or unique key unless "
+            "there is a specific non-obvious reason.\n\n"
+            "Rules:\n"
+            "1. Use target table names and target column names in each dependency.\n"
+            "2. determinant and dependent must be non-empty arrays of columns that exist in the named target table.\n"
+            "3. Prefer semantically meaningful dependencies such as code -> description, identifier -> descriptive attributes, "
+            "or natural key -> non-key attributes.\n"
+            "4. Mark confidence high, medium, or low and explain briefly.\n"
+            "5. These are candidates for human approval, not proofs.\n\n"
+            "Return JSON with this shape:\n"
+            "{\n"
+            '  "status": "candidate_normalization|appears_3nf|insufficient_evidence",\n'
+            '  "summary": "short summary",\n'
+            '  "reasoning": ["..."],\n'
+            '  "table_findings": ["..."],\n'
+            '  "functional_dependencies": [\n'
+            "    {\n"
+            '      "table": "target_table",\n'
+            '      "determinant": ["col_a"],\n'
+            '      "dependent": ["col_b", "col_c"],\n'
+            '      "confidence": "high|medium|low",\n'
+            '      "reason": "why this dependency is plausible"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            f"Original source schema:\n{json.dumps(self._schema_summary(schema), ensure_ascii=True, indent=2)}\n\n"
+            f"Current 1NF target tables:\n{json.dumps(target_tables, ensure_ascii=True, indent=2)}"
         )
         return [
             {"role": "system", "content": system_prompt},
@@ -764,6 +888,126 @@ class SchemaTransformer:
             sql_statements=sql_statements,
             source="deterministic_1nf_fallback",
         )
+
+    def _synthesize_3nf_tables(self, target_tables: list[dict], functional_dependencies: list[dict]) -> list[dict]:
+        tables_by_name = {str(table.get("name", "")): self._copy_target_table(table) for table in target_tables}
+        used_names = set(tables_by_name)
+        fds_by_table: dict[str, list[dict]] = {}
+        for fd in functional_dependencies:
+            table_name = str(fd.get("table", "")).strip()
+            if table_name in tables_by_name:
+                fds_by_table.setdefault(table_name, []).append(fd)
+
+        synthesized: list[dict] = []
+        for table_name, table in tables_by_name.items():
+            original_columns = [dict(column) for column in table.get("columns", [])]
+            original_column_names = {column["name"] for column in original_columns}
+            primary_key = list(table.get("primary_key", []))
+            unique_sets = [list(unique) for unique in table.get("uniques", [])]
+            key_sets = [set(primary_key)] if primary_key else []
+            key_sets.extend(set(unique) for unique in unique_sets if unique)
+            remove_columns: set[str] = set()
+
+            for fd in fds_by_table.get(table_name, []):
+                determinant = [
+                    self._sanitize_identifier(str(column))
+                    for column in fd.get("determinant", [])
+                    if self._sanitize_identifier(str(column)) in original_column_names
+                ]
+                dependent = [
+                    self._sanitize_identifier(str(column))
+                    for column in fd.get("dependent", [])
+                    if self._sanitize_identifier(str(column)) in original_column_names
+                ]
+                dependent = [column for column in dependent if column not in determinant]
+                if not determinant or not dependent:
+                    continue
+                determinant_set = set(determinant)
+                if any(key and determinant_set.issuperset(key) for key in key_sets):
+                    continue
+
+                relation_columns = self._columns_by_name(original_columns, determinant + dependent)
+                relation_name = self._unique_target_name(
+                    f"{table_name}_{'_'.join(dependent[:2])}",
+                    used_names,
+                )
+                used_names.add(relation_name)
+                synthesized.append(
+                    {
+                        "name": relation_name,
+                        "purpose": f"3NF relation for {table_name}: {', '.join(determinant)} determines {', '.join(dependent)}.",
+                        "source_tables": list(table.get("source_tables", [])),
+                        "columns": relation_columns,
+                        "primary_key": determinant,
+                        "uniques": [],
+                        "foreign_keys": [],
+                        "normal_form": "3NF",
+                        "functional_dependency": fd,
+                    }
+                )
+                for column in dependent:
+                    if column not in primary_key:
+                        remove_columns.add(column)
+                if determinant_set.issubset(original_column_names):
+                    table.setdefault("foreign_keys", []).append(
+                        {
+                            "columns": determinant,
+                            "references_table": relation_name,
+                            "references_columns": determinant,
+                        }
+                    )
+
+            if remove_columns:
+                table["columns"] = [
+                    column
+                    for column in table.get("columns", [])
+                    if column.get("name") not in remove_columns
+                ]
+                valid_names = {column["name"] for column in table["columns"]}
+                table["primary_key"] = [column for column in table.get("primary_key", []) if column in valid_names]
+                table["uniques"] = [
+                    [column for column in unique if column in valid_names]
+                    for unique in table.get("uniques", [])
+                    if set(unique).issubset(valid_names)
+                ]
+                table["foreign_keys"] = [
+                    foreign_key
+                    for foreign_key in table.get("foreign_keys", [])
+                    if set(foreign_key.get("columns", [])).issubset(valid_names)
+                ]
+            table["normal_form"] = "3NF" if fds_by_table.get(table_name) else table.get("normal_form", "1NF")
+
+        result = list(tables_by_name.values()) + synthesized
+        return [table for table in result if table.get("columns")]
+
+    def _copy_target_table(self, table: dict) -> dict:
+        return {
+            "name": str(table.get("name", "")),
+            "purpose": str(table.get("purpose", "")),
+            "source_tables": list(table.get("source_tables", [])),
+            "columns": [dict(column) for column in table.get("columns", [])],
+            "primary_key": list(table.get("primary_key", [])),
+            "uniques": [list(unique) for unique in table.get("uniques", [])],
+            "foreign_keys": [dict(foreign_key) for foreign_key in table.get("foreign_keys", [])],
+            **{
+                key: value
+                for key, value in table.items()
+                if key
+                not in {
+                    "name",
+                    "purpose",
+                    "source_tables",
+                    "columns",
+                    "primary_key",
+                    "uniques",
+                    "foreign_keys",
+                }
+            },
+        }
+
+    def _columns_by_name(self, columns: list[dict], names: list[str]) -> list[dict]:
+        by_name = {column.get("name"): dict(column) for column in columns}
+        return [by_name[name] for name in names if name in by_name]
 
     def _generate_sql(self, target_tables: list[dict], schema: SchemaSnapshot) -> list[str]:
         if not target_tables:

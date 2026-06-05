@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
 
 from ilvesbench.benchmark.pgbench import PgBenchRunner
 from ilvesbench.benchmark.workload import WorkloadRewriteProposal
-from ilvesbench.benchmarker.query_migration import QueryMigrationExecutionError, QueryMigrationService
+from ilvesbench.benchmarker.query_rewrite import QueryRewriteExecutionError, QueryRewriteService
 from ilvesbench.benchmarker.service import BenchmarkerService
 from ilvesbench.config import IlvesBenchConfig, PgBenchConfig, PostgresConfig, StorageConfig
 
@@ -102,26 +102,28 @@ class PgBenchTests(unittest.TestCase):
             self.assertEqual(warning["valid_statement_count"], 1)
             self.assertEqual(filtered.read_text(encoding="utf-8").strip(), "SELECT 1;")
 
-    def test_query_migration_batches_and_progress_payload(self) -> None:
+    def test_query_rewrite_batches_and_progress_payload(self) -> None:
         config = IlvesBenchConfig(postgres=PostgresConfig(original_database="source_db", new_database="target_db"))
-        service = QueryMigrationService(config, batch_size=2)
+        service = QueryRewriteService(config, batch_size=2)
 
         progress = service.progress_payload(
             "SELECT 1;",
             ["SELECT 1;", "SELECT 2;", "SELECT 3;"],
+            [{"schema": "public", "name": "source_items"}],
             [{"name": "items"}],
             [{"sql": "INSERT INTO items SELECT * FROM public.items;"}],
         )
         batches = service.batches([(1, "a", "ka"), (2, "b", "kb"), (3, "c", "kc")])
 
         self.assertEqual(progress["total_query_count"], 3)
+        self.assertEqual(progress["source_table_count"], 1)
         self.assertEqual(progress["target_table_count"], 1)
         self.assertEqual(progress["llm_request"]["batch_size"], 2)
         self.assertEqual([len(batch) for batch in batches], [2, 1])
 
-    def test_query_migration_completes_only_valid_rewrites_in_source_order(self) -> None:
+    def test_query_rewrite_completes_only_valid_rewrites_in_source_order(self) -> None:
         config = IlvesBenchConfig(postgres=PostgresConfig(original_database="source_db", new_database="target_db"))
-        service = QueryMigrationService(config, batch_size=10)
+        service = QueryRewriteService(config, batch_size=10)
         progress = {
             "query_results": [
                 {
@@ -151,7 +153,7 @@ class PgBenchTests(unittest.TestCase):
         self.assertEqual(progress["completed_query_count"], 2)
         self.assertEqual(progress["processed_query_count"], 3)
 
-    def test_query_migration_cache_key_and_roundtrip(self) -> None:
+    def test_query_rewrite_cache_key_and_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = IlvesBenchConfig(
                 postgres=PostgresConfig(
@@ -162,11 +164,12 @@ class PgBenchTests(unittest.TestCase):
                 storage=StorageConfig(artifact_dir="artifacts"),
                 config_path=str(Path(tmpdir) / "config.toml"),
             )
-            service = QueryMigrationService(config)
+            service = QueryRewriteService(config)
             target_tables = [{"name": "items", "columns": [{"name": "id"}]}]
+            source_tables = [{"schema": "public", "name": "source_items", "columns": [{"name": "id"}]}]
 
-            first_key = service.cache_key("SELECT   id\nFROM items;", target_tables)
-            second_key = service.cache_key("SELECT id FROM items;", target_tables)
+            first_key = service.cache_key("SELECT   id\nFROM items;", target_tables, source_tables=source_tables)
+            second_key = service.cache_key("SELECT id FROM items;", target_tables, source_tables=source_tables)
             cache = {first_key: {"rewritten_statement": "SELECT id FROM items_new;"}}
             service.save_cache(cache)
 
@@ -174,19 +177,20 @@ class PgBenchTests(unittest.TestCase):
             self.assertEqual(service.load_cache(), cache)
             self.assertEqual(service.cache_path().name, "query_rewrite_cache.json")
 
-    def test_query_migration_rewrites_in_batches_and_saves_cache(self) -> None:
+    def test_query_rewrite_rewrites_in_batches_and_saves_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = IlvesBenchConfig(
                 postgres=PostgresConfig(original_database="source_db", new_database="target_db"),
                 storage=StorageConfig(artifact_dir="artifacts"),
                 config_path=str(Path(tmpdir) / "config.toml"),
             )
-            service = QueryMigrationService(config, batch_size=2)
+            service = QueryRewriteService(config, batch_size=2)
             rewrite_calls: list[str] = []
             progress_snapshots: list[dict] = []
 
             def rewrite_batch(
                 sql: str,
+                source_tables: list[dict],
                 target_tables: list[dict],
                 migration_statements: list[dict],
                 batch_size: int,
@@ -212,6 +216,7 @@ class PgBenchTests(unittest.TestCase):
                     "SELECT name FROM source_items;",
                     "SELECT code FROM source_items;",
                 ],
+                source_tables=[{"schema": "public", "name": "source_items", "columns": [{"name": "id"}]}],
                 target_tables=[{"name": "target_items"}],
                 migration_statements=[],
                 rewrite_batch=rewrite_batch,
@@ -229,17 +234,19 @@ class PgBenchTests(unittest.TestCase):
             self.assertEqual(progress_snapshots[-1]["completed_query_count"], 3)
             self.assertEqual(len(service.load_cache()), 3)
 
-    def test_query_migration_raises_with_progress_when_validation_fails(self) -> None:
+    def test_query_rewrite_repairs_after_validation_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = IlvesBenchConfig(
                 postgres=PostgresConfig(original_database="source_db", new_database="target_db"),
                 storage=StorageConfig(artifact_dir="artifacts"),
                 config_path=str(Path(tmpdir) / "config.toml"),
             )
-            service = QueryMigrationService(config, batch_size=5)
+            service = QueryRewriteService(config, batch_size=5)
+            validations: list[str] = []
 
             def rewrite_batch(
                 sql: str,
+                source_tables: list[dict],
                 target_tables: list[dict],
                 migration_statements: list[dict],
                 batch_size: int,
@@ -253,10 +260,78 @@ class PgBenchTests(unittest.TestCase):
                     request_payload={"source_statements": sql},
                 )
 
-            with self.assertRaises(QueryMigrationExecutionError) as ctx:
+            def repair_rewrite(
+                source_statement: str,
+                previous_rewrite: str,
+                validation: dict,
+                source_tables: list[dict],
+                target_tables: list[dict],
+                migration_statements: list[dict],
+                query_index: int,
+                batch_size: int,
+            ) -> WorkloadRewriteProposal:
+                return WorkloadRewriteProposal(
+                    status="planned",
+                    summary="repaired",
+                    statements=["SELECT id FROM target_items;"],
+                    source="llm",
+                    raw_response_text="raw repaired response",
+                    request_payload={"validation_error": validation, "previous_rewrite": previous_rewrite},
+                )
+
+            def validate(statement: str) -> dict:
+                validations.append(statement)
+                if "missing" in statement:
+                    return {"status": "failed", "error": "column missing"}
+                return {"status": "passed"}
+
+            result = service.rewrite_incremental(
+                workload_sql="SELECT id FROM source_items;",
+                source_statements=["SELECT id FROM source_items;"],
+                source_tables=[{"schema": "public", "name": "source_items", "columns": [{"name": "id"}]}],
+                target_tables=[{"name": "target_items"}],
+                migration_statements=[],
+                rewrite_batch=rewrite_batch,
+                repair_rewrite=repair_rewrite,
+                validate_statement=validate,
+                on_progress=lambda progress: None,
+            )
+
+            self.assertEqual(validations, ["SELECT missing FROM target_items;", "SELECT id FROM target_items;"])
+            self.assertEqual(result.ordered_statements, ["SELECT id FROM target_items;"])
+            self.assertEqual(result.ordered_results[0]["rewrite_attempt_count"], 2)
+            self.assertIn("raw repaired response", service.raw_response_text(result.progress))
+
+    def test_query_rewrite_raises_with_progress_when_validation_repair_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = IlvesBenchConfig(
+                postgres=PostgresConfig(original_database="source_db", new_database="target_db"),
+                storage=StorageConfig(artifact_dir="artifacts"),
+                config_path=str(Path(tmpdir) / "config.toml"),
+            )
+            service = QueryRewriteService(config, batch_size=5)
+
+            def rewrite_batch(
+                sql: str,
+                source_tables: list[dict],
+                target_tables: list[dict],
+                migration_statements: list[dict],
+                batch_size: int,
+            ) -> WorkloadRewriteProposal:
+                return WorkloadRewriteProposal(
+                    status="planned",
+                    summary="bad rewrite",
+                    statements=["SELECT missing FROM target_items;"],
+                    source="llm",
+                    raw_response_text="raw bad response",
+                    request_payload={"source_statements": sql},
+                )
+
+            with self.assertRaises(QueryRewriteExecutionError) as ctx:
                 service.rewrite_incremental(
                     workload_sql="SELECT id FROM source_items;",
                     source_statements=["SELECT id FROM source_items;"],
+                    source_tables=[{"schema": "public", "name": "source_items", "columns": [{"name": "id"}]}],
                     target_tables=[{"name": "target_items"}],
                     migration_statements=[],
                     rewrite_batch=rewrite_batch,

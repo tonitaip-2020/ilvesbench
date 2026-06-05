@@ -16,6 +16,7 @@ DBOps owns work that requires PostgreSQL access:
 - schema and metadata inspection
 - profiling row counts, indexes, table sizes, and database metrics
 - normal-form warning scans that require sampled database values
+- source-data consistency checks for candidate functional dependencies
 - target database creation, truncation, and dropping
 - DDL/DML execution
 - data migration support
@@ -44,7 +45,7 @@ Package: `ilvesbench.benchmarker`
 Benchmarker owns workload and benchmark execution:
 
 - workload profile and summary-table candidate planning
-- source-to-target query migration progress, batching, and cache state
+- source-to-target query rewrite progress, batching, repair, and cache state
 - pgbench script/workload preparation
 - pgbench parameter handling
 - pgbench execution
@@ -64,6 +65,13 @@ The orchestrator coordinates component outputs and LLM tasks:
 - human review checkpoints
 - prompt payload assembly and LLM calls
 - routing outputs from LLM tasks back to DBOps, OSOps, and Benchmarker
+
+Normalization is staged and human-gated. IlvesBench first surfaces 1NF
+findings such as delimited multi-value columns. Tables approved for 1NF
+normalization then move to 3NF review: the LLM proposes candidate functional
+dependencies, DBOps checks candidates against current source data when the
+columns map to one source table, and the user approves or rejects each FD. The
+final 3NF target schema is synthesized deterministically from approved FDs.
 
 The legacy `PipelineOrchestrator` is being thinned. New LLM-mediated task
 wrappers live under `ilvesbench.orchestrator`.

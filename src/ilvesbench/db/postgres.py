@@ -355,6 +355,82 @@ class PostgresInspector:
             conn.close()
         return errors
 
+    def validate_functional_dependency(
+        self,
+        database: str,
+        schema_name: str,
+        table_name: str,
+        determinant_columns: list[str],
+        dependent_columns: list[str],
+    ) -> dict:
+        if not determinant_columns or not dependent_columns:
+            return {
+                "status": "skipped",
+                "summary": "Functional dependency validation requires determinant and dependent columns.",
+            }
+        if psycopg is None or sql is None:
+            return {
+                "status": "skipped",
+                "summary": "psycopg is not available, so source-data FD validation was skipped.",
+            }
+
+        conn = self._connect(database)
+        try:
+            with conn.cursor() as cur:
+                determinant_sql = sql.SQL(", ").join(sql.Identifier(column) for column in determinant_columns)
+                dependent_parts = [
+                    sql.SQL("COALESCE({}::text, '<NULL>')").format(sql.Identifier(column))
+                    for column in dependent_columns
+                ]
+                dependent_expr = sql.SQL("concat_ws(chr(31), {})").format(sql.SQL(", ").join(dependent_parts))
+                query = sql.SQL(
+                    """
+                    SELECT COUNT(*) AS violation_count
+                    FROM (
+                        SELECT {determinants}
+                        FROM {table}
+                        GROUP BY {determinants}
+                        HAVING COUNT(DISTINCT {dependent_expr}) > 1
+                        LIMIT 1
+                    ) AS ilvesbench_fd_violations
+                    """
+                ).format(
+                    determinants=determinant_sql,
+                    table=sql.Identifier(schema_name, table_name),
+                    dependent_expr=dependent_expr,
+                )
+                cur.execute("SET LOCAL statement_timeout = '10s'")
+                cur.execute(query)
+                row = cur.fetchone()
+        except Exception as exc:
+            conn.rollback()
+            return {
+                "status": "skipped",
+                "summary": "Functional dependency validation could not run against the source data.",
+                "error": str(exc),
+                "database": database,
+                "table": f"{schema_name}.{table_name}",
+            }
+        finally:
+            conn.close()
+
+        violation_count = int(row["violation_count"] or 0) if row else 0
+        if violation_count:
+            return {
+                "status": "violated",
+                "summary": "Current source data contradicts this candidate functional dependency.",
+                "violation_count": violation_count,
+                "database": database,
+                "table": f"{schema_name}.{table_name}",
+            }
+        return {
+            "status": "consistent",
+            "summary": "No contradiction to this candidate functional dependency was found in current source data.",
+            "violation_count": 0,
+            "database": database,
+            "table": f"{schema_name}.{table_name}",
+        }
+
     def compare_query_results(
         self,
         original_database: str,
