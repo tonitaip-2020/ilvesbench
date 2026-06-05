@@ -11,7 +11,10 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from ilvesbench.benchmark.pgbench import PgBenchRunner
-from ilvesbench.config import PgBenchConfig, PostgresConfig
+from ilvesbench.benchmark.workload import WorkloadRewriteProposal
+from ilvesbench.benchmarker.query_migration import QueryMigrationExecutionError, QueryMigrationService
+from ilvesbench.benchmarker.service import BenchmarkerService
+from ilvesbench.config import IlvesBenchConfig, PgBenchConfig, PostgresConfig, StorageConfig
 
 
 class FakeRunner:
@@ -67,6 +70,203 @@ class PgBenchTests(unittest.TestCase):
 
         self.assertEqual(result.status, "skipped")
         self.assertIn("was not found", result.stderr)
+
+    def test_service_filters_invalid_rewritten_workload_before_pgbench(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            workload = root / "rewritten.sql"
+            workload.write_text("SELECT 1;\n\nSELECT bad_column FROM missing_table;\n", encoding="utf-8")
+            service = BenchmarkerService(config=type("Config", (), {
+                "postgres": type("Postgres", (), {"new_database": "target_db"})()
+            })())
+
+            def validate(statements: list[str]) -> list[dict]:
+                return [{"index": 1, "statement": statements[1], "error": "column does not exist"}]
+
+            def write_text_artifact(run_id: str, name: str, content: str) -> str:
+                path = root / f"{name}.sql"
+                path.write_text(content, encoding="utf-8")
+                return str(path)
+
+            filtered, warning = service.prepare_validated_workload(
+                run_id="run-test",
+                workload_path=workload,
+                target_database="target_db",
+                validate_statements=validate,
+                write_text_artifact=write_text_artifact,
+            )
+
+            self.assertEqual(filtered.name, "rewritten_workload_db_new_validated.sql")
+            self.assertIsNotNone(warning)
+            self.assertEqual(warning["status"], "warning")
+            self.assertEqual(warning["valid_statement_count"], 1)
+            self.assertEqual(filtered.read_text(encoding="utf-8").strip(), "SELECT 1;")
+
+    def test_query_migration_batches_and_progress_payload(self) -> None:
+        config = IlvesBenchConfig(postgres=PostgresConfig(original_database="source_db", new_database="target_db"))
+        service = QueryMigrationService(config, batch_size=2)
+
+        progress = service.progress_payload(
+            "SELECT 1;",
+            ["SELECT 1;", "SELECT 2;", "SELECT 3;"],
+            [{"name": "items"}],
+            [{"sql": "INSERT INTO items SELECT * FROM public.items;"}],
+        )
+        batches = service.batches([(1, "a", "ka"), (2, "b", "kb"), (3, "c", "kc")])
+
+        self.assertEqual(progress["total_query_count"], 3)
+        self.assertEqual(progress["target_table_count"], 1)
+        self.assertEqual(progress["llm_request"]["batch_size"], 2)
+        self.assertEqual([len(batch) for batch in batches], [2, 1])
+
+    def test_query_migration_completes_only_valid_rewrites_in_source_order(self) -> None:
+        config = IlvesBenchConfig(postgres=PostgresConfig(original_database="source_db", new_database="target_db"))
+        service = QueryMigrationService(config, batch_size=10)
+        progress = {
+            "query_results": [
+                {
+                    "query_index": 2,
+                    "rewritten_statement": "SELECT missing FROM target;",
+                    "validation": {"status": "failed"},
+                },
+                {
+                    "query_index": 1,
+                    "rewritten_statement": "SELECT id FROM target;",
+                    "validation": {"status": "passed"},
+                },
+                {
+                    "query_index": 3,
+                    "rewritten_statement": "SELECT name FROM target;",
+                    "validation": {"status": "passed"},
+                },
+            ],
+            "statements": [],
+        }
+
+        ordered_results, ordered_statements, invalid_count = service.complete_progress(progress)
+
+        self.assertEqual([item["query_index"] for item in ordered_results], [1, 2, 3])
+        self.assertEqual(ordered_statements, ["SELECT id FROM target;", "SELECT name FROM target;"])
+        self.assertEqual(invalid_count, 1)
+        self.assertEqual(progress["completed_query_count"], 2)
+        self.assertEqual(progress["processed_query_count"], 3)
+
+    def test_query_migration_cache_key_and_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = IlvesBenchConfig(
+                postgres=PostgresConfig(
+                    original_database="source_db",
+                    new_database="target_db",
+                    schemas=["public"],
+                ),
+                storage=StorageConfig(artifact_dir="artifacts"),
+                config_path=str(Path(tmpdir) / "config.toml"),
+            )
+            service = QueryMigrationService(config)
+            target_tables = [{"name": "items", "columns": [{"name": "id"}]}]
+
+            first_key = service.cache_key("SELECT   id\nFROM items;", target_tables)
+            second_key = service.cache_key("SELECT id FROM items;", target_tables)
+            cache = {first_key: {"rewritten_statement": "SELECT id FROM items_new;"}}
+            service.save_cache(cache)
+
+            self.assertEqual(first_key, second_key)
+            self.assertEqual(service.load_cache(), cache)
+            self.assertEqual(service.cache_path().name, "query_rewrite_cache.json")
+
+    def test_query_migration_rewrites_in_batches_and_saves_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = IlvesBenchConfig(
+                postgres=PostgresConfig(original_database="source_db", new_database="target_db"),
+                storage=StorageConfig(artifact_dir="artifacts"),
+                config_path=str(Path(tmpdir) / "config.toml"),
+            )
+            service = QueryMigrationService(config, batch_size=2)
+            rewrite_calls: list[str] = []
+            progress_snapshots: list[dict] = []
+
+            def rewrite_batch(
+                sql: str,
+                target_tables: list[dict],
+                migration_statements: list[dict],
+                batch_size: int,
+            ) -> WorkloadRewriteProposal:
+                rewrite_calls.append(sql)
+                return WorkloadRewriteProposal(
+                    status="planned",
+                    summary="rewritten",
+                    statements=[
+                        statement.replace("source_items", "target_items")
+                        for statement in sql.split(";")
+                        if statement.strip()
+                    ],
+                    source="llm",
+                    raw_response_text="ok",
+                    request_payload={"source_statements": sql, "batch_size": batch_size},
+                )
+
+            result = service.rewrite_incremental(
+                workload_sql="SELECT id FROM source_items; SELECT name FROM source_items; SELECT code FROM source_items;",
+                source_statements=[
+                    "SELECT id FROM source_items;",
+                    "SELECT name FROM source_items;",
+                    "SELECT code FROM source_items;",
+                ],
+                target_tables=[{"name": "target_items"}],
+                migration_statements=[],
+                rewrite_batch=rewrite_batch,
+                validate_statement=lambda statement: {"status": "passed", "statement": statement},
+                on_progress=lambda progress: progress_snapshots.append(dict(progress)),
+            )
+
+            self.assertEqual(len(rewrite_calls), 2)
+            self.assertEqual(result.ordered_statements, [
+                "SELECT id FROM target_items",
+                "SELECT name FROM target_items",
+                "SELECT code FROM target_items",
+            ])
+            self.assertEqual(result.invalid_count, 0)
+            self.assertEqual(progress_snapshots[-1]["completed_query_count"], 3)
+            self.assertEqual(len(service.load_cache()), 3)
+
+    def test_query_migration_raises_with_progress_when_validation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = IlvesBenchConfig(
+                postgres=PostgresConfig(original_database="source_db", new_database="target_db"),
+                storage=StorageConfig(artifact_dir="artifacts"),
+                config_path=str(Path(tmpdir) / "config.toml"),
+            )
+            service = QueryMigrationService(config, batch_size=5)
+
+            def rewrite_batch(
+                sql: str,
+                target_tables: list[dict],
+                migration_statements: list[dict],
+                batch_size: int,
+            ) -> WorkloadRewriteProposal:
+                return WorkloadRewriteProposal(
+                    status="planned",
+                    summary="bad rewrite",
+                    statements=["SELECT missing FROM target_items;"],
+                    source="llm",
+                    raw_response_text="raw bad response",
+                    request_payload={"source_statements": sql},
+                )
+
+            with self.assertRaises(QueryMigrationExecutionError) as ctx:
+                service.rewrite_incremental(
+                    workload_sql="SELECT id FROM source_items;",
+                    source_statements=["SELECT id FROM source_items;"],
+                    target_tables=[{"name": "target_items"}],
+                    migration_statements=[],
+                    rewrite_batch=rewrite_batch,
+                    validate_statement=lambda statement: {"status": "failed", "error": "column missing"},
+                    on_progress=lambda progress: None,
+                )
+
+            self.assertEqual(ctx.exception.progress["processed_query_count"], 1)
+            self.assertIn("no pgbench workload was generated", str(ctx.exception))
+            self.assertIn("raw bad response", service.raw_response_text(ctx.exception.progress))
 
 
 if __name__ == "__main__":

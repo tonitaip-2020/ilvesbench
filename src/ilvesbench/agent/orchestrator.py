@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-import hashlib
 import json
 from pathlib import Path, PureWindowsPath
 import re
@@ -9,6 +8,7 @@ import traceback
 import uuid
 
 from ilvesbench.benchmark.workload import WorkloadRewriteError
+from ilvesbench.benchmarker.query_migration import QueryMigrationExecutionError
 from ilvesbench.benchmarker.service import BenchmarkerService
 from ilvesbench.config import IlvesBenchConfig
 from ilvesbench.core.components import ComponentBundle
@@ -27,9 +27,6 @@ from ilvesbench.models import (
 from ilvesbench.orchestrator.llm_tasks import LLMTaskService
 from ilvesbench.osops.service import OSOpsService
 from ilvesbench.store.repository import RunRepository
-
-
-QUERY_REWRITE_BATCH_SIZE = 25
 
 
 class PipelineOrchestrator:
@@ -70,6 +67,20 @@ class PipelineOrchestrator:
     @property
     def store(self) -> RunRepository:
         return self._store
+
+    def _sync_component_aliases(self) -> None:
+        """Keep new services aligned with legacy test/runtime monkeypatches.
+
+        The orchestrator is being migrated from direct component attributes to
+        service facades. During that transition, existing tests and callers may
+        still patch aliases such as ``_postgres`` or ``_migration_planner``.
+        """
+
+        if self._dbops.postgres is not self._postgres:
+            self._dbops.replace_postgres(self._postgres)
+        self._llm_tasks.schema_transformer = self._schema_transformer
+        self._llm_tasks.migration_planner = self._migration_planner
+        self._benchmarker.workload_planner = self._workload_planner
 
     def test_llm(self) -> dict:
         result = self._llm.generate(
@@ -497,9 +508,10 @@ class PipelineOrchestrator:
                 record = self._plan_migration_step(record, schema)
                 migrate_step = next(step for step in record.steps if step.name == "migrate_data")
             if migrate_step.details.get("source") == "deterministic_1nf":
-                refreshed = self._migration_planner.plan(schema, migrate_step.details.get("target_tables", []))
-                if refreshed.statements:
-                    migration_sql = "\n\n".join(statement["sql"] for statement in refreshed.statements) + "\n"
+                self._sync_component_aliases()
+                refreshed = self._llm_tasks.plan_migration(schema, migrate_step.details.get("target_tables", []))
+                if refreshed.get("statements"):
+                    migration_sql = "\n\n".join(statement["sql"] for statement in refreshed["statements"]) + "\n"
                     migration_path = self._store.write_text_artifact(
                         record.run_id,
                         "migration_plan",
@@ -508,11 +520,11 @@ class PipelineOrchestrator:
                     )
                     migrate_step.details.update(
                         {
-                            "status": refreshed.status,
-                            "summary": refreshed.summary,
-                            "reasoning": refreshed.rationale,
-                            "statements": refreshed.statements,
-                            "source": refreshed.source,
+                            "status": refreshed["status"],
+                            "summary": refreshed["summary"],
+                            "reasoning": refreshed["reasoning"],
+                            "statements": refreshed["statements"],
+                            "source": refreshed["source"],
                             "sql_path": migration_path,
                         }
                     )
@@ -526,25 +538,23 @@ class PipelineOrchestrator:
             if not statements:
                 raise ValueError("No migration SQL is available for this run.")
 
-            source_alias = f"ilvesbench_src_{record.run_id[-6:]}"
-            referenced_tables = self._source_tables_for_migration(schema, migrate_step.details.get("target_tables", []))
-            fdw_tables = self._postgres.ensure_source_fdw(
-                self._config.postgres.new_database,
-                source_alias,
-                referenced_tables,
+            self._sync_component_aliases()
+            execution = self._dbops.migration.execute_migration(
+                run_id=record.run_id,
+                schema=schema,
+                target_tables=migrate_step.details.get("target_tables", []),
+                statements=statements,
             )
-            final_statements = [statement.replace("__SOURCE_SCHEMA__", f'"{source_alias}"') for statement in statements]
-            executed = self._postgres.execute_statements(self._config.postgres.new_database, final_statements)
             record = self._complete_step(
                 record,
                 "migrate_data",
                 {
                     **migrate_step.details,
-                    "source_schema_alias": source_alias,
-                    "fdw_tables": fdw_tables,
-                    "executed_statement_count": len(executed),
-                    "executed_sql": final_statements,
-                    "summary": f"Executed {len(executed)} migration statements into {self._config.postgres.new_database}.",
+                    **execution,
+                    "summary": (
+                        f"Executed {execution['executed_statement_count']} migration statements into "
+                        f"{self._config.postgres.new_database}."
+                    ),
                 },
             )
             record.summary["migration_completed"] = True
@@ -835,7 +845,8 @@ class PipelineOrchestrator:
             for finding in review.get("findings", [])
         ]
         if approved_findings:
-            proposal = self._schema_transformer.build_first_normal_form_decomposition(schema, approved_findings)
+            self._sync_component_aliases()
+            proposal = self._llm_tasks.build_first_normal_form_decomposition(schema, approved_findings)
             if proposal is None:
                 raise ValueError("Approved normalization reviews did not produce a target-table proposal.")
             details.update(
@@ -914,7 +925,8 @@ class PipelineOrchestrator:
             schema = self._load_schema_artifact(record)
             normalization_step = next(step for step in record.steps if step.name == "propose_3nf_schema")
             create_step = next(step for step in record.steps if step.name == "create_target_schema")
-            repaired = self._schema_transformer.repair(
+            self._sync_component_aliases()
+            repaired = self._llm_tasks.repair_schema(
                 schema,
                 normalization_step.details.get("target_tables", []),
                 normalization_step.details.get("sql_statements", []),
@@ -1444,64 +1456,21 @@ class PipelineOrchestrator:
         )
 
     def _prepare_pgbench_new_workload(self, record: BenchmarkRunRecord, workload_path: Path) -> tuple[Path, dict | None]:
-        if not workload_path.exists():
-            return workload_path, None
-        statements = self._split_sql_statements(workload_path.read_text(encoding="utf-8", errors="replace"))
-        validation_errors = self._validate_db_new_workload(statements)
-        if not validation_errors:
-            return workload_path, {
-                "status": "passed",
-                "summary": f"Rewritten workload dry-run validates against {self._config.postgres.new_database}.",
-                "statement_count": len(statements),
-                "valid_statement_count": len(statements),
-                "error_count": 0,
-                "errors": [],
-                "blocking": False,
-            }
-        invalid_indexes = {
-            int(item["index"])
-            for item in validation_errors
-            if str(item.get("index", "")).isdigit()
-        }
-        invalid_texts = {
-            self._normalize_sql_for_compare(str(item.get("statement", "")))
-            for item in validation_errors
-            if item.get("statement")
-        }
-        valid_statements = [
-            statement
-            for index, statement in enumerate(statements)
-            if index not in invalid_indexes
-            and self._normalize_sql_for_compare(statement) not in invalid_texts
-        ]
-        if not valid_statements:
-            raise ValueError(
-                f"None of the rewritten {self._config.postgres.new_database} workload statements passed "
-                "PostgreSQL dry-run validation, so pgbench was not started."
-            )
-        filtered_path = Path(
-            self._store.write_text_artifact(
-                record.run_id,
-                "rewritten_workload_db_new_validated",
-                "\n\n".join(valid_statements) + "\n",
+        prepared_path, validation_warning = self._benchmarker.prepare_validated_workload(
+            run_id=record.run_id,
+            workload_path=workload_path,
+            target_database=self._config.postgres.new_database,
+            validate_statements=self._validate_db_new_workload,
+            write_text_artifact=lambda run_id, name, content: self._store.write_text_artifact(
+                run_id,
+                name,
+                content,
                 suffix=".sql",
-            )
-        )
-        record.artifacts["run_pgbench_new_validated_workload"] = str(filtered_path)
-        return filtered_path, {
-            "status": "warning",
-            "summary": (
-                f"{len(validation_errors)} rewritten workload statement(s) failed PostgreSQL dry-run validation "
-                f"against {self._config.postgres.new_database}. pgbench will use "
-                f"{len(valid_statements)} validated statement(s)."
             ),
-            "statement_count": len(statements),
-            "valid_statement_count": len(valid_statements),
-            "error_count": len(validation_errors),
-            "errors": validation_errors[:10],
-            "filtered_workload_path": str(filtered_path),
-            "blocking": False,
-        }
+        )
+        if validation_warning and validation_warning.get("filtered_workload_path"):
+            record.artifacts["run_pgbench_new_validated_workload"] = str(validation_warning["filtered_workload_path"])
+        return prepared_path, validation_warning
 
     def _pgbench_new_validation_warning(self, workload_path: Path) -> dict | None:
         if not workload_path.exists():
@@ -1529,7 +1498,7 @@ class PipelineOrchestrator:
         }
 
     def _normalize_sql_for_compare(self, statement: str) -> str:
-        return re.sub(r"\s+", " ", statement.strip().rstrip(";")).strip().lower()
+        return self._benchmarker.normalize_sql_for_compare(statement)
 
     def _store_energy_estimate(self, record: BenchmarkRunRecord, step_name: str, benchmark) -> dict:
         hardware = self._load_optional_artifact(record, "capture_hardware") or {}
@@ -1569,59 +1538,12 @@ class PipelineOrchestrator:
         first_normal_form_findings: list[dict],
         draft_target_tables: list[dict],
     ) -> list[dict]:
-        reviewable_findings = [
-            finding
-            for finding in first_normal_form_findings
-            if finding.get("pattern") == "delimited_multi_value_column"
-            and str(finding.get("table", "")).strip()
-            and str(finding.get("column", "")).strip()
-        ]
-        if not reviewable_findings:
-            return []
-
-        source_tables = {f"{table.schema}.{table.name}": table for table in schema.tables}
-        findings_by_table: dict[str, list[dict]] = {}
-        for finding in reviewable_findings:
-            table_name = str(finding.get("table", "")).strip()
-            findings_by_table.setdefault(table_name, []).append(finding)
-
-        candidates: list[dict] = []
-        for table_name in sorted(findings_by_table):
-            findings = findings_by_table[table_name]
-            source_table = source_tables.get(table_name)
-            columns = [str(finding.get("column", "")) for finding in findings if str(finding.get("column", ""))]
-            relevant_targets = [
-                table
-                for table in draft_target_tables
-                if table_name in table.get("source_tables", [])
-            ]
-            reasons = [
-                str(finding.get("summary", ""))
-                for finding in findings
-                if str(finding.get("summary", "")).strip()
-            ]
-            if not reasons:
-                reasons = [f"{table_name} has sampled data that looks suspicious for normalization review."]
-
-            candidate_id = re.sub(r"[^a-zA-Z0-9_]+", "_", table_name).strip("_").lower()
-            candidates.append(
-                {
-                    "id": candidate_id,
-                    "source_table": table_name,
-                    "status": "pending",
-                    "normal_forms": ["1NF"],
-                    "suspicious_columns": columns,
-                    "source_column_count": len(source_table.columns) if source_table is not None else 0,
-                    "suspicion_reasons": reasons,
-                    "proposal_summary": (
-                        f"Split {', '.join(columns)} out of {table_name} into child table(s), "
-                        "while keeping the remaining columns in a copied parent table."
-                    ),
-                    "findings": findings,
-                    "proposed_target_tables": relevant_targets,
-                }
-            )
-        return candidates
+        self._sync_component_aliases()
+        return self._dbops.normalization.review_candidates(
+            schema,
+            first_normal_form_findings,
+            draft_target_tables,
+        )
 
     def _plan_target_schema_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
@@ -1632,54 +1554,22 @@ class PipelineOrchestrator:
                 {"summary": "Normalization proposal step was not found."},
             )
 
-        sql_statements = normalization_step.details.get("sql_statements", [])
-        target_tables = normalization_step.details.get("target_tables", [])
-        summary = normalization_step.details.get("summary", "")
-
-        if normalization_step.details.get("review_status") == "pending":
-            return self._mark_planned(
-                record,
-                "create_target_schema",
-                {
-                    "summary": "Target-schema DDL is waiting for table-by-table normalization review decisions.",
-                    "normalization_summary": summary,
-                    "pending_review_count": sum(
-                        1
-                        for review in normalization_step.details.get("normalization_reviews", [])
-                        if review.get("status") == "pending"
-                    ),
-                },
-            )
-
-        if sql_statements:
+        self._sync_component_aliases()
+        plan = self._dbops.normalization.target_schema_plan(
+            normalization_step.details,
+            self._config.postgres.new_database,
+        )
+        details = dict(plan.details)
+        if plan.sql_statements:
             ddl_path = self._store.write_text_artifact(
                 record.run_id,
                 "create_target_schema",
-                "\n\n".join(sql_statements) + "\n",
+                "\n\n".join(plan.sql_statements) + "\n",
                 suffix=".sql",
             )
             record.artifacts["create_target_schema_sql"] = ddl_path
-            return self._mark_planned(
-                record,
-                "create_target_schema",
-                {
-                    "summary": f"Approval-gated SQL is ready for {self._config.postgres.new_database} schema creation.",
-                    "normalization_summary": summary,
-                    "target_table_count": len(target_tables),
-                    "sql_statement_count": len(sql_statements),
-                    "sql_statements": sql_statements,
-                    "sql_path": ddl_path,
-                },
-            )
-
-        return self._mark_planned(
-            record,
-            "create_target_schema",
-            {
-                "summary": "No target-schema SQL was generated because the proposal did not recommend a decomposition.",
-                "normalization_summary": summary,
-            },
-        )
+            details["sql_path"] = ddl_path
+        return self._mark_planned(record, "create_target_schema", details)
 
     def _plan_migration_step(self, record: BenchmarkRunRecord, schema: SchemaSnapshot | None) -> BenchmarkRunRecord:
         if schema is None:
@@ -1688,18 +1578,11 @@ class PipelineOrchestrator:
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
         target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
         try:
-            proposal = self._migration_planner.plan(schema, target_tables)
-            proposal_dict = {
-                "status": proposal.status,
-                "summary": proposal.summary,
-                "reasoning": proposal.rationale,
-                "statements": proposal.statements,
-                "target_tables": target_tables,
-                "source": proposal.source,
-                "llm_request": proposal.request_payload or {},
-            }
-            if proposal.statements:
-                migration_sql = "\n\n".join(statement["sql"] for statement in proposal.statements) + "\n"
+            self._sync_component_aliases()
+            proposal_dict = self._llm_tasks.plan_migration(schema, target_tables)
+            raw_response_text = proposal_dict.pop("raw_response_text", "")
+            if proposal_dict["statements"]:
+                migration_sql = "\n\n".join(statement["sql"] for statement in proposal_dict["statements"]) + "\n"
                 migration_path = self._store.write_text_artifact(
                     record.run_id,
                     "migration_plan",
@@ -1711,9 +1594,9 @@ class PipelineOrchestrator:
             record.artifacts["migrate_data"] = self._store.write_artifact(
                 record.run_id,
                 "migration_plan",
-                proposal_dict | {"raw_response_text": proposal.raw_response_text},
+                proposal_dict | {"raw_response_text": raw_response_text},
             )
-            if proposal.statements:
+            if proposal_dict["statements"]:
                 return self._mark_planned(record, "migrate_data", proposal_dict)
             return self._complete_step(record, "migrate_data", proposal_dict)
         except Exception as exc:
@@ -1831,127 +1714,28 @@ class PipelineOrchestrator:
             )
             return self._complete_step(record, "rewrite_queries", details)
 
-        cache = self._load_query_rewrite_cache()
-        progress = self._query_rewrite_progress_payload(
-            workload_sql,
-            source_statements,
-            prompt_target_tables,
-            migration_statements,
-        )
-        record = self._save_query_rewrite_progress(record, progress, status="running")
-
         try:
-            pending: list[tuple[int, str, str]] = []
-            for index, source_statement in enumerate(source_statements, start=1):
-                progress["current_query_index"] = index
-                progress["current_stage"] = "checking rewrite cache"
+            def save_progress(progress: dict) -> None:
+                nonlocal record
                 record = self._save_query_rewrite_progress(record, progress, status="running")
 
-                cache_key = self._query_rewrite_cache_key(source_statement, prompt_target_tables)
-                cached = cache.get(cache_key)
-                if cached:
-                    query_result = dict(cached)
-                    rewritten_statement = str(query_result.get("rewritten_statement", "")).strip()
-                    validation = self._validate_rewritten_query_statement(rewritten_statement)
-                    if validation.get("status") == "failed":
-                        cache.pop(cache_key, None)
-                        self._save_query_rewrite_cache(cache)
-                        pending.append((index, source_statement, cache_key))
-                        continue
-                    query_result.update({
-                        "query_index": index,
-                        "cache_hit": True,
-                        "stage": "cached",
-                        "validation": validation,
-                    })
-                    progress["query_results"].append(query_result)
-                    progress["statements"].append(rewritten_statement)
-                    progress["completed_query_count"] = len(progress["statements"])
-                    progress["cache_hit_count"] = int(progress.get("cache_hit_count", 0)) + 1
-                    progress["current_stage"] = "cached rewrite reused"
-                    record = self._save_query_rewrite_progress(record, progress, status="running")
-                    continue
-                pending.append((index, source_statement, cache_key))
-
-            for batch_number, pending_batch in enumerate(self._query_rewrite_batches(pending), start=1):
-                progress["current_query_index"] = pending_batch[0][0]
-                progress["current_stage"] = (
-                    f"sending rewrite batch {batch_number} "
-                    f"({len(pending_batch)} query statement(s)) to the LLM"
-                )
-                record = self._save_query_rewrite_progress(record, progress, status="running")
-                pending_sql = "\n\n".join(statement for _, statement, _ in pending_batch)
-                proposal = self._workload_planner.rewrite(
+            result = self._benchmarker.query_migration.rewrite_incremental(
+                workload_sql=workload_sql,
+                source_statements=source_statements,
+                target_tables=prompt_target_tables,
+                migration_statements=migration_statements,
+                rewrite_batch=lambda pending_sql, target_tables, statements, batch_size: self._workload_planner.rewrite(
                     pending_sql,
-                    prompt_target_tables,
-                    migration_statements,
-                    batch_size=QUERY_REWRITE_BATCH_SIZE,
-                )
-                if len(proposal.statements) != len(pending_batch):
-                    raise WorkloadRewriteError(
-                        (
-                            f"The LLM returned {len(proposal.statements)} rewritten statement(s), "
-                            f"but IlvesBench expected {len(pending_batch)} for batch {batch_number}."
-                        ),
-                        raw_response_text=proposal.raw_response_text or "",
-                        request_payload=proposal.request_payload or {},
-                    )
-                if proposal.request_payload:
-                    progress["llm_requests"].append(proposal.request_payload)
-                if proposal.raw_response_text:
-                    progress["raw_responses"].append(f"Rewrite batch {batch_number} response:\n{proposal.raw_response_text}")
-
-                for offset, (index, source_statement, cache_key) in enumerate(pending_batch):
-                    rewritten_statement = proposal.statements[offset]
-                    progress["current_query_index"] = index
-                    progress["current_stage"] = f"validating rewritten query {index} against {self._config.postgres.new_database}"
-                    progress["last_rewritten_statement"] = rewritten_statement
-                    record = self._save_query_rewrite_progress(record, progress, status="running")
-                    validation = self._validate_rewritten_query_statement(rewritten_statement)
-                    validation_passed = validation.get("status") == "passed"
-                    query_result = {
-                        "query_index": index,
-                        "source_statement": source_statement,
-                        "rewritten_statement": rewritten_statement,
-                        "status": "completed" if validation_passed else "failed",
-                        "stage": "target_validation_passed" if validation_passed else "target_validation_failed",
-                        "source": proposal.source,
-                        "reasoning": proposal.rationale,
-                        "cache_hit": False,
-                        "validation": validation,
-                        "raw_response_text": proposal.raw_response_text or "",
-                        "llm_request": proposal.request_payload or {},
-                    }
-                    progress["query_results"].append(query_result)
-                    progress["processed_query_count"] = len(progress["query_results"])
-                    if validation_passed:
-                        progress["statements"].append(rewritten_statement)
-                        progress["completed_query_count"] = len(progress["statements"])
-                        progress["current_stage"] = f"query {index} validated and saved"
-                        cache[cache_key] = {
-                            "source_statement": source_statement,
-                            "rewritten_statement": rewritten_statement,
-                            "source": proposal.source,
-                            "reasoning": proposal.rationale,
-                            "validation": validation,
-                            "target_table_count": len(prompt_target_tables),
-                            "saved_at": datetime.now(UTC).isoformat(),
-                        }
-                        self._save_query_rewrite_cache(cache)
-                    else:
-                        progress["current_stage"] = f"query {index} failed target validation"
-                    record = self._save_query_rewrite_progress(record, progress, status="running")
-
-            ordered_results = sorted(progress["query_results"], key=lambda item: int(item.get("query_index", 0) or 0))
-            ordered_statements = [
-                str(item.get("rewritten_statement", "")).strip()
-                for item in ordered_results
-                if str(item.get("rewritten_statement", "")).strip()
-                and item.get("validation", {}).get("status") == "passed"
-            ]
-            invalid_count = sum(1 for item in ordered_results if item.get("validation", {}).get("status") == "failed")
-            progress["query_results"] = ordered_results
-            progress["statements"] = ordered_statements
+                    target_tables,
+                    statements,
+                    batch_size=batch_size,
+                ),
+                validate_statement=self._validate_rewritten_query_statement,
+                on_progress=save_progress,
+            )
+            progress = result.progress
+            ordered_statements = result.ordered_statements
+            invalid_count = result.invalid_count
             sql_text = "\n\n".join(ordered_statements) + "\n"
             sql_path = self._store.write_text_artifact(
                 record.run_id,
@@ -1959,15 +1743,6 @@ class PipelineOrchestrator:
                 sql_text,
                 suffix=".sql",
             )
-            if not ordered_statements:
-                raise WorkloadRewriteError(
-                    (
-                        f"None of the {len(source_statements)} rewritten query statement(s) validated against "
-                        f"{self._config.postgres.new_database}; no pgbench workload was generated."
-                    ),
-                    raw_response_text="\n\n".join(progress["raw_responses"]),
-                    request_payload=self._query_rewrite_request_summary(progress, len(source_statements)),
-                )
             completed_details = progress | {
                 "status": "planned",
                 "summary": (
@@ -1980,8 +1755,8 @@ class PipelineOrchestrator:
                 "failed_query_count": invalid_count,
                 "current_stage": "completed",
                 "workload_path": sql_path,
-                "raw_response_text": "\n\n".join(progress["raw_responses"]),
-                "llm_request": self._query_rewrite_request_summary(progress, len(source_statements)),
+                "raw_response_text": self._benchmarker.query_migration.raw_response_text(progress),
+                "llm_request": self._benchmarker.query_migration.request_summary(progress, len(source_statements)),
                 "source": "llm_incremental",
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
@@ -1990,13 +1765,12 @@ class PipelineOrchestrator:
                 completed_details,
             )
             return self._complete_step(record, "rewrite_queries", completed_details)
-        except WorkloadRewriteError as exc:
+        except QueryMigrationExecutionError as exc:
+            progress = exc.progress
             raw_response_text = exc.raw_response_text or (
-                "\n\n".join(progress["raw_responses"])
+                self._benchmarker.query_migration.raw_response_text(progress)
                 or "[No LLM response text was received before query migration failed.]"
             )
-            if exc.raw_response_text and exc.raw_response_text not in "\n\n".join(progress["raw_responses"]):
-                progress["raw_responses"].append(exc.raw_response_text)
             failure_details = progress | {
                 "status": "failed",
                 "summary": str(exc),
@@ -2006,7 +1780,8 @@ class PipelineOrchestrator:
                 "source_query_text": workload_sql,
                 "target_tables": prompt_target_tables,
                 "migration_statements": migration_statements,
-                "llm_request": exc.request_payload or self._query_rewrite_request_summary(progress, len(source_statements)),
+                "llm_request": exc.request_payload
+                or self._benchmarker.query_migration.request_summary(progress, len(source_statements)),
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
                 record.run_id,
@@ -2022,12 +1797,18 @@ class PipelineOrchestrator:
                 planned_only=False,
             )
         except Exception as exc:
+            progress = self._benchmarker.query_migration.progress_payload(
+                workload_sql,
+                source_statements,
+                prompt_target_tables,
+                migration_statements,
+            )
             failure_details = progress | {
                 "status": "failed",
                 "summary": str(exc),
-                "raw_response_text": "\n\n".join(progress["raw_responses"])
+                "raw_response_text": self._benchmarker.query_migration.raw_response_text(progress)
                 or "[No LLM response text was received before query migration failed.]",
-                "llm_request": self._query_rewrite_request_summary(progress, len(source_statements)),
+                "llm_request": self._benchmarker.query_migration.request_summary(progress, len(source_statements)),
             }
             record.artifacts["rewrite_queries"] = self._store.write_artifact(
                 record.run_id,
@@ -2043,42 +1824,6 @@ class PipelineOrchestrator:
                 planned_only=False,
             )
 
-    def _query_rewrite_progress_payload(
-        self,
-        workload_sql: str,
-        source_statements: list[str],
-        target_tables: list[dict],
-        migration_statements: list[dict],
-    ) -> dict:
-        return {
-            "status": "running",
-            "summary": (
-                f"Rewriting {len(source_statements)} query statement(s) for "
-                f"{self._config.postgres.new_database} in batches of up to {QUERY_REWRITE_BATCH_SIZE}."
-            ),
-            "mode": "incremental",
-            "total_query_count": len(source_statements),
-            "completed_query_count": 0,
-            "cache_hit_count": 0,
-            "current_query_index": 0,
-            "current_stage": "starting",
-            "statement_count": 0,
-            "statements": [],
-            "query_results": [],
-            "raw_responses": [],
-            "raw_response_text": "",
-            "llm_requests": [],
-            "llm_request": {
-                "mode": "incremental",
-                "total_query_count": len(source_statements),
-                "batches": [],
-            },
-            "source_query_text": workload_sql,
-            "target_tables": target_tables,
-            "target_table_count": len(target_tables),
-            "migration_statements": migration_statements,
-        }
-
     def _save_query_rewrite_progress(
         self,
         record: BenchmarkRunRecord,
@@ -2086,15 +1831,8 @@ class PipelineOrchestrator:
         *,
         status: str,
     ) -> BenchmarkRunRecord:
-        statements = [str(statement) for statement in progress.get("statements", []) if str(statement).strip()]
-        artifact_payload = dict(progress)
-        artifact_payload["statement_count"] = len(statements)
-        artifact_payload["completed_query_count"] = len(statements)
-        artifact_payload["raw_response_text"] = "\n\n".join(progress.get("raw_responses", []))
-        artifact_payload["llm_request"] = self._query_rewrite_request_summary(
-            progress,
-            int(progress.get("total_query_count", 0) or 0),
-        )
+        statements = self._benchmarker.query_migration.valid_progress_statements(progress)
+        artifact_payload = self._benchmarker.query_migration.artifact_payload(progress)
         if statements:
             artifact_payload["partial_workload_path"] = self._store.write_text_artifact(
                 record.run_id,
@@ -2115,20 +1853,6 @@ class PipelineOrchestrator:
             error=None,
             planned_only=False,
         )
-
-    def _query_rewrite_request_summary(self, progress: dict, total_query_count: int) -> dict:
-        return {
-            "mode": "incremental",
-            "total_query_count": total_query_count,
-            "batch_size": QUERY_REWRITE_BATCH_SIZE,
-            "batches": progress.get("llm_requests", []),
-        }
-
-    def _query_rewrite_batches(self, pending: list[tuple[int, str, str]]) -> list[list[tuple[int, str, str]]]:
-        return [
-            pending[index : index + QUERY_REWRITE_BATCH_SIZE]
-            for index in range(0, len(pending), QUERY_REWRITE_BATCH_SIZE)
-        ]
 
     def _summary_table_target_tables(self, record: BenchmarkRunRecord) -> list[dict]:
         summary_step = next((step for step in record.steps if step.name == "suggest_summary_tables"), None)
@@ -2199,33 +1923,6 @@ class PipelineOrchestrator:
             "errors": errors,
             "target_database": self._config.postgres.new_database,
         }
-
-    def _query_rewrite_cache_path(self) -> Path:
-        return self._config.resolve_path(self._config.storage.artifact_dir) / "query_rewrite_cache.json"
-
-    def _load_query_rewrite_cache(self) -> dict:
-        path = self._query_rewrite_cache_path()
-        if not path.exists():
-            return {}
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    def _save_query_rewrite_cache(self, cache: dict) -> None:
-        path = self._query_rewrite_cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cache, ensure_ascii=True, indent=2), encoding="utf-8")
-
-    def _query_rewrite_cache_key(self, source_statement: str, target_tables: list[dict]) -> str:
-        payload = {
-            "original_database": self._config.postgres.original_database,
-            "new_database": self._config.postgres.new_database,
-            "schemas": list(self._config.postgres.schemas),
-            "source_statement": re.sub(r"\s+", " ", source_statement).strip(),
-            "target_tables": target_tables,
-        }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")).hexdigest()
 
     def _plan_query_validation_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
@@ -2372,11 +2069,7 @@ class PipelineOrchestrator:
             return [{"statement": "", "error": str(exc)}]
 
     def _split_sql_statements(self, text: str) -> list[str]:
-        return [
-            statement.strip() + ";"
-            for statement in text.split(";")
-            if statement.strip()
-        ]
+        return self._benchmarker.split_sql_statements(text)
 
     def _plan_index_recommendations_step(
         self,
@@ -2733,16 +2426,8 @@ class PipelineOrchestrator:
         )
 
     def _source_tables_for_migration(self, schema: SchemaSnapshot, target_tables: list[dict]):
-        source_table_names = {
-            source_table
-            for table in target_tables
-            for source_table in table.get("source_tables", [])
-        }
-        return [
-            table
-            for table in schema.tables
-            if f"{table.schema}.{table.name}" in source_table_names
-        ]
+        self._sync_component_aliases()
+        return self._dbops.migration.source_tables_for_migration(schema, target_tables)
 
     def _resolve_workload_path(self) -> Path | None:
         return self._osops.resolve_workload_path()

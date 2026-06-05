@@ -44,6 +44,7 @@ Package: `ilvesbench.benchmarker`
 Benchmarker owns workload and benchmark execution:
 
 - workload profile and summary-table candidate planning
+- source-to-target query migration progress, batching, and cache state
 - pgbench script/workload preparation
 - pgbench parameter handling
 - pgbench execution
@@ -85,4 +86,3 @@ The migration strategy is incremental:
 4. Simplify the frontend so it renders state and invokes actions, rather than
    enforcing workflow rules itself.
 5. Split or replace the browser UI without changing backend component contracts.
-
