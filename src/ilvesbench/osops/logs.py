@@ -59,12 +59,14 @@ class PostgresLogParser:
             if pid in open_transactions:
                 open_transactions[pid].append(sql)
 
+        total_count = sum(query_counts.values())
         top_queries = [
             QueryObservation(
                 fingerprint=fingerprint,
                 sample_sql=query_samples[fingerprint],
                 count=count,
                 total_duration_ms=round(query_durations[fingerprint], 3),
+                proportion=round(count / total_count, 6) if total_count else 0.0,
             )
             for fingerprint, count in query_counts.most_common(10)
         ]

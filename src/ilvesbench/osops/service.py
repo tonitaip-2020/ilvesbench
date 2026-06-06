@@ -96,7 +96,10 @@ class OSOpsService:
                 "checked_workload_path": str(workload_path) if workload_path else "",
             }
         staged_query_text = "\n\n".join(
-            f"-- observed query {index} | count {query.count}\n{query.sample_sql.strip().rstrip(';')};"
+            (
+                f"-- observed query {index} | count {query.count} | proportion {query.proportion * 100:.3f}%\n"
+                f"{query.sample_sql.strip().rstrip(';')};"
+            )
             for index, query in enumerate(log_summary.top_queries, start=1)
             if query.sample_sql.strip()
         )
@@ -110,4 +113,3 @@ class OSOpsService:
             "sampled_transactions": [to_dict(transaction) for transaction in log_summary.sampled_transactions],
             "staged_query_text": staged_query_text,
         }
-

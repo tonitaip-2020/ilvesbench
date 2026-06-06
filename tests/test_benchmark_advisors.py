@@ -13,7 +13,34 @@ from ilvesbench.benchmark.energy import BenchmarkComparator, EnergyEstimator
 from ilvesbench.benchmark.index_advisor import IndexAdvisor
 from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
 from ilvesbench.config import EnergyConfig, PgBenchConfig
-from ilvesbench.models import BenchmarkMetrics, LogSummary, QueryObservation
+from ilvesbench.models import (
+    BenchmarkMetrics,
+    ColumnMetadata,
+    IndexMetadata,
+    LLMResult,
+    LogSummary,
+    QueryObservation,
+    SchemaSnapshot,
+    TableMetadata,
+    UniqueConstraintMetadata,
+)
+
+
+class StaticGateway:
+    def __init__(self, responses: list[dict]) -> None:
+        self._responses = list(responses)
+        self.messages = []
+
+    def generate(self, messages, model=None, max_tokens=256) -> LLMResult:
+        self.messages.append(messages)
+        payload = self._responses.pop(0) if self._responses else {"status": "no_recommendations", "recommendations": []}
+        import json
+        return LLMResult(
+            backend="fake",
+            model=model or "fake-model",
+            response_text=json.dumps(payload),
+            raw_response={},
+        )
 
 
 class BenchmarkAdvisorTests(unittest.TestCase):
@@ -40,6 +67,140 @@ class BenchmarkAdvisorTests(unittest.TestCase):
         self.assertEqual(recommendation.table, "items_lookup")
         self.assertEqual(recommendation.columns, ["name"])
         self.assertIn("CREATE INDEX IF NOT EXISTS", recommendation.sql)
+
+    def test_index_advisor_accepts_llm_compound_expression_and_drop_recommendations(self) -> None:
+        gateway = StaticGateway([
+            {
+                "status": "recommended",
+                "summary": "compound and expression indexes",
+                "recommendations": [
+                    {
+                        "action": "create",
+                        "table": "items",
+                        "columns": ["category", "created_at"],
+                        "name": "idx_items_category_created_at",
+                        "sql": 'CREATE INDEX IF NOT EXISTS "idx_items_category_created_at" ON "items" ("category", "created_at" DESC);',
+                        "reason": "supports category filter plus ordering",
+                        "confidence": 0.86,
+                        "index_type": "btree",
+                    },
+                    {
+                        "action": "create",
+                        "table": "items",
+                        "columns": [],
+                        "expressions": ["lower(name)"],
+                        "name": "idx_items_lower_name",
+                        "sql": 'CREATE INDEX IF NOT EXISTS "idx_items_lower_name" ON "items" (lower("name"));',
+                        "reason": "supports case-insensitive lookup",
+                        "confidence": 0.82,
+                        "index_type": "btree",
+                    },
+                    {
+                        "action": "drop",
+                        "table": "items",
+                        "columns": ["old_col"],
+                        "name": "idx_items_old_col",
+                        "sql": 'DROP INDEX IF EXISTS "idx_items_old_col";',
+                        "reason": "redundant with workload-aware compound index",
+                        "confidence": 0.71,
+                    },
+                ],
+            }
+        ])
+        advisor = IndexAdvisor(llm=gateway)
+        schema = SchemaSnapshot(
+            database="target_db",
+            collected_at="2026-06-05T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="items",
+                    columns=[
+                        ColumnMetadata(name="id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="category", data_type="text", is_nullable=True),
+                        ColumnMetadata(name="created_at", data_type="timestamp", is_nullable=True),
+                        ColumnMetadata(name="name", data_type="text", is_nullable=True),
+                        ColumnMetadata(name="old_col", data_type="text", is_nullable=True),
+                    ],
+                    indexes=[
+                        IndexMetadata(
+                            name="idx_items_old_col",
+                            definition='CREATE INDEX idx_items_old_col ON public.items USING btree (old_col)',
+                            is_unique=False,
+                        )
+                    ],
+                    unique_constraints=[
+                        UniqueConstraintMetadata(name="items_pkey", columns=["id"]),
+                    ],
+                )
+            ],
+        )
+
+        plan = advisor.recommend(
+            schema=schema,
+            target_tables=[],
+            workload_sql="SELECT * FROM items WHERE category = 'movie' ORDER BY created_at DESC; SELECT * FROM items WHERE lower(name) = 'x';",
+            use_llm=True,
+        )
+
+        self.assertEqual(plan.status, "recommended")
+        self.assertEqual(plan.source, "llm")
+        self.assertEqual(len(plan.recommendations), 3)
+        self.assertEqual(plan.recommendations[0].columns, ["category", "created_at"])
+        self.assertEqual(plan.recommendations[1].expressions, ["lower(name)"])
+        self.assertEqual(plan.recommendations[2].action, "drop")
+
+    def test_index_advisor_batches_queries_and_carries_previous_recommendations(self) -> None:
+        gateway = StaticGateway([
+            {
+                "status": "recommended",
+                "recommendations": [
+                    {
+                        "action": "create",
+                        "table": "items",
+                        "columns": ["category"],
+                        "name": "idx_items_category",
+                        "sql": 'CREATE INDEX IF NOT EXISTS "idx_items_category" ON "items" ("category");',
+                        "reason": "batch one",
+                        "confidence": 0.7,
+                    }
+                ],
+            },
+            {
+                "status": "recommended",
+                "recommendations": [
+                    {
+                        "action": "create",
+                        "table": "items",
+                        "columns": ["created_at"],
+                        "name": "idx_items_created_at",
+                        "sql": 'CREATE INDEX IF NOT EXISTS "idx_items_created_at" ON "items" ("created_at");',
+                        "reason": "batch two",
+                        "confidence": 0.7,
+                    }
+                ],
+            },
+        ])
+        advisor = IndexAdvisor(llm=gateway, query_batch_size=1)
+
+        plan = advisor.recommend(
+            schema=None,
+            target_tables=[
+                {
+                    "name": "items",
+                    "columns": [{"name": "category"}, {"name": "created_at"}],
+                    "primary_key": [],
+                }
+            ],
+            workload_sql="SELECT * FROM items WHERE category = 'x'; SELECT * FROM items ORDER BY created_at;",
+            use_llm=True,
+        )
+
+        self.assertEqual(len(gateway.messages), 2)
+        second_prompt = gateway.messages[1][1]["content"]
+        self.assertIn("previous_recommendations", second_prompt)
+        self.assertIn("idx_items_category", second_prompt)
+        self.assertEqual(len(plan.recommendations), 2)
 
     def test_tuning_advisor_generates_memory_and_parallelism_knobs(self) -> None:
         advisor = PostgresTuningAdvisor()

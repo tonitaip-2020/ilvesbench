@@ -609,7 +609,7 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(rewrite_step.status, "completed")
             self.assertTrue(rewrite_step.details["workload_path"].endswith(".sql"))
             self.assertEqual(pgbench_new_step.status, "planned")
-            self.assertEqual(pgbench_new_step.details["workload_path"], rewrite_step.details["workload_path"])
+            self.assertIn("pgbench_workload_db_new", pgbench_new_step.details["workload_path"])
 
     def test_artifact_loading_recovers_from_moved_windows_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -9,6 +9,7 @@ from ilvesbench.models import LogSummary, QueryObservation
 
 LINE_COMMENT_RE = re.compile(r"--.*?$", re.MULTILINE)
 BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+PGBENCH_META_COMMAND_RE = re.compile(r"^\s*\\.*$", re.MULTILINE)
 WS_RE = re.compile(r"\s+")
 
 
@@ -21,22 +22,25 @@ class WorkloadFileParser:
         raw = target.read_text(encoding="utf-8", errors="replace")
         stripped = LINE_COMMENT_RE.sub("", raw)
         stripped = BLOCK_COMMENT_RE.sub("", stripped)
+        stripped = PGBENCH_META_COMMAND_RE.sub("", stripped)
 
         query_counts: Counter[str] = Counter()
         query_samples: dict[str, str] = {}
         for statement in self._split_statements(stripped):
-            normalized = self._fingerprint(statement)
-            query_counts[normalized] += 1
-            query_samples.setdefault(normalized, statement)
+            fingerprint = self._fingerprint(statement)
+            query_counts[fingerprint] += 1
+            query_samples.setdefault(fingerprint, statement)
 
+        total_count = sum(query_counts.values())
         top_queries = [
             QueryObservation(
                 fingerprint=fingerprint,
                 sample_sql=query_samples[fingerprint],
                 count=count,
                 total_duration_ms=0.0,
+                proportion=round(count / total_count, 6) if total_count else 0.0,
             )
-            for fingerprint, count in query_counts.most_common(10)
+            for fingerprint, count in query_counts.most_common()
         ]
 
         return LogSummary(
@@ -77,7 +81,4 @@ class WorkloadFileParser:
         return statements
 
     def _fingerprint(self, sql: str) -> str:
-        compact = WS_RE.sub(" ", sql.strip())
-        compact = re.sub(r"\b\d+\b", "?", compact)
-        compact = re.sub(r"'[^']*'", "'?'", compact)
-        return compact
+        return WS_RE.sub(" ", sql.strip())

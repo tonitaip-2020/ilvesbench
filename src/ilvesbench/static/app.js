@@ -224,8 +224,12 @@ function rawJsonBlock(title, payload) {
 }
 
 function observedQuerySql(logs) {
+  const total = (logs.top_queries || []).reduce((sum, query) => sum + Number(query.count || 0), 0);
   return (logs.top_queries || [])
-    .map((query, index) => `-- observed query ${index + 1} | count ${query.count || 0}\n${query.sample_sql || query.fingerprint || ""}`)
+    .map((query, index) => {
+      const proportion = Number(query.proportion || 0) || (total ? Number(query.count || 0) / total : 0);
+      return `-- observed query ${index + 1} | count ${query.count || 0} | proportion ${(proportion * 100).toFixed(3)}%\n${query.sample_sql || query.fingerprint || ""}`;
+    })
     .filter(Boolean);
 }
 
@@ -273,6 +277,44 @@ function renderNormalizationReviews(run, reviews) {
                 </button>
                 <button type="button" class="action-button" data-review-action="rejected" data-review-id="${escapeHtml(review.id)}" data-run-id="${escapeHtml(run.run_id)}">
                   <span>Reject for this run</span>
+                </button>
+              </div>
+            ` : ""}
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderSummaryTableReviews(run, candidates) {
+  if (!candidates.length) return `<div class="empty-inline">No summary-table candidates yet.</div>`;
+  return `
+    <div class="candidate-list">
+      ${candidates.map((candidate) => {
+        const canDecide = run.run_id && candidate.status === "pending";
+        return `
+          <article class="candidate-card review-${escapeHtml(candidate.status || "pending")}">
+            <div class="review-head">
+              <div>
+                <strong>${escapeHtml(candidate.label || candidate.table_name || "Summary table")}</strong>
+                <span>${escapeHtml(candidate.pattern || "summary table")}</span>
+              </div>
+              ${pill((candidate.status || "pending").replaceAll("_", " "), candidate.status || "pending")}
+            </div>
+            <p>${escapeHtml(candidate.reason || "")}</p>
+            <div class="review-facts">
+              <span>Table: ${escapeHtml(candidate.table_name || "n/a")}</span>
+              <span>Queries: ${escapeHtml((candidate.query_ids || []).join(", ") || "not specified")}</span>
+              ${candidate.freshness_expectation ? `<span>Freshness: ${escapeHtml(candidate.freshness_expectation)}</span>` : ""}
+            </div>
+            ${canDecide ? `
+              <div class="review-actions">
+                <button type="button" class="action-button primary-approval" data-summary-review-action="approved" data-summary-review-id="${escapeHtml(candidate.id)}" data-run-id="${escapeHtml(run.run_id)}">
+                  Accept
+                </button>
+                <button type="button" class="action-button" data-summary-review-action="rejected" data-summary-review-id="${escapeHtml(candidate.id)}" data-run-id="${escapeHtml(run.run_id)}">
+                  Reject
                 </button>
               </div>
             ` : ""}
@@ -826,6 +868,7 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const createStep = step(run, "create_target_schema");
   const migrateStep = step(run, "migrate_data");
   const rewriteStep = step(run, "rewrite_queries");
+  const summaryStep = step(run, "suggest_summary_tables");
   const normalizationStep = step(run, "propose_3nf_schema");
   const workloadStep = step(run, "extract_workload_logs");
   const indexRecommendStep = step(run, "optimize_indexes");
@@ -847,6 +890,15 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const canGenerateOrRunMigration = readiness.structureReady
     && (hasMigrationSql || hasTargetTables)
     && ["planned", "failed", "pending", "completed"].includes(migrationStatus);
+  const summaryReviewStatus = summaryStep.details?.review_status || "";
+  const summaryCreationStatus = summaryStep.details?.creation_status || "";
+  const summaryResolved = ["created", "not_recommended", "not_needed"].includes(summaryCreationStatus);
+  const summaryNeedsCreation = summaryCreationStatus === "approval_required";
+  const summaryBlockingReason = summaryNeedsCreation
+    ? "Create approved summary table structures before query rewrites and index recommendations."
+    : !summaryResolved
+    ? "Discover and review summary-table recommendations first."
+    : "";
 
   actions.push(actionButton(
     run,
@@ -881,6 +933,14 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   ));
   actions.push(actionButton(
     run,
+    "discover-summary-tables",
+    "Recommend summary tables",
+    "",
+    selectionOnlyReason || (!readiness.structureReady ? `Create ${targetName} structure first.` : !querySourceReady ? "Needs a PostgreSQL log or workload SQL file first." : summaryStep.status === "running" ? "Summary-table recommendation discovery is already running." : summaryReviewStatus === "pending" ? "Review the current summary-table recommendations first." : summaryCreationStatus === "created" ? "Summary table structures have already been created." : ""),
+    true,
+  ));
+  actions.push(actionButton(
+    run,
     "regenerate-rewrite",
     `Rewrite queries for ${targetName}`,
     "",
@@ -888,6 +948,8 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
       ? `Needs ${targetName} structure first.`
       : !querySourceReady
       ? "Needs a PostgreSQL log or workload SQL file first."
+      : summaryBlockingReason
+      ? summaryBlockingReason
       : (!run.selectionOnly && !["planned", "completed", "failed", "pending"].includes(rewriteStep.status || "pending"))
       ? "Query rewrites are not ready yet."
       : "",
@@ -895,10 +957,18 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   ));
   actions.push(actionButton(
     run,
+    "discover-index-recommendations",
+    "Discover index recommendations",
+    "",
+    selectionOnlyReason || (!readiness.structureReady ? `Create ${targetName} structure first.` : !querySourceReady ? "Needs rewritten queries or a workload source first." : summaryBlockingReason ? summaryBlockingReason : indexRecommendStep.status === "running" ? "Index recommendation discovery is already running." : ""),
+    true,
+  ));
+  actions.push(actionButton(
+    run,
     "create-secondary-indexes",
-    `Create secondary indexes${indexSqlCount ? ` (${indexSqlCount})` : ""}`,
+    `Apply index changes${indexSqlCount ? ` (${indexSqlCount})` : ""}`,
     "primary-approval",
-    selectionOnlyReason || (!readiness.structureReady ? `Create ${targetName} structure first.` : hasIndexSql && indexCreateStep.status !== "completed" ? "" : indexCreateStep.status === "completed" ? "Secondary indexes are already created or not needed." : indexRecommendStep.status === "completed" ? "No secondary-index SQL is available." : "Run or regenerate index recommendations first."),
+    selectionOnlyReason || (!readiness.structureReady ? `Create ${targetName} structure first.` : hasIndexSql && indexCreateStep.status !== "completed" ? "" : indexCreateStep.status === "completed" ? "Approved index changes are already applied or not needed." : indexRecommendStep.status === "completed" ? "No index-change SQL is available." : "Discover index recommendations first."),
   ));
   actions.push(actionButton(
     run,
@@ -1132,7 +1202,12 @@ function renderWorkload(run, artifacts) {
   const summaryArtifact = artifactOrStep(artifacts, "suggest_summary_tables", run);
   const candidates = summaryArtifact.candidates || summaryTables.details?.candidates || [];
   const summarySql = summaryArtifact.sql_statements || summaryTables.details?.sql_statements || [];
+  const pendingSummaryCount = candidates.filter((candidate) => candidate.status === "pending").length;
+  const approvedSummaryCount = candidates.filter((candidate) => candidate.status === "approved").length;
   const rewrittenStatements = rewrite.details?.statements || [];
+  const generatedWorkloadArtifact = artifactOrStep(artifacts, "generate_benchmark_workload", run);
+  const workloadMix = generatedWorkloadArtifact.query_mix || generatedWorkload.details?.query_mix || [];
+  const generatedWorkloadSql = generatedWorkloadArtifact.workload_sql || "";
   const stagedQueryText = rewriteArtifact.source_query_text || rewrite.details?.source_query_text || "";
   const llmRequest = rewriteArtifact.llm_request || rewrite.details?.llm_request || {};
   const rawResponse = rewriteArtifact.raw_response_text || rewrite.details?.raw_response_text || "";
@@ -1176,6 +1251,7 @@ function renderWorkload(run, artifacts) {
             ${metricCard("Validation", validation.details?.status || validation.status || "placeholder")}
             ${metricCard("Validation failed", formatNumber(validation.details?.failed_count || 0))}
             ${metricCard("Workload mix", generatedWorkload.details?.status || generatedWorkload.status || "placeholder")}
+            ${metricCard("Distinct workload queries", formatNumber(workloadMix.length))}
           </div>
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("regenerate-rewrite") || html.includes("run-pgbench-new")).join("")}</div>
           ${renderQueryRewriteProgress(rewrite)}
@@ -1184,15 +1260,35 @@ function renderWorkload(run, artifacts) {
           ${rawJsonBlock("Query rewrite data sent to LLM", llmRequest)}
           ${rawJsonBlock("Query rewrite LLM raw response", rawResponse)}
           ${rawJsonBlock("Query validation comparisons", validation.details?.query_results || [])}
+          ${rawJsonBlock("Generated workload proportions", workloadMix)}
+          ${rawSqlBlock("Generated pgbench workload SQL", generatedWorkloadSql, generatedWorkloadArtifact.workload_path || generatedWorkload.details?.workload_path || "")}
           ${rawSqlBlock(`Raw rewritten query SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
         </article>
         <article class="workspace-panel">
           <h2>Summary Tables</h2>
           <div class="metric-grid">
             ${metricCard("Candidates", formatNumber(candidates.length))}
+            ${metricCard("Approved", formatNumber(approvedSummaryCount))}
+            ${metricCard("Review", summaryTables.details?.review_status || summaryTables.status || "pending")}
             ${metricCard("Creation", summaryTables.details?.creation_status || "placeholder")}
           </div>
           <div class="action-shelf">
+            ${actionButton(
+              run,
+              "discover-summary-tables",
+              "Recommend summary tables",
+              "",
+              run.selectionOnly
+                ? "Start a run for this database pair first."
+                : summaryTables.status === "running"
+                ? "Summary-table recommendation discovery is already running."
+                : pendingSummaryCount
+                ? "Review the current summary-table recommendations first."
+                : summaryTables.details?.creation_status === "created"
+                ? "Summary table structures have already been created."
+                : "",
+              true,
+            )}
             ${actionButton(
               run,
               "create-summary-tables",
@@ -1200,6 +1296,8 @@ function renderWorkload(run, artifacts) {
               "primary-approval",
               run.selectionOnly
                 ? "Start a run for this database pair first."
+                : pendingSummaryCount
+                ? "Approve or reject each summary-table candidate first."
                 : !summarySql.length
                 ? "No summary-table CREATE TABLE SQL is available."
                 : summaryTables.details?.creation_status === "created"
@@ -1208,17 +1306,9 @@ function renderWorkload(run, artifacts) {
             )}
           </div>
           ${renderStepCards(run, ["suggest_summary_tables"])}
-          ${candidates.length ? `
-            <div class="candidate-list">
-              ${candidates.map((candidate) => `
-                <article class="candidate-card">
-                  <strong>${escapeHtml(candidate.label)}</strong>
-                  <span>${escapeHtml(candidate.pattern)}</span>
-                  <p>${escapeHtml(candidate.reason)}</p>
-                </article>
-              `).join("")}
-            </div>
-          ` : `<div class="empty-inline">No summary-table candidates yet.</div>`}
+          ${renderSummaryTableReviews(run, candidates)}
+          ${rawJsonBlock("Summary table data sent to LLM", summaryArtifact.llm_request || summaryTables.details?.llm_request || {})}
+          ${rawJsonBlock("Summary table LLM raw response", summaryArtifact.raw_response_text || summaryTables.details?.raw_response_text || "")}
           ${rawSqlBlock("Raw summary-table CREATE TABLE SQL", summarySql, summaryArtifact.sql_path || summaryTables.details?.sql_path || "")}
         </article>
       </div>
@@ -1232,6 +1322,7 @@ function renderPhysical(run, artifacts = {}) {
   const tuning = step(run, "tune_postgresql_conf");
   const indexArtifact = artifactOrStep(artifacts, "optimize_indexes", run);
   const indexSql = secondaryIndexSqlStatements(run);
+  const recommendations = indexArtifact.recommendations || indexes.details?.recommendations || [];
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
@@ -1239,15 +1330,19 @@ function renderPhysical(run, artifacts = {}) {
           <h2>Secondary Indexes</h2>
           <div class="metric-grid">
             ${metricCard("Recommendations", formatNumber(indexes.details?.recommendation_count || 0))}
-            ${metricCard("Create status", indexCreation.status || "pending")}
+            ${metricCard("Create", formatNumber(indexes.details?.create_recommendation_count || recommendations.filter((item) => item.action === "create").length || 0))}
+            ${metricCard("Drop", formatNumber(indexes.details?.drop_recommendation_count || recommendations.filter((item) => item.action === "drop").length || 0))}
+            ${metricCard("Apply status", indexCreation.status || "pending")}
             ${metricCard("SQL statements", formatNumber(indexSql.length))}
           </div>
-          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("create-secondary-indexes")).join("")}</div>
+          <div class="action-shelf">${targetActions(run).filter((html) => html.includes("discover-index-recommendations") || html.includes("create-secondary-indexes")).join("")}</div>
           ${renderStepCards(run, ["optimize_indexes", "create_secondary_indexes"])}
-          ${rawSqlBlock("Raw CREATE INDEX SQL", indexSql)}
+          ${rawSqlBlock("Raw index-change SQL", indexSql)}
           ${rawJsonBlock("Index recommendation details", {
-            recommendations: indexArtifact.recommendations || indexes.details?.recommendations || [],
+            recommendations,
             sql_statements: indexArtifact.sql_statements || indexes.details?.sql_statements || indexSql,
+            llm_request: indexArtifact.llm_request || indexes.details?.llm_request || {},
+            raw_response_text: indexArtifact.raw_response_text || indexes.details?.raw_response_text || "",
             source: indexArtifact.source || indexes.details?.source || "",
           })}
         </article>
@@ -1543,9 +1638,11 @@ async function triggerRunAction(runId, action) {
     "reset-target-db": `Dropping ${targetName}...`,
     "truncate-target-data": `Truncating ${targetName} data...`,
     "migrate-data": "Migrating data...",
-    "regenerate-rewrite": "Migrating queries...",
+    "regenerate-rewrite": "Rewriting queries...",
+    "discover-summary-tables": "Discovering summary table recommendations...",
+    "discover-index-recommendations": "Discovering index recommendations...",
     "create-summary-tables": "Creating summary table structures...",
-    "create-secondary-indexes": "Creating secondary indexes...",
+    "create-secondary-indexes": "Applying approved index changes...",
     "run-pgbench-original": `Benchmarking ${sourceName}...`,
     "run-pgbench-new": `Benchmarking ${targetName}...`,
   };
@@ -1568,6 +1665,16 @@ async function submitNormalizationReview(runId, candidateId, decision) {
     body: JSON.stringify({ candidate_id: candidateId, decision }),
   });
   setStatus("Normalization review saved.");
+  await pollRun(data.run_id);
+}
+
+async function submitSummaryTableReview(runId, candidateId, decision) {
+  setStatus(decision === "approved" ? "Accepting summary table candidate..." : "Rejecting summary table candidate...");
+  const data = await api(`/api/runs/${runId}/actions/summary-table-review`, {
+    method: "POST",
+    body: JSON.stringify({ candidate_id: candidateId, decision }),
+  });
+  setStatus("Summary table review saved.");
   await pollRun(data.run_id);
 }
 
@@ -1696,6 +1803,16 @@ runsContainer.addEventListener("click", (event) => {
       reviewButton.dataset.runId,
       reviewButton.dataset.reviewId,
       reviewButton.dataset.reviewAction,
+    ).catch((error) => setStatus(error.message, true));
+    return;
+  }
+
+  const summaryReviewButton = event.target.closest("[data-summary-review-action]");
+  if (summaryReviewButton) {
+    submitSummaryTableReview(
+      summaryReviewButton.dataset.runId,
+      summaryReviewButton.dataset.summaryReviewId,
+      summaryReviewButton.dataset.summaryReviewAction,
     ).catch((error) => setStatus(error.message, true));
     return;
   }

@@ -206,6 +206,22 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if parsed.path.endswith("/actions/summary-table-review"):
+            run_id = parsed.path.split("/")[-3]
+            record = self.server.orchestrator.apply_summary_table_review(
+                run_id,
+                str(body.get("candidate_id", "")),
+                str(body.get("decision", "")),
+            )
+            self._send_json(
+                {
+                    "status": "completed",
+                    "run_id": record.run_id,
+                    "action": "summary-table-review",
+                    "run_status": record.status,
+                }
+            )
+            return
         if parsed.path.endswith("/actions/migrate-data"):
             run_id = parsed.path.split("/")[-3]
             self.server.orchestrator.begin_migrate_data(run_id)
@@ -239,6 +255,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             thread.start()
             self._send_json({"status": "accepted", "run_id": run_id, "action": "create-summary-tables"}, status=HTTPStatus.ACCEPTED)
             return
+        if parsed.path.endswith("/actions/discover-summary-tables"):
+            run_id = parsed.path.split("/")[-3]
+            self.server.orchestrator.begin_discover_summary_tables(run_id)
+            thread = threading.Thread(
+                target=self.server.orchestrator.execute_discover_summary_tables,
+                args=(run_id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"status": "accepted", "run_id": run_id, "action": "discover-summary-tables"}, status=HTTPStatus.ACCEPTED)
+            return
         if parsed.path.endswith("/actions/run-pgbench-original"):
             run_id = parsed.path.split("/")[-3]
             self.server.orchestrator.begin_pgbench_original(run_id)
@@ -271,6 +298,17 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             )
             thread.start()
             self._send_json({"status": "accepted", "run_id": run_id, "action": "create-secondary-indexes"}, status=HTTPStatus.ACCEPTED)
+            return
+        if parsed.path.endswith("/actions/discover-index-recommendations"):
+            run_id = parsed.path.split("/")[-3]
+            self.server.orchestrator.begin_discover_index_recommendations(run_id)
+            thread = threading.Thread(
+                target=self.server.orchestrator.execute_discover_index_recommendations,
+                args=(run_id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"status": "accepted", "run_id": run_id, "action": "discover-index-recommendations"}, status=HTTPStatus.ACCEPTED)
             return
         if parsed.path == "/api/llm/test":
             config_path = body.get("config_path", self.server.config_path)

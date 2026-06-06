@@ -19,6 +19,9 @@ class IndexRecommendation:
     reason: str
     confidence: float
     index_type: str = "btree"
+    expressions: list[str] = field(default_factory=list)
+    include_columns: list[str] = field(default_factory=list)
+    predicate: str = ""
 
 
 @dataclass(slots=True)
@@ -175,6 +178,7 @@ class IndexAdvisor:
         recommendations: list[IndexRecommendation] = []
         request_batches: list[dict] = []
         raw_responses: list[str] = []
+        prior_recommendations: list[dict] = []
         for query_index, query_chunk in enumerate(query_chunks, start=1):
             for index_index, index_chunk in enumerate(index_chunks, start=1):
                 request_payload = {
@@ -186,6 +190,7 @@ class IndexAdvisor:
                     "queries": query_chunk,
                     "database_structure": structure,
                     "current_indices": index_chunk,
+                    "previous_recommendations": prior_recommendations,
                 }
                 llm_result = self._llm.generate(
                     self._build_messages(request_payload),
@@ -193,7 +198,20 @@ class IndexAdvisor:
                 )
                 request_batches.append(request_payload)
                 raw_responses.append(f"Query batch {query_index}, index batch {index_index}:\n{llm_result.response_text}")
-                recommendations.extend(self._recommendations_from_response(llm_result.response_text, structure, current_indices))
+                batch_recommendations = self._recommendations_from_response(llm_result.response_text, structure, current_indices)
+                recommendations.extend(batch_recommendations)
+                prior_recommendations = [
+                    {
+                        "action": item.action,
+                        "name": item.name,
+                        "table": item.table,
+                        "columns": item.columns,
+                        "expressions": item.expressions,
+                        "predicate": item.predicate,
+                        "sql": item.sql,
+                    }
+                    for item in self._dedupe_recommendations(recommendations)
+                ]
 
         recommendations = self._dedupe_recommendations(recommendations)
         if not recommendations:
@@ -230,13 +248,16 @@ class IndexAdvisor:
                 "content": (
                     "Recommend index changes for the target PostgreSQL database.\n\n"
                     "Rules:\n"
-                    "1. Recommend CREATE INDEX statements only when supported by the workload predicates, joins, ordering, or grouping.\n"
+                    "1. Recommend CREATE INDEX statements only when supported by the workload predicates, joins, ordering, grouping, full-text/search, range, JSON/array, or pattern-matching needs.\n"
                     "2. Recommend DROP INDEX statements only for clearly redundant or unused-looking non-primary indexes. "
                     "Do not drop primary-key or unique-constraint indexes.\n"
                     "3. Do not use CREATE INDEX CONCURRENTLY or DROP INDEX CONCURRENTLY.\n"
                     "4. SQL must contain only CREATE INDEX, CREATE INDEX IF NOT EXISTS, DROP INDEX, or DROP INDEX IF EXISTS.\n"
-                    "5. Prefer B-tree indexes unless the workload clearly justifies another PostgreSQL index type.\n"
-                    "6. If unsure, omit the recommendation.\n\n"
+                    "5. Consider the workload as a whole: prefer useful compound indexes over separate redundant single-column indexes when query predicates share prefixes.\n"
+                    "6. Consider PostgreSQL expression/function indexes, partial indexes, INCLUDE columns, and B-tree, hash, GIN, GiST, SP-GiST, BRIN, or other PostgreSQL access methods when justified.\n"
+                    "7. Minimize redundancy with current indexes and with your own recommendations.\n"
+                    "8. previous_recommendations contains accepted recommendations from earlier batches; avoid duplicating or making them redundant.\n"
+                    "9. If unsure, omit the recommendation.\n\n"
                     "Return JSON with this shape:\n"
                     "{\n"
                     '  "status": "recommended|no_recommendations",\n'
@@ -246,6 +267,9 @@ class IndexAdvisor:
                     '      "action": "create|drop",\n'
                     '      "table": "table_name",\n'
                     '      "columns": ["col"],\n'
+                    '      "expressions": ["lower(name)"],\n'
+                    '      "include_columns": ["payload_col"],\n'
+                    '      "predicate": "deleted_at IS NULL",\n'
                     '      "name": "index_name",\n'
                     '      "sql": "CREATE INDEX IF NOT EXISTS ...;",\n'
                     '      "reason": "why this helps or should be dropped",\n'
@@ -267,7 +291,7 @@ class IndexAdvisor:
     ) -> list[IndexRecommendation]:
         payload = self._extract_json_object(response_text)
         table_names = {str(table.get("name", "")) for table in structure}
-        index_names = {str(index.get("name", "")) for index in current_indices}
+        index_names = {self._identifier(str(index.get("name", ""))) for index in current_indices}
         recommendations: list[IndexRecommendation] = []
         for item in payload.get("recommendations", []):
             if not isinstance(item, dict):
@@ -275,6 +299,13 @@ class IndexAdvisor:
             action = str(item.get("action", "")).strip().lower()
             table = self._identifier(str(item.get("table", "")))
             columns = [self._identifier(str(column)) for column in item.get("columns", []) if str(column).strip()]
+            expressions = [str(expression).strip() for expression in item.get("expressions", []) if str(expression).strip()]
+            include_columns = [
+                self._identifier(str(column))
+                for column in item.get("include_columns", [])
+                if str(column).strip()
+            ]
+            predicate = str(item.get("predicate", "")).strip()
             name = self._identifier(str(item.get("name", "")))
             sql_text = self._normalize_index_sql(str(item.get("sql", "")))
             if action not in {"create", "drop"} or not sql_text:
@@ -283,7 +314,7 @@ class IndexAdvisor:
                 continue
             if action == "drop" and name and index_names and name not in index_names:
                 continue
-            if action == "create" and (not table or not columns):
+            if action == "create" and not table:
                 continue
             recommendations.append(
                 IndexRecommendation(
@@ -295,6 +326,9 @@ class IndexAdvisor:
                     reason=str(item.get("reason", "")),
                     confidence=self._confidence(item.get("confidence", 0.5)),
                     index_type=str(item.get("index_type", "btree") or "btree"),
+                    expressions=expressions,
+                    include_columns=include_columns,
+                    predicate=predicate,
                 )
             )
         return recommendations

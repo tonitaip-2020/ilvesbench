@@ -640,6 +640,147 @@ class PipelineOrchestrator:
         self._store.upsert_run(record)
         return record
 
+    def begin_discover_summary_tables(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        record.status = "running"
+        summary_step = next((step for step in record.steps if step.name == "suggest_summary_tables"), None)
+        details = summary_step.details if summary_step else {}
+        record = self._replace_step(
+            record,
+            "suggest_summary_tables",
+            status="running",
+            details=details | {
+                "summary": "Discovering workload-aware summary table recommendations with the LLM.",
+                "source": "llm",
+                "review_status": "discovering",
+            },
+            error=None,
+            planned_only=False,
+        )
+        record.summary.update(self._summary_counts(record))
+        self._store.upsert_run(record)
+        return record
+
+    def execute_discover_summary_tables(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        try:
+            log_summary = self._load_log_summary_artifact(record)
+            record = self._plan_summary_tables_step(record, log_summary, use_llm=True)
+            if self._summary_table_gate(record)["ready"]:
+                record = self._plan_rewrite_queries_step(record, log_summary)
+                record = self._plan_query_validation_step(record)
+                record = self._plan_benchmark_workload_step(record)
+                schema = self._load_schema_artifact(record)
+                record = self._plan_index_recommendations_step(record, schema, log_summary)
+                record = self._plan_pgbench_new_step(record)
+            else:
+                record = self._plan_rewrite_queries_step(record, log_summary)
+            record.summary.pop("error", None)
+        except Exception as exc:
+            record = self._replace_step(
+                record,
+                "suggest_summary_tables",
+                status="failed",
+                details=next((step.details for step in record.steps if step.name == "suggest_summary_tables"), {}),
+                error=str(exc),
+                planned_only=False,
+            )
+            record.summary["error"] = str(exc)
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
+        return record
+
+    def apply_summary_table_review(self, run_id: str, candidate_id: str, decision: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        if decision not in {"approved", "rejected"}:
+            raise ValueError("Summary table review decision must be approved or rejected.")
+        summary_step = next(step for step in record.steps if step.name == "suggest_summary_tables")
+        details = dict(summary_step.details)
+        candidates = [dict(candidate) for candidate in details.get("candidates", [])]
+        if not candidates:
+            raise ValueError("This run has no summary table recommendations to review.")
+
+        matched = False
+        for candidate in candidates:
+            if str(candidate.get("id")) == candidate_id:
+                candidate["status"] = decision
+                matched = True
+                break
+        if not matched:
+            raise ValueError(f"Summary table recommendation not found: {candidate_id}")
+
+        pending = [candidate for candidate in candidates if candidate.get("status") == "pending"]
+        approved = [candidate for candidate in candidates if candidate.get("status") == "approved"]
+        sql_statements = [
+            str(candidate.get("sql_statement", "")).strip()
+            for candidate in approved
+            if str(candidate.get("sql_statement", "")).strip()
+        ]
+        details.update(
+            {
+                "candidates": candidates,
+                "candidate_count": len(candidates),
+                "approved_candidate_count": len(approved),
+                "rejected_candidate_count": sum(1 for candidate in candidates if candidate.get("status") == "rejected"),
+                "sql_statements": sql_statements,
+            }
+        )
+
+        if pending:
+            details.update(
+                {
+                    "review_status": "pending",
+                    "creation_status": "approval_required" if sql_statements else "not_reviewed",
+                    "summary": f"{len(pending)} summary table candidate(s) still need approve/reject decisions.",
+                }
+            )
+            record.artifacts["suggest_summary_tables"] = self._store.write_artifact(
+                record.run_id,
+                "summary_table_recommendations",
+                details,
+            )
+            record = self._input_required_step(record, "suggest_summary_tables", details)
+        elif approved:
+            details.update(
+                {
+                    "review_status": "completed",
+                    "creation_status": "approval_required",
+                    "summary": (
+                        f"{len(approved)} summary table candidate(s) approved. Create their structures before query rewrites."
+                    ),
+                }
+            )
+            record = self._store_summary_table_artifacts(record, details)
+            record = self._mark_planned(record, "suggest_summary_tables", details)
+        else:
+            details.update(
+                {
+                    "status": "no_recommendations",
+                    "review_status": "completed",
+                    "creation_status": "not_recommended",
+                    "summary": "All summary table candidates were rejected; query rewrites can proceed without summary tables.",
+                    "sql_statements": [],
+                }
+            )
+            record = self._store_summary_table_artifacts(record, details)
+            record = self._complete_step(record, "suggest_summary_tables", details)
+            log_summary = self._load_log_summary_artifact(record)
+            schema = self._load_schema_artifact(record)
+            record = self._plan_rewrite_queries_step(record, log_summary)
+            record = self._plan_query_validation_step(record)
+            record = self._plan_benchmark_workload_step(record)
+            record = self._plan_index_recommendations_step(record, schema, log_summary)
+            record = self._plan_pgbench_new_step(record)
+
+        record.summary.pop("error", None)
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
+        return record
+
     def execute_create_summary_tables(self, run_id: str) -> BenchmarkRunRecord:
         record = self.load_run_record(run_id)
         try:
@@ -653,23 +794,33 @@ class PipelineOrchestrator:
                 raise ValueError("No summary-table CREATE TABLE SQL is available.")
             executed = self._postgres.execute_statements(self._config.postgres.new_database, statements)
             details = dict(summary_step.details)
+            candidates = [dict(candidate) for candidate in details.get("candidates", [])]
+            approved_tables = {
+                str(candidate.get("table_name", "")).strip()
+                for candidate in candidates
+                if candidate.get("status") == "approved"
+            }
+            for candidate in candidates:
+                if candidate.get("status") == "approved":
+                    candidate["creation_status"] = "created"
             details.update(
                 {
+                    "candidates": candidates,
                     "creation_status": "created",
+                    "review_status": "completed",
                     "executed_statement_count": len(executed),
                     "executed_sql": statements,
+                    "created_tables": sorted(table for table in approved_tables if table),
                     "summary": f"Created {len(executed)} summary table structure(s) in {self._config.postgres.new_database}.",
                 }
             )
-            record.artifacts["suggest_summary_tables"] = self._store.write_artifact(
-                record.run_id,
-                "summary_table_recommendations",
-                details,
-            )
+            record = self._store_summary_table_artifacts(record, details)
             record = self._complete_step(record, "suggest_summary_tables", details)
             record = self._plan_rewrite_queries_step(record, self._load_log_summary_artifact(record))
             record = self._plan_query_validation_step(record)
             record = self._plan_benchmark_workload_step(record)
+            schema = self._target_schema_for_index_recommendations(record) or self._load_schema_artifact(record)
+            record = self._plan_index_recommendations_step(record, schema, self._load_log_summary_artifact(record))
             record = self._plan_pgbench_new_step(record)
             record.summary.pop("error", None)
         except Exception as exc:
@@ -1359,7 +1510,13 @@ class PipelineOrchestrator:
                 )
             if rewrite_step.status != "completed" or not rewrite_step.details.get("workload_path"):
                 raise ValueError(f"Rewritten {self._config.postgres.new_database} workload must be completed before benchmarking.")
-            workload_path = Path(str(rewrite_step.details.get("workload_path"))).resolve()
+            benchmark_workload_step = next((step for step in record.steps if step.name == "generate_benchmark_workload"), None)
+            benchmark_workload_path = (
+                str(benchmark_workload_step.details.get("workload_path", "")).strip()
+                if benchmark_workload_step
+                else ""
+            )
+            workload_path = Path(benchmark_workload_path or str(rewrite_step.details.get("workload_path"))).resolve()
             workload_path, validation_warning = self._prepare_pgbench_new_workload(record, workload_path)
             record = self._run_pgbench_new_step(
                 record,
@@ -1402,6 +1559,49 @@ class PipelineOrchestrator:
         self._store.upsert_run(record)
         return record
 
+    def begin_discover_index_recommendations(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        record.status = "running"
+        index_step = next((step for step in record.steps if step.name == "optimize_indexes"), None)
+        details = index_step.details if index_step else {}
+        record = self._replace_step(
+            record,
+            "optimize_indexes",
+            status="running",
+            details=details | {
+                "summary": "Discovering workload-aware index recommendations with the LLM.",
+                "source": "llm",
+            },
+            error=None,
+            planned_only=False,
+        )
+        record.summary.update(self._summary_counts(record))
+        self._store.upsert_run(record)
+        return record
+
+    def execute_discover_index_recommendations(self, run_id: str) -> BenchmarkRunRecord:
+        record = self.load_run_record(run_id)
+        try:
+            schema = self._target_schema_for_index_recommendations(record)
+            log_summary = self._load_log_summary_artifact(record)
+            record = self._plan_index_recommendations_step(record, schema, log_summary, use_llm=True)
+            record.summary.pop("error", None)
+        except Exception as exc:
+            record = self._replace_step(
+                record,
+                "optimize_indexes",
+                status="failed",
+                details=next((step.details for step in record.steps if step.name == "optimize_indexes"), {}),
+                error=str(exc),
+                planned_only=False,
+            )
+            record.summary["error"] = str(exc)
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
+        return record
+
     def execute_create_secondary_indexes(self, run_id: str) -> BenchmarkRunRecord:
         record = self.load_run_record(run_id)
         step = self._secondary_index_step(record)
@@ -1425,7 +1625,7 @@ class PipelineOrchestrator:
                 {
                     **step.details,
                     "executed_statement_count": len(executed),
-                    "summary": f"Created or reused {len(executed)} secondary index(es) on {self._config.postgres.new_database}.",
+                    "summary": f"Applied {len(executed)} approved index change statement(s) on {self._config.postgres.new_database}.",
                 },
             )
             record = self._run_extended_metrics_step(
@@ -1470,15 +1670,15 @@ class PipelineOrchestrator:
         return record.steps[-1]
 
     def _secondary_index_sql_statements(self, record: BenchmarkRunRecord) -> list[str]:
-        statements: list[str] = []
+        raw_statements: list[str] = []
         for step_name in ("create_secondary_indexes", "optimize_indexes"):
             step = next((step for step in record.steps if step.name == step_name), None)
             if step is None:
                 continue
             for statement in step.details.get("sql_statements", []):
-                if statement and statement not in statements:
-                    statements.append(statement)
-        return statements
+                if statement and statement not in raw_statements:
+                    raw_statements.append(statement)
+        return self._safe_index_sql_statements(raw_statements)
 
     def _target_database_has_data(self) -> bool:
         try:
@@ -1690,8 +1890,62 @@ class PipelineOrchestrator:
         except Exception as exc:
             return self._fail_step(record, "migrate_data", str(exc))
 
-    def _plan_summary_tables_step(self, record: BenchmarkRunRecord, log_summary) -> BenchmarkRunRecord:
-        workload_plan = self._workload_planner.build_plan(log_summary)
+    def _plan_summary_tables_step(
+        self,
+        record: BenchmarkRunRecord,
+        log_summary,
+        *,
+        use_llm: bool = False,
+    ) -> BenchmarkRunRecord:
+        existing_step = next((step for step in record.steps if step.name == "suggest_summary_tables"), None)
+        if not use_llm and existing_step is not None:
+            existing_review_status = existing_step.details.get("review_status")
+            existing_creation_status = existing_step.details.get("creation_status")
+            if existing_review_status in {"pending", "completed", "discovering"} or existing_creation_status in {
+                "approval_required",
+                "created",
+                "not_recommended",
+            }:
+                return record
+
+        if not use_llm:
+            workload_plan = self._workload_planner.build_plan(log_summary)
+            details = {
+                "status": workload_plan.status,
+                "summary": (
+                    workload_plan.summary
+                    if workload_plan.candidate_summary_tables
+                    else workload_plan.summary + " Use the recommendation button for an LLM-backed summary-table review."
+                ),
+                "candidate_count": len(workload_plan.candidate_summary_tables),
+                "candidates": workload_plan.candidate_summary_tables,
+                "creation_status": "approval_required" if workload_plan.candidate_summary_tables else "not_recommended",
+                "review_status": "pending" if workload_plan.candidate_summary_tables else "completed",
+                "sql_statements": [],
+                "implemented": True,
+                "source": workload_plan.source,
+            }
+            record.artifacts["suggest_summary_tables"] = self._store.write_artifact(
+                record.run_id,
+                "summary_table_recommendations",
+                details,
+            )
+            if workload_plan.candidate_summary_tables:
+                return self._input_required_step(record, "suggest_summary_tables", details)
+            return self._complete_step(record, "suggest_summary_tables", details)
+
+        source_schema = self._load_schema_artifact(record)
+        source_tables = [to_dict(table) for table in source_schema.tables] if source_schema else []
+        normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
+        target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
+        if not target_tables:
+            target_tables = self._existing_target_tables()
+
+        workload_plan = self._workload_planner.recommend_summary_tables(
+            log_summary,
+            source_tables=source_tables,
+            target_tables=target_tables,
+        )
         sql_statements = [
             str(candidate.get("sql_statement", "")).strip()
             for candidate in workload_plan.candidate_summary_tables
@@ -1703,10 +1957,26 @@ class PipelineOrchestrator:
             "candidate_count": len(workload_plan.candidate_summary_tables),
             "candidates": workload_plan.candidate_summary_tables,
             "creation_status": "approval_required" if sql_statements else "not_recommended",
-            "sql_statements": sql_statements,
+            "review_status": "pending" if workload_plan.candidate_summary_tables else "completed",
+            "sql_statements": [],
             "implemented": True,
-            "source": "workload_heuristic",
+            "source": workload_plan.source,
+            "llm_request": workload_plan.request_payload or {},
+            "raw_response_text": workload_plan.raw_response_text or "",
+            "source_table_count": len(source_tables),
+            "target_table_count": len(target_tables),
         }
+        record = self._store_summary_table_artifacts(record, details)
+        if workload_plan.candidate_summary_tables:
+            return self._input_required_step(record, "suggest_summary_tables", details)
+        return self._complete_step(record, "suggest_summary_tables", details)
+
+    def _store_summary_table_artifacts(self, record: BenchmarkRunRecord, details: dict) -> BenchmarkRunRecord:
+        sql_statements = [
+            str(statement).strip()
+            for statement in details.get("sql_statements", [])
+            if str(statement).strip()
+        ]
         if sql_statements:
             sql_path = self._store.write_text_artifact(
                 record.run_id,
@@ -1716,14 +1986,31 @@ class PipelineOrchestrator:
             )
             details["sql_path"] = sql_path
             record.artifacts["suggest_summary_tables_sql"] = sql_path
+        else:
+            details.pop("sql_path", None)
         record.artifacts["suggest_summary_tables"] = self._store.write_artifact(
             record.run_id,
             "summary_table_recommendations",
             details,
         )
-        return self._mark_planned(record, "suggest_summary_tables", details)
+        return record
 
     def _plan_rewrite_queries_step(self, record: BenchmarkRunRecord, log_summary) -> BenchmarkRunRecord:
+        summary_gate = self._summary_table_gate(record)
+        if not summary_gate["ready"]:
+            details = {
+                "status": "waiting_for_summary_tables",
+                "summary": summary_gate["summary"],
+                "blocking_step": "suggest_summary_tables",
+                "source": "workflow_gate",
+            }
+            record.artifacts["rewrite_queries"] = self._store.write_artifact(
+                record.run_id,
+                "rewritten_workload_db_new",
+                details,
+            )
+            return self._mark_planned(record, "rewrite_queries", details)
+
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
         migrate_step = next((step for step in record.steps if step.name == "migrate_data"), None)
         source_schema = self._load_schema_artifact(record)
@@ -2104,21 +2391,42 @@ class PipelineOrchestrator:
                     "source_kind": source_kind,
                 },
             )
-        return self._mark_planned(
-            record,
-            "generate_benchmark_workload",
-            {
-                "status": "placeholder",
-                "summary": (
-                    "Placeholder: build pgbench-ready scripts with relative query proportions. "
-                    "For now, IlvesBench reuses the rewritten query SQL as the benchmark input."
-                ),
-                "query_statement_count": statement_count,
-                "workload_path": rewrite_step.details.get("workload_path", ""),
-                "implemented_mix_model": False,
-                "source_kind": source_kind,
-            },
+        plan = self._workload_planner.build_pgbench_workload(
+            [str(statement) for statement in rewrite_step.details.get("statements", [])],
+            source_kind=source_kind,
         )
+        details = {
+            "status": plan.status,
+            "summary": plan.summary,
+            "query_statement_count": statement_count,
+            "distinct_query_count": len(plan.query_mix),
+            "query_mix": plan.query_mix,
+            "implemented_mix_model": plan.status == "completed",
+            "source_kind": source_kind,
+            "source": plan.source,
+        }
+        if plan.workload_sql:
+            workload_path = self._store.write_text_artifact(
+                record.run_id,
+                "pgbench_workload_db_new",
+                plan.workload_sql,
+                suffix=".sql",
+            )
+            details["workload_path"] = workload_path
+            record.artifacts["generate_benchmark_workload_sql"] = workload_path
+            record.artifacts["generate_benchmark_workload"] = self._store.write_artifact(
+                record.run_id,
+                "benchmark_workload",
+                details | {"workload_sql": plan.workload_sql},
+            )
+            return self._complete_step(record, "generate_benchmark_workload", details)
+
+        record.artifacts["generate_benchmark_workload"] = self._store.write_artifact(
+            record.run_id,
+            "benchmark_workload",
+            details,
+        )
+        return self._mark_planned(record, "generate_benchmark_workload", details)
 
     def _existing_target_tables(self) -> list[dict]:
         try:
@@ -2177,12 +2485,57 @@ class PipelineOrchestrator:
     def _split_sql_statements(self, text: str) -> list[str]:
         return self._benchmarker.split_sql_statements(text)
 
+    def _summary_table_gate(self, record: BenchmarkRunRecord) -> dict:
+        step = next((step for step in record.steps if step.name == "suggest_summary_tables"), None)
+        if step is None:
+            return {
+                "ready": False,
+                "summary": "Discover summary-table recommendations before query rewrites and index recommendations.",
+            }
+        details = step.details or {}
+        review_status = str(details.get("review_status", "") or "")
+        creation_status = str(details.get("creation_status", "") or "")
+        if creation_status in {"created", "not_recommended", "not_needed"}:
+            return {"ready": True, "summary": "Summary-table decisions are resolved."}
+        if review_status == "completed" and creation_status in {"not_recommended", "created"}:
+            return {"ready": True, "summary": "Summary-table decisions are resolved."}
+        if creation_status == "approval_required":
+            return {
+                "ready": False,
+                "summary": "Approved summary table structures must be created before query rewrites and index recommendations.",
+            }
+        if review_status in {"pending", "discovering"}:
+            return {
+                "ready": False,
+                "summary": "Approve or reject each summary-table recommendation before query rewrites and index recommendations.",
+            }
+        return {
+            "ready": False,
+            "summary": "Discover summary-table recommendations before query rewrites and index recommendations.",
+        }
+
     def _plan_index_recommendations_step(
         self,
         record: BenchmarkRunRecord,
         schema: SchemaSnapshot | None,
         log_summary: LogSummary | None,
+        *,
+        use_llm: bool = False,
     ) -> BenchmarkRunRecord:
+        summary_gate = self._summary_table_gate(record)
+        if not summary_gate["ready"]:
+            return self._mark_planned(
+                record,
+                "optimize_indexes",
+                {
+                    "status": "waiting_for_summary_tables",
+                    "summary": summary_gate["summary"],
+                    "source": "workflow_gate",
+                    "recommendation_count": 0,
+                    "recommendations": [],
+                    "sql_statements": [],
+                },
+            )
         normalization_step = next((step for step in record.steps if step.name == "propose_3nf_schema"), None)
         target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
         try:
@@ -2192,6 +2545,7 @@ class PipelineOrchestrator:
                 target_tables=target_tables,
                 workload_sql=workload_sql,
                 log_summary=log_summary,
+                use_llm=use_llm,
             )
             recommendations = [to_dict(item) for item in plan.recommendations]
             plan_dict = {
@@ -2199,8 +2553,12 @@ class PipelineOrchestrator:
                 "summary": plan.summary,
                 "source": plan.source,
                 "recommendation_count": len(recommendations),
+                "create_recommendation_count": sum(1 for item in recommendations if item.get("action") == "create"),
+                "drop_recommendation_count": sum(1 for item in recommendations if item.get("action") == "drop"),
                 "recommendations": recommendations,
                 "sql_statements": [item["sql"] for item in recommendations],
+                "llm_request": plan.request_payload or {},
+                "raw_response_text": plan.raw_response_text,
             }
             record.artifacts["optimize_indexes"] = self._store.write_artifact(
                 record.run_id,
@@ -2213,14 +2571,14 @@ class PipelineOrchestrator:
             return self._fail_step(record, "optimize_indexes", str(exc))
 
     def _plan_secondary_index_creation_step(self, record: BenchmarkRunRecord, index_plan: dict) -> BenchmarkRunRecord:
-        statements = list(index_plan.get("sql_statements", []))
+        statements = self._safe_index_sql_statements(list(index_plan.get("sql_statements", [])))
         if statements:
             return self._mark_planned(
                 record,
                 "create_secondary_indexes",
                 {
                     "summary": (
-                        f"Approval-gated: create recommended secondary indexes on {self._config.postgres.new_database} "
+                        f"Approval-gated: apply recommended index changes on {self._config.postgres.new_database} "
                         "after the target schema exists."
                     ),
                     "recommendation_count": len(statements),
@@ -2232,11 +2590,36 @@ class PipelineOrchestrator:
             record,
             "create_secondary_indexes",
             {
-                "summary": "No secondary indexes were recommended for creation.",
+                "summary": "No index changes were recommended.",
                 "recommendation_count": 0,
                 "sql_statements": [],
             },
         )
+
+    def _target_schema_for_index_recommendations(self, record: BenchmarkRunRecord) -> SchemaSnapshot | None:
+        try:
+            if self._postgres.database_exists(self._config.postgres.new_database):
+                return self._postgres.inspect_schema(self._config.postgres.new_database)
+        except Exception:
+            return None
+        return None
+
+    def _safe_index_sql_statements(self, statements: list[str]) -> list[str]:
+        safe: list[str] = []
+        for statement in statements:
+            sql_text = str(statement).strip().rstrip(";")
+            if not sql_text:
+                continue
+            if re.search(r"\bconcurrently\b", sql_text, re.IGNORECASE):
+                continue
+            if not re.match(r"^\s*(create\s+index|drop\s+index)\b", sql_text, re.IGNORECASE):
+                continue
+            if ";" in sql_text:
+                continue
+            final_statement = sql_text + ";"
+            if final_statement not in safe:
+                safe.append(final_statement)
+        return safe
 
     def _run_tuning_step(
         self,
@@ -2343,7 +2726,14 @@ class PipelineOrchestrator:
 
     def _plan_pgbench_new_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         rewrite_step = next((step for step in record.steps if step.name == "rewrite_queries"), None)
-        workload_path = str(rewrite_step.details.get("workload_path", "")).strip() if rewrite_step else ""
+        benchmark_workload_step = next((step for step in record.steps if step.name == "generate_benchmark_workload"), None)
+        workload_path = (
+            str(benchmark_workload_step.details.get("workload_path", "")).strip()
+            if benchmark_workload_step
+            else ""
+        )
+        if not workload_path:
+            workload_path = str(rewrite_step.details.get("workload_path", "")).strip() if rewrite_step else ""
         return self._mark_planned(
             record,
             "run_pgbench_new",
@@ -2449,6 +2839,7 @@ class PipelineOrchestrator:
                     sample_sql=str(item.get("sample_sql", "")),
                     count=int(item.get("count", 0)),
                     total_duration_ms=float(item.get("total_duration_ms", 0.0)),
+                    proportion=float(item.get("proportion", 0.0)),
                 )
                 for item in payload.get("top_queries", [])
             ],

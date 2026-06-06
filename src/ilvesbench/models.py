@@ -86,6 +86,7 @@ class QueryObservation:
     sample_sql: str
     count: int
     total_duration_ms: float = 0.0
+    proportion: float = 0.0
 
 
 @dataclass(slots=True)

@@ -13,6 +13,7 @@ BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 PGBENCH_META_COMMAND_RE = re.compile(r"^\s*\\.*$", re.MULTILINE)
 MARKDOWN_FENCE_RE = re.compile(r"^\s*```(?:sql)?\s*$|^\s*```\s*$", re.IGNORECASE | re.MULTILINE)
 DEFAULT_REWRITE_BATCH_SIZE = 25
+DEFAULT_MAX_WORKLOAD_WEIGHT = 100
 
 
 @dataclass(slots=True)
@@ -20,6 +21,9 @@ class WorkloadPlan:
     status: str
     summary: str
     candidate_summary_tables: list[dict] = field(default_factory=list)
+    source: str = "fallback"
+    raw_response_text: str | None = None
+    request_payload: dict | None = None
 
 
 @dataclass(slots=True)
@@ -31,6 +35,15 @@ class WorkloadRewriteProposal:
     source: str = "fallback"
     raw_response_text: str | None = None
     request_payload: dict | None = None
+
+
+@dataclass(slots=True)
+class PgBenchWorkloadPlan:
+    status: str
+    summary: str
+    workload_sql: str = ""
+    query_mix: list[dict] = field(default_factory=list)
+    source: str = "workload_file"
 
 
 class WorkloadRewriteError(ValueError):
@@ -69,12 +82,102 @@ class WorkloadPlanner:
                 status="recommended",
                 summary=f"Found {len(candidates)} candidate summary-table pattern(s) in the workload.",
                 candidate_summary_tables=candidates,
+                source="workload_heuristic",
             )
         return WorkloadPlan(
-            status="planned",
+            status="no_recommendations",
             summary=(
-                "Workload extraction is active. No obvious aggregate summary-table candidate was detected yet."
+                "Workload extraction is active. No obvious summary-table candidate was detected yet."
             ),
+            source="workload_heuristic",
+        )
+
+    def recommend_summary_tables(
+        self,
+        log_summary: LogSummary | None,
+        *,
+        source_tables: list[dict] | None = None,
+        target_tables: list[dict] | None = None,
+        batch_size: int = 20,
+    ) -> WorkloadPlan:
+        baseline = self.build_plan(log_summary)
+        if log_summary is None or not log_summary.top_queries:
+            return baseline
+        if self._llm is None:
+            return baseline
+
+        observations = [
+            {
+                "query_id": f"query_{index}",
+                "count": query.count,
+                "sample_sql": query.sample_sql,
+                "fingerprint": query.fingerprint,
+                "total_duration_ms": query.total_duration_ms,
+            }
+            for index, query in enumerate(log_summary.top_queries, start=1)
+            if query.sample_sql.strip()
+        ]
+        if not observations:
+            return WorkloadPlan(
+                status="no_queries",
+                summary="The workload source was parsed, but no executable SQL statements were detected.",
+                source="llm",
+            )
+
+        chunks = [observations[index : index + batch_size] for index in range(0, len(observations), batch_size)]
+        candidates: list[dict] = []
+        raw_responses: list[str] = []
+        request_batches: list[dict] = []
+        for batch_index, chunk in enumerate(chunks, start=1):
+            request_payload = {
+                "mode": "summary_table_recommendations",
+                "batch_index": batch_index,
+                "batch_count": len(chunks),
+                "queries": chunk,
+                "source_tables": source_tables or [],
+                "target_tables": target_tables or [],
+                "previous_recommendations": candidates,
+            }
+            request_batches.append(request_payload)
+            messages = self._build_summary_table_messages(request_payload)
+            try:
+                llm_result = self._llm.generate(messages, max_tokens=8192)
+            except Exception as exc:
+                if baseline.candidate_summary_tables:
+                    return WorkloadPlan(
+                        status=baseline.status,
+                        summary=f"LLM summary-table recommendation failed, so heuristic candidates were used: {exc}",
+                        candidate_summary_tables=baseline.candidate_summary_tables,
+                        source="workload_heuristic_fallback",
+                        request_payload={"batches": request_batches},
+                    )
+                raise
+            raw_responses.append(f"Batch {batch_index}:\n{llm_result.response_text}")
+            candidates.extend(
+                self._summary_recommendations_from_response(
+                    llm_result.response_text,
+                    existing_candidates=candidates,
+                )
+            )
+
+        if not candidates:
+            return WorkloadPlan(
+                status="no_recommendations",
+                summary=(
+                    "The LLM did not recommend summary tables. The workload does not currently show "
+                    "a repeated, stable, expensive pattern that clearly warrants precomputed tables."
+                ),
+                source="llm",
+                raw_response_text="\n\n".join(raw_responses),
+                request_payload={"mode": "batched", "batch_count": len(chunks), "batches": request_batches},
+            )
+        return WorkloadPlan(
+            status="recommended",
+            summary=f"Recommended {len(candidates)} summary table candidate(s) for human review.",
+            candidate_summary_tables=candidates,
+            source="llm",
+            raw_response_text="\n\n".join(raw_responses),
+            request_payload={"mode": "batched", "batch_count": len(chunks), "batches": request_batches},
         )
 
     def rewrite(
@@ -124,6 +227,92 @@ class WorkloadPlanner:
 
     def source_statements(self, workload_sql: str) -> list[str]:
         return self._split_statements(workload_sql)
+
+    def build_pgbench_workload(
+        self,
+        statements: list[str],
+        *,
+        source_kind: str,
+        max_total_weight: int = DEFAULT_MAX_WORKLOAD_WEIGHT,
+    ) -> PgBenchWorkloadPlan:
+        if source_kind == "postgres_log":
+            return PgBenchWorkloadPlan(
+                status="placeholder",
+                summary=(
+                    "PostgreSQL log based workload inference is a placeholder. "
+                    "Use a workload SQL file for pgbench-ready workload generation in this prototype."
+                ),
+                source=source_kind,
+            )
+        normalized_statements = [
+            self._normalize_statement(statement, set())
+            for statement in statements
+            if str(statement).strip()
+        ]
+        if not normalized_statements:
+            return PgBenchWorkloadPlan(
+                status="no_queries",
+                summary="No executable query statements were available for pgbench workload generation.",
+                source=source_kind,
+            )
+
+        ordered: list[dict] = []
+        by_key: dict[str, dict] = {}
+        for statement in normalized_statements:
+            key = self._workload_key(statement)
+            if key not in by_key:
+                item = {"statement": statement, "count": 0}
+                by_key[key] = item
+                ordered.append(item)
+            by_key[key]["count"] += 1
+
+        counts = [int(item["count"]) for item in ordered]
+        weights = self._workload_weights(counts, max_total_weight=max_total_weight)
+        total_count = sum(counts)
+        query_mix: list[dict] = []
+        sql_blocks = [
+            "-- IlvesBench pgbench workload",
+            f"-- source_kind: {source_kind}",
+            "-- Literal constants from workload files are preserved. Only explicit question-mark placeholders are converted.",
+        ]
+        for index, (item, weight) in enumerate(zip(ordered, weights, strict=False), start=1):
+            statement = str(item["statement"]).strip()
+            count = int(item["count"])
+            proportion = count / total_count if total_count else 0.0
+            prepared_statement, placeholder_count = self._pgbench_placeholder_statement(statement, query_index=index)
+            query_mix.append(
+                {
+                    "query_id": f"query_{index}",
+                    "statement": statement,
+                    "count": count,
+                    "proportion": round(proportion, 6),
+                    "proportion_percent": round(proportion * 100, 3),
+                    "weight": weight,
+                    "placeholder_count": placeholder_count,
+                }
+            )
+            for repetition in range(weight):
+                sql_blocks.append(
+                    "\n".join(
+                        [
+                            (
+                                f"-- query_{index} repeat {repetition + 1}/{weight} | "
+                                f"proportion {proportion * 100:.3f}% | observed {count}"
+                            ),
+                            prepared_statement,
+                        ]
+                    )
+                )
+        return PgBenchWorkloadPlan(
+            status="completed",
+            summary=(
+                f"Generated pgbench workload mix with {len(query_mix)} distinct query statement(s) "
+                f"and {sum(weights)} weighted execution block(s)."
+            ),
+            workload_sql="\n\n".join(sql_blocks).strip() + "\n",
+            query_mix=query_mix,
+            source=source_kind,
+        )
 
     def rewrite_one(
         self,
@@ -483,6 +672,54 @@ class WorkloadPlanner:
             for index, statement in enumerate(statements, start=1)
         )
 
+    def _workload_key(self, statement: str) -> str:
+        return re.sub(r"\s+", " ", statement.strip().rstrip(";")).strip()
+
+    def _workload_weights(self, counts: list[int], *, max_total_weight: int) -> list[int]:
+        if not counts:
+            return []
+        divisor = counts[0]
+        for count in counts[1:]:
+            divisor = self._gcd(divisor, count)
+        reduced = [max(1, count // max(divisor, 1)) for count in counts]
+        if sum(reduced) <= max_total_weight:
+            return reduced
+        total = sum(counts)
+        scaled = [max(1, round((count / total) * max_total_weight)) for count in counts]
+        return scaled
+
+    def _gcd(self, left: int, right: int) -> int:
+        left, right = abs(left), abs(right)
+        while right:
+            left, right = right, left % right
+        return left or 1
+
+    def _pgbench_placeholder_statement(self, statement: str, *, query_index: int) -> tuple[str, int]:
+        chars: list[str] = []
+        placeholder_index = 0
+        in_single = False
+        in_double = False
+        for char in statement:
+            if char == "'" and not in_double:
+                in_single = not in_single
+            elif char == '"' and not in_single:
+                in_double = not in_double
+            if char == "?" and not in_single and not in_double:
+                placeholder_index += 1
+                chars.append(f":ilves_q{query_index}_p{placeholder_index}")
+                continue
+            chars.append(char)
+        prepared = "".join(chars).strip()
+        if not prepared.endswith(";"):
+            prepared += ";"
+        if placeholder_index == 0:
+            return prepared, 0
+        variables = [
+            f"\\set ilves_q{query_index}_p{index} 1"
+            for index in range(1, placeholder_index + 1)
+        ]
+        return "\n".join(variables + [prepared]), placeholder_index
+
     def _build_repair_messages(
         self,
         source_statements: list[str],
@@ -601,8 +838,11 @@ class WorkloadPlanner:
             table_name = f"summary_workload_{len(candidates) + 1}"
             candidates.append(
                 {
+                    "id": f"summary_{len(candidates) + 1}",
                     "label": f"Summary candidate {len(candidates) + 1}",
+                    "status": "pending",
                     "pattern": pattern,
+                    "query_ids": [f"query_{index}"],
                     "query_frequency": query.count,
                     "grouping_column_count": len(group_columns),
                     "grouping_columns_sample": group_columns,
@@ -639,6 +879,126 @@ class WorkloadPlanner:
             for column in columns
         )
         return f'CREATE TABLE IF NOT EXISTS "{table_name}" (\n  {column_defs}\n);'
+
+    def _build_summary_table_messages(self, payload: dict) -> list[dict[str, str]]:
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "/no_think\n"
+                    "You recommend PostgreSQL summary tables for workload acceleration. Return JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Recommend summary tables for the target PostgreSQL database.\n\n"
+                    "Rules:\n"
+                    "1. Recommend summary tables only when they are clearly justified by repeated, expensive, stable query patterns.\n"
+                    "2. Prefer no recommendation when ordinary indexes, fresh base-table reads, or query rewrites are likely enough.\n"
+                    "3. Good candidates include repeated aggregates, stable top-N reports, recurring multi-table reporting joins, and low-staleness analytical snapshots.\n"
+                    "4. Avoid recommending a summary table for point lookups, highly selective transactional queries, volatile data, or one-off queries.\n"
+                    "5. SQL must contain only CREATE TABLE or CREATE TABLE IF NOT EXISTS statements. Do not include INSERT, SELECT AS, materialized views, indexes, triggers, comments, or multiple statements.\n"
+                    "6. Use target table and column names when the target schema is available. Summary tables will be created before query rewrites and before index recommendations.\n"
+                    "7. previous_recommendations contains accepted recommendations from earlier batches; avoid duplicates and redundant summary tables.\n\n"
+                    "Return JSON with this shape:\n"
+                    "{\n"
+                    '  "status": "recommended|no_recommendations",\n'
+                    '  "summary": "short summary",\n'
+                    '  "recommendations": [\n'
+                    "    {\n"
+                    '      "label": "short label",\n'
+                    '      "table_name": "summary_table_name",\n'
+                    '      "pattern": "aggregate_group_by|stable_top_n|reporting_join|other",\n'
+                    '      "query_ids": ["query_1"],\n'
+                    '      "reason": "why this is truly needed",\n'
+                    '      "freshness_expectation": "why staleness is acceptable",\n'
+                    '      "confidence": 0.0,\n'
+                    '      "sql_statement": "CREATE TABLE IF NOT EXISTS ...;"\n'
+                    "    }\n"
+                    "  ]\n"
+                    "}\n\n"
+                    f"Payload:\n{json.dumps(payload, ensure_ascii=True, indent=2)}"
+                ),
+            },
+        ]
+
+    def _summary_recommendations_from_response(
+        self,
+        response_text: str,
+        *,
+        existing_candidates: list[dict],
+    ) -> list[dict]:
+        payload = self._extract_json_object(response_text)
+        candidates: list[dict] = []
+        used_names = {
+            str(candidate.get("table_name", "")).strip().lower()
+            for candidate in existing_candidates
+            if str(candidate.get("table_name", "")).strip()
+        }
+        next_index = len(existing_candidates) + 1
+        for item in payload.get("recommendations", []):
+            if not isinstance(item, dict):
+                continue
+            sql_statement = self._normalize_summary_table_sql(str(item.get("sql_statement", "")))
+            if not sql_statement:
+                continue
+            table_name = self._summary_table_name(str(item.get("table_name", "")), sql_statement)
+            if not table_name:
+                continue
+            dedupe_name = table_name.lower()
+            if dedupe_name in used_names:
+                continue
+            used_names.add(dedupe_name)
+            candidates.append(
+                {
+                    "id": f"summary_{next_index}",
+                    "label": str(item.get("label") or f"Summary candidate {next_index}"),
+                    "status": "pending",
+                    "pattern": str(item.get("pattern", "other") or "other"),
+                    "query_ids": [str(value) for value in item.get("query_ids", []) if str(value).strip()],
+                    "reason": str(item.get("reason", "")),
+                    "freshness_expectation": str(item.get("freshness_expectation", "")),
+                    "confidence": self._confidence(item.get("confidence", 0.5)),
+                    "creation_status": "approval_required",
+                    "table_name": table_name,
+                    "sql_statement": sql_statement,
+                }
+            )
+            next_index += 1
+        return candidates
+
+    def _normalize_summary_table_sql(self, sql_text: str) -> str:
+        statement = sql_text.strip().rstrip(";")
+        if not statement:
+            return ""
+        if ";" in statement:
+            return ""
+        if not re.match(r"^\s*create\s+table(?:\s+if\s+not\s+exists)?\b", statement, re.IGNORECASE):
+            return ""
+        if re.search(r"\b(insert|update|delete|drop|alter|truncate|create\s+index|create\s+materialized\s+view)\b", statement, re.IGNORECASE):
+            return ""
+        return statement + ";"
+
+    def _summary_table_name(self, supplied_name: str, sql_statement: str) -> str:
+        name = re.sub(r"[^A-Za-z0-9_]+", "_", supplied_name.strip().strip('"')).strip("_").lower()
+        if name:
+            return name
+        match = re.search(
+            r"create\s+table(?:\s+if\s+not\s+exists)?\s+(?:\"(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)\"|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
+            sql_statement,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        return (match.group("quoted") or match.group("plain") or "").lower()
+
+    def _confidence(self, value) -> float:
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        return max(0.0, min(1.0, confidence))
 
     def _normalize_statement(self, sql: str, target_table_names: set[str]) -> str:
         normalized = sql.strip().rstrip(";")

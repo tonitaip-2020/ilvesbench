@@ -52,7 +52,7 @@ Benchmarker owns workload and benchmark execution:
 - benchmark result parsing
 - energy estimates
 - benchmark comparison
-- workload-aware index recommendations until those move fully into DBOps
+- workload-aware index recommendations, including LLM-guided create/drop proposals
 
 ### Orchestrator
 
@@ -72,6 +72,14 @@ normalization then move to 3NF review: the LLM proposes candidate functional
 dependencies, DBOps checks candidates against current source data when the
 columns map to one source table, and the user approves or rejects each FD. The
 final 3NF target schema is synthesized deterministically from approved FDs.
+
+Index recommendation is also staged. The Benchmarker builds an LLM prompt from
+the workload queries, target database structure, and current PostgreSQL indexes.
+Large workloads and index sets are split into batches, with prior
+recommendations carried forward to reduce redundant proposals. The LLM may
+recommend compound, expression/function, partial, INCLUDE, and PostgreSQL
+access-method-specific indexes, plus safe index drops. The user must approve
+the generated index-change SQL before DBOps executes it in PostgreSQL.
 
 The legacy `PipelineOrchestrator` is being thinned. New LLM-mediated task
 wrappers live under `ilvesbench.orchestrator`.

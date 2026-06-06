@@ -333,6 +333,138 @@ class WorkloadPlannerTests(unittest.TestCase):
         self.assertEqual(len(plan.candidate_summary_tables), 1)
         self.assertEqual(plan.candidate_summary_tables[0]["pattern"], "aggregate_group_by")
 
+    def test_recommend_summary_tables_omits_point_lookup_workload(self) -> None:
+        planner = WorkloadPlanner(
+            llm=StaticGateway(
+                {
+                    "status": "no_recommendations",
+                    "summary": "No summary tables needed.",
+                    "recommendations": [],
+                }
+            )
+        )
+
+        plan = planner.recommend_summary_tables(
+            LogSummary(
+                path="workload.sql",
+                lines_processed=1,
+                statements_detected=1,
+                transactions_detected=0,
+                multi_statement_transactions=0,
+                top_queries=[
+                    QueryObservation(
+                        fingerprint="lookup order",
+                        sample_sql="SELECT * FROM orders WHERE order_id = ?;",
+                        count=100,
+                    )
+                ],
+                sampled_transactions=[],
+                source_kind="workload_file",
+            ),
+            target_tables=[{"name": "orders", "columns": [{"name": "order_id", "data_type": "integer"}]}],
+        )
+
+        self.assertEqual(plan.status, "no_recommendations")
+        self.assertEqual(plan.candidate_summary_tables, [])
+        self.assertEqual(plan.source, "llm")
+        self.assertIn("Recommend summary tables", planner._llm.messages[0][1]["content"])
+
+    def test_recommend_summary_tables_returns_review_candidates(self) -> None:
+        planner = WorkloadPlanner(
+            llm=StaticGateway(
+                {
+                    "status": "recommended",
+                    "summary": "Top movies can be precomputed.",
+                    "recommendations": [
+                        {
+                            "label": "Top movies",
+                            "table_name": "summary_top_movies",
+                            "pattern": "stable_top_n",
+                            "query_ids": ["query_1"],
+                            "reason": "Repeated stable top-N report.",
+                            "freshness_expectation": "Ratings change slowly.",
+                            "confidence": 0.8,
+                            "sql_statement": (
+                                "CREATE TABLE IF NOT EXISTS summary_top_movies "
+                                "(primarytitle text, averagerating numeric)"
+                            ),
+                        }
+                    ],
+                }
+            )
+        )
+
+        plan = planner.recommend_summary_tables(
+            LogSummary(
+                path="workload.sql",
+                lines_processed=1,
+                statements_detected=1,
+                transactions_detected=0,
+                multi_statement_transactions=0,
+                top_queries=[
+                    QueryObservation(
+                        fingerprint="top movies",
+                        sample_sql=(
+                            "SELECT tb.primarytitle, tr.averagerating FROM title_basics tb "
+                            "JOIN title_ratings tr ON tb.tconst = tr.tconst "
+                            "ORDER BY tr.averagerating DESC LIMIT 250;"
+                        ),
+                        count=25,
+                    )
+                ],
+                sampled_transactions=[],
+                source_kind="workload_file",
+            ),
+            target_tables=[{"name": "title_basics"}, {"name": "title_ratings"}],
+        )
+
+        self.assertEqual(plan.status, "recommended")
+        self.assertEqual(len(plan.candidate_summary_tables), 1)
+        candidate = plan.candidate_summary_tables[0]
+        self.assertEqual(candidate["status"], "pending")
+        self.assertEqual(candidate["table_name"], "summary_top_movies")
+        self.assertTrue(candidate["sql_statement"].endswith(";"))
+
+    def test_build_pgbench_workload_preserves_literal_constants_and_weights(self) -> None:
+        planner = WorkloadPlanner()
+        plan = planner.build_pgbench_workload(
+            [
+                "SELECT title FROM title_basics WHERE titletype = 'movie' AND numvotes > 25000 LIMIT 250;",
+                "SELECT title FROM title_basics WHERE titletype = 'movie' AND numvotes > 25000 LIMIT 250;",
+                "SELECT title FROM title_basics WHERE titletype = 'short' LIMIT 10;",
+            ],
+            source_kind="workload_file",
+        )
+
+        self.assertEqual(plan.status, "completed")
+        self.assertEqual(len(plan.query_mix), 2)
+        self.assertEqual([item["weight"] for item in plan.query_mix], [2, 1])
+        self.assertIn("titletype = 'movie'", plan.workload_sql)
+        self.assertIn("numvotes > 25000", plan.workload_sql)
+        self.assertIn("LIMIT 250", plan.workload_sql)
+        self.assertNotIn("'?'", plan.workload_sql)
+
+    def test_build_pgbench_workload_converts_explicit_question_mark_placeholders(self) -> None:
+        planner = WorkloadPlanner()
+        plan = planner.build_pgbench_workload(
+            ["SELECT * FROM users WHERE id = ?;"],
+            source_kind="workload_file",
+        )
+
+        self.assertEqual(plan.status, "completed")
+        self.assertIn("\\set ilves_q1_p1 1", plan.workload_sql)
+        self.assertIn("id = :ilves_q1_p1", plan.workload_sql)
+
+    def test_build_pgbench_workload_keeps_postgres_log_analysis_placeholder(self) -> None:
+        planner = WorkloadPlanner()
+        plan = planner.build_pgbench_workload(
+            ["SELECT * FROM users WHERE id = 1;"],
+            source_kind="postgres_log",
+        )
+
+        self.assertEqual(plan.status, "placeholder")
+        self.assertEqual(plan.workload_sql, "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,7 @@ class BenchmarkerService:
             llm=llm,
             target_database=config.postgres.new_database,
         )
-        self.index_advisor = IndexAdvisor()
+        self.index_advisor = IndexAdvisor(llm=llm)
         self.tuning_advisor = PostgresTuningAdvisor()
         self.energy_estimator = EnergyEstimator()
         self.benchmark_comparator = BenchmarkComparator()
@@ -111,9 +111,16 @@ class BenchmarkerService:
         }
 
     def split_sql_statements(self, text: str) -> list[str]:
+        cleaned_lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("--") or stripped.startswith("\\"):
+                continue
+            cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines)
         return [
             statement.strip() + ";"
-            for statement in text.split(";")
+            for statement in cleaned.split(";")
             if statement.strip()
         ]
 
