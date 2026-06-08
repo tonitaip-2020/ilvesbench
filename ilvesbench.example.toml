@@ -23,6 +23,9 @@ max_lines = 5000
 [workload]
 path = "data/workload.sql"
 
+[postgresql_conf]
+path = "postgres-config/postgresql.conf"
+
 [docker]
 postgres_container_name = "ilvesbench-postgres"
 prefer_container_snapshot = true

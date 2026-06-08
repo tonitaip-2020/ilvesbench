@@ -113,3 +113,46 @@ class OSOpsService:
             "sampled_transactions": [to_dict(transaction) for transaction in log_summary.sampled_transactions],
             "staged_query_text": staged_query_text,
         }
+
+    def postgresql_conf_status(self) -> dict:
+        path = self._postgresql_conf_path()
+        if path is None:
+            return {
+                "status": "missing",
+                "summary": "No postgresql.conf path is configured.",
+                "path": "",
+                "exists": False,
+                "editable": False,
+                "content": "",
+            }
+        exists = path.exists()
+        content = path.read_text(encoding="utf-8", errors="replace") if exists else ""
+        return {
+            "status": "ok" if exists else "missing",
+            "summary": "postgresql.conf loaded." if exists else "Configured postgresql.conf path does not exist yet.",
+            "path": str(path),
+            "exists": exists,
+            "editable": exists and path.is_file(),
+            "content": content,
+        }
+
+    def save_postgresql_conf(self, content: str) -> dict:
+        path = self._postgresql_conf_path()
+        if path is None:
+            raise ValueError("No postgresql.conf path is configured.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {
+            "status": "ok",
+            "summary": "postgresql.conf saved. Restart or reload PostgreSQL for changes to take effect.",
+            "path": str(path),
+            "exists": True,
+            "editable": True,
+            "content": content,
+        }
+
+    def _postgresql_conf_path(self) -> Path | None:
+        configured = (self._config.postgresql_conf.path or "").strip()
+        if not configured:
+            return None
+        return self._config.resolve_path(configured)

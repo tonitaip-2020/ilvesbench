@@ -6,6 +6,11 @@ const workloadSourceStatusBox = document.getElementById("workloadSourceStatus");
 const originalDatabaseSelect = document.getElementById("originalDatabase");
 const newDatabaseInput = document.getElementById("newDatabase");
 const schemasInput = document.getElementById("schemas");
+const pgbenchDurationInput = document.getElementById("pgbenchDuration");
+const pgbenchClientsInput = document.getElementById("pgbenchClients");
+const pgbenchJobsInput = document.getElementById("pgbenchJobs");
+const pgbenchTransactionsInput = document.getElementById("pgbenchTransactions");
+const postgresqlConfPathInput = document.getElementById("postgresqlConfPath");
 const dbSelectionStatus = document.getElementById("dbSelectionStatus");
 const postgresStatusBox = document.getElementById("postgresStatus");
 
@@ -21,6 +26,8 @@ let lastAutoTargetDatabase = newDatabaseInput.value.trim();
 let profileLoading = false;
 let profileError = "";
 let latestProfilesContext = "";
+let latestPgbenchRecommendation = null;
+let latestPostgresqlConf = null;
 
 const WORKSPACE_TABS = [
   { id: "setup", label: "Setup", steps: ["llm_gateway", "inspect_source_schema", "extract_workload_logs"] },
@@ -85,7 +92,21 @@ function requestContext() {
     original_database: originalDatabaseSelect.value.trim(),
     new_database: newDatabaseInput.value.trim(),
     schemas: selectedSchemas(),
+    postgresql_conf_path: postgresqlConfPathInput.value.trim(),
+    pgbench: {
+      enabled: true,
+      command: "pgbench",
+      duration_seconds: numberInputValue(pgbenchDurationInput, 30),
+      clients: numberInputValue(pgbenchClientsInput, 4),
+      jobs: numberInputValue(pgbenchJobsInput, 1),
+      transactions: pgbenchTransactionsInput.value.trim() ? numberInputValue(pgbenchTransactionsInput, null) : null,
+    },
   };
+}
+
+function numberInputValue(input, fallback) {
+  const parsed = Number(input.value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 function requestContextKey() {
@@ -96,6 +117,8 @@ function requestContextKey() {
     original_database: context.original_database,
     new_database: context.new_database,
     schemas: context.schemas,
+    pgbench: context.pgbench,
+    postgresql_conf_path: context.postgresql_conf_path,
   });
 }
 
@@ -1353,9 +1376,28 @@ function renderPhysical(run, artifacts = {}) {
             ${metricCard("Source", tuning.details?.source || "pending")}
           </div>
           ${renderStepCards(run, ["tune_postgresql_conf"])}
+          ${renderPostgresqlConfEditor()}
         </article>
       </div>
     </section>
+  `;
+}
+
+function renderPostgresqlConfEditor() {
+  const payload = latestPostgresqlConf || {};
+  return `
+    <div class="config-editor">
+      <h3>postgresql.conf</h3>
+      <div class="workload-source-detail">
+        <span>${escapeHtml(payload.path || postgresqlConfPathInput.value.trim() || "No path configured")}</span>
+        <span>${escapeHtml(payload.summary || "Load the file to view or edit it.")}</span>
+      </div>
+      <textarea id="postgresqlConfEditor" spellcheck="false" placeholder="Load postgresql.conf to edit it here.">${escapeHtml(payload.content || "")}</textarea>
+      <div class="action-shelf">
+        <button class="action-button" type="button" data-config-action="load-postgresql-conf">Load postgresql.conf</button>
+        <button class="action-button primary-approval" type="button" data-config-action="save-postgresql-conf">Save postgresql.conf</button>
+      </div>
+    </div>
   `;
 }
 
@@ -1364,9 +1406,25 @@ function renderBenchmark(run) {
   const target = step(run, "run_pgbench_new");
   const sourceName = selectedOriginalDatabase(run) || "source database";
   const targetName = selectedTargetDatabase(run) || "target database";
+  const recommended = latestPgbenchRecommendation?.recommended || {};
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
+        <article class="workspace-panel">
+          <h2>pgbench Settings</h2>
+          <div class="metric-grid">
+            ${metricCard("Duration", `${escapeHtml(pgbenchDurationInput.value || "30")} s`)}
+            ${metricCard("Clients", escapeHtml(pgbenchClientsInput.value || "4"))}
+            ${metricCard("Jobs", escapeHtml(pgbenchJobsInput.value || "1"))}
+            ${metricCard("Transactions", escapeHtml(pgbenchTransactionsInput.value || "time based"))}
+          </div>
+          <p class="summary-text">${escapeHtml(latestPgbenchRecommendation?.summary || "Use hardware recommendations as a starting point, then edit these values before running pgbench.")}</p>
+          <div class="action-shelf">
+            <button class="action-button" type="button" data-config-action="recommend-pgbench">Recommend from hardware</button>
+            <button class="action-button primary-approval" type="button" data-config-action="apply-pgbench-recommendation" ${recommended.clients ? "" : "disabled"}>Apply recommendation</button>
+          </div>
+          ${rawJsonBlock("pgbench recommendation details", latestPgbenchRecommendation || {})}
+        </article>
         <article class="workspace-panel">
           <h2>${escapeHtml(sourceName)}</h2>
           <div class="metric-grid">
@@ -1652,7 +1710,7 @@ async function triggerRunAction(runId, action) {
     : `/api/runs/actions/${action}`;
   const data = await api(path, {
     method: "POST",
-    body: JSON.stringify(runId ? {} : requestContext()),
+    body: JSON.stringify(requestContext()),
   });
   setStatus(`Action ${data.action} accepted.`);
   await pollRun(data.run_id);
@@ -1676,6 +1734,56 @@ async function submitSummaryTableReview(runId, candidateId, decision) {
   });
   setStatus("Summary table review saved.");
   await pollRun(data.run_id);
+}
+
+async function recommendPgbench() {
+  setStatus("Recommending pgbench parameters from hardware...");
+  latestPgbenchRecommendation = await api("/api/pgbench/recommend", {
+    method: "POST",
+    body: JSON.stringify(requestContext()),
+  });
+  await refreshRuns();
+  setStatus(latestPgbenchRecommendation.summary || "pgbench recommendation is ready.");
+}
+
+function applyPgbenchRecommendation() {
+  const recommended = latestPgbenchRecommendation?.recommended || {};
+  if (!recommended.clients) {
+    setStatus("No pgbench recommendation has been loaded yet.", true);
+    return;
+  }
+  pgbenchDurationInput.value = recommended.duration_seconds || pgbenchDurationInput.value;
+  pgbenchClientsInput.value = recommended.clients || pgbenchClientsInput.value;
+  pgbenchJobsInput.value = recommended.jobs || pgbenchJobsInput.value;
+  pgbenchTransactionsInput.value = recommended.transactions || "";
+  latestProfiles = null;
+  latestProfilesContext = "";
+  setStatus("Applied recommended pgbench parameters to the editable fields.");
+  refreshRuns().catch((error) => setStatus(error.message, true));
+}
+
+async function loadPostgresqlConf() {
+  setStatus("Loading postgresql.conf...");
+  latestPostgresqlConf = await api("/api/postgresql-conf", {
+    method: "POST",
+    body: JSON.stringify(requestContext()),
+  });
+  await refreshRuns();
+  setStatus(latestPostgresqlConf.summary || "postgresql.conf loaded.", latestPostgresqlConf.status !== "ok");
+}
+
+async function savePostgresqlConf() {
+  const editor = document.getElementById("postgresqlConfEditor");
+  setStatus("Saving postgresql.conf...");
+  latestPostgresqlConf = await api("/api/postgresql-conf/save", {
+    method: "POST",
+    body: JSON.stringify({
+      ...requestContext(),
+      content: editor ? editor.value : latestPostgresqlConf?.content || "",
+    }),
+  });
+  await refreshRuns();
+  setStatus(latestPostgresqlConf.summary || "postgresql.conf saved.");
 }
 
 async function testLLM() {
@@ -1738,6 +1846,14 @@ document.getElementById("llmButton").addEventListener("click", () => {
 
 document.getElementById("postgresButton").addEventListener("click", () => {
   checkPostgres().catch((error) => setStatus(error.message, true));
+});
+
+document.getElementById("pgbenchRecommendButton").addEventListener("click", () => {
+  recommendPgbench().catch((error) => setStatus(error.message, true));
+});
+
+document.getElementById("postgresqlConfLoadButton").addEventListener("click", () => {
+  loadPostgresqlConf().catch((error) => setStatus(error.message, true));
 });
 
 document.getElementById("refreshButton").addEventListener("click", () => {
@@ -1842,6 +1958,16 @@ runsContainer.addEventListener("click", (event) => {
     latestPostgresStatus = null;
     updateDatabaseSelectionStatus();
     refreshRuns().catch((error) => setStatus(error.message, true));
+    return;
+  }
+
+  const configAction = event.target.closest("[data-config-action]");
+  if (configAction) {
+    const action = configAction.dataset.configAction;
+    if (action === "recommend-pgbench") recommendPgbench().catch((error) => setStatus(error.message, true));
+    if (action === "apply-pgbench-recommendation") applyPgbenchRecommendation();
+    if (action === "load-postgresql-conf") loadPostgresqlConf().catch((error) => setStatus(error.message, true));
+    if (action === "save-postgresql-conf") savePostgresqlConf().catch((error) => setStatus(error.message, true));
     return;
   }
 

@@ -10,11 +10,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from ilvesbench.benchmark.pgbench import PgBenchRunner
+from ilvesbench.benchmark.pgbench import PgBenchParameterAdvisor, PgBenchRunner
 from ilvesbench.benchmark.workload import WorkloadRewriteProposal
 from ilvesbench.benchmarker.query_rewrite import QueryRewriteExecutionError, QueryRewriteService
 from ilvesbench.benchmarker.service import BenchmarkerService
 from ilvesbench.config import IlvesBenchConfig, PgBenchConfig, PostgresConfig, StorageConfig
+from ilvesbench.models import HardwareSnapshot
 
 
 class FakeRunner:
@@ -37,6 +38,29 @@ class FakeRunner:
 
 
 class PgBenchTests(unittest.TestCase):
+    def test_pgbench_parameter_advisor_uses_hardware_as_starting_point(self) -> None:
+        advisor = PgBenchParameterAdvisor()
+        hardware = HardwareSnapshot(
+            collected_at="now",
+            scope="host",
+            platform="test",
+            cpu_count=6,
+            architecture="x86_64",
+            memory_total_bytes=8 * 1024 ** 3,
+            disk_total_bytes=None,
+            disk_free_bytes=None,
+        )
+
+        recommendation = advisor.recommend(
+            hardware,
+            PgBenchConfig(enabled=True, duration_seconds=30, clients=4, jobs=1),
+        )
+
+        self.assertEqual(recommendation["recommended"]["duration_seconds"], 60)
+        self.assertEqual(recommendation["recommended"]["jobs"], 6)
+        self.assertEqual(recommendation["recommended"]["clients"], 24)
+        self.assertIn("starting point", recommendation["summary"])
+
     def test_runner_uses_workload_script_and_parses_metrics(self) -> None:
         fake_runner = FakeRunner(
             stdout="latency average = 12.34 ms\ntps = 456.78 (without initial connection time)\n",

@@ -44,6 +44,11 @@ class WorkloadConfig:
 
 
 @dataclass(slots=True)
+class PostgresConfConfig:
+    path: str | None = None
+
+
+@dataclass(slots=True)
 class DockerConfig:
     postgres_container_name: str | None = "ilvesbench-postgres"
     prefer_container_snapshot: bool = True
@@ -85,6 +90,7 @@ class IlvesBenchConfig:
     postgres: PostgresConfig = field(default_factory=PostgresConfig)
     logs: LogConfig = field(default_factory=LogConfig)
     workload: WorkloadConfig = field(default_factory=WorkloadConfig)
+    postgresql_conf: PostgresConfConfig = field(default_factory=PostgresConfConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     pgbench: PgBenchConfig = field(default_factory=PgBenchConfig)
     energy: EnergyConfig = field(default_factory=EnergyConfig)
@@ -105,6 +111,7 @@ class IlvesBenchConfig:
             postgres=PostgresConfig(**data.get("postgres", {})),
             logs=LogConfig(**data.get("logs", {})),
             workload=WorkloadConfig(**data.get("workload", {})),
+            postgresql_conf=PostgresConfConfig(**data.get("postgresql_conf", {})),
             docker=DockerConfig(**data.get("docker", {})),
             pgbench=PgBenchConfig(**data.get("pgbench", {})),
             energy=EnergyConfig(**data.get("energy", {})),

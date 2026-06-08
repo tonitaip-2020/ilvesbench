@@ -28,6 +28,8 @@ class IlvesBenchServer(ThreadingHTTPServer):
         original_database: str | None = None,
         new_database: str | None = None,
         schemas: list[str] | str | None = None,
+        pgbench: dict | None = None,
+        postgresql_conf_path: str | None = None,
     ) -> None:
         self.config_path = str(Path(config_path).resolve())
         config = self._load_config(config_path)
@@ -42,10 +44,26 @@ class IlvesBenchServer(ThreadingHTTPServer):
             selected_schemas = [schema.strip() for schema in schema_values if schema.strip()]
             if selected_schemas:
                 config.postgres.schemas = selected_schemas
+        if pgbench:
+            self._apply_pgbench_overrides(config, pgbench)
+        if postgresql_conf_path is not None:
+            config.postgresql_conf.path = postgresql_conf_path.strip() or None
         self.orchestrator = PipelineOrchestrator(config)
 
     def _load_config(self, config_path: str) -> IlvesBenchConfig:
         return IlvesBenchConfig.from_toml(config_path)
+
+    def _apply_pgbench_overrides(self, config: IlvesBenchConfig, payload: dict) -> None:
+        if "enabled" in payload:
+            config.pgbench.enabled = bool(payload["enabled"])
+        if str(payload.get("command", "")).strip():
+            config.pgbench.command = str(payload["command"]).strip()
+        for key in ("duration_seconds", "clients", "jobs"):
+            if payload.get(key) in ("", None):
+                continue
+            setattr(config.pgbench, key, max(1, int(payload[key])))
+        transactions = payload.get("transactions")
+        config.pgbench.transactions = None if transactions in ("", None) else max(1, int(transactions))
 
 
 class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
@@ -108,6 +126,8 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             record = self.server.orchestrator.create_mvp_record()
             thread = threading.Thread(
@@ -133,6 +153,8 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             record = self.server.orchestrator.create_state_resume_record()
             thread = threading.Thread(
@@ -268,6 +290,15 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.endswith("/actions/run-pgbench-original"):
             run_id = parsed.path.split("/")[-3]
+            self.server.reload_config(
+                body.get("config_path", self.server.config_path),
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
             self.server.orchestrator.begin_pgbench_original(run_id)
             thread = threading.Thread(
                 target=self.server.orchestrator.execute_pgbench_original,
@@ -279,6 +310,15 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.endswith("/actions/run-pgbench-new"):
             run_id = parsed.path.split("/")[-3]
+            self.server.reload_config(
+                body.get("config_path", self.server.config_path),
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
             self.server.orchestrator.begin_pgbench_new(run_id)
             thread = threading.Thread(
                 target=self.server.orchestrator.execute_pgbench_new,
@@ -324,6 +364,8 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             result = self.server.orchestrator.discover_postgres_databases()
             self._send_json(result)
@@ -336,6 +378,8 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             result = self.server.orchestrator.check_postgres_connection()
             self._send_json(result)
@@ -348,6 +392,8 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             profiles = self.server.orchestrator.profile_databases()
             self._send_json({"status": "ok", "profiles": profiles})
@@ -360,6 +406,8 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             self._send_json(self.server.orchestrator.workload_source_status())
             return
@@ -371,8 +419,49 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 original_database=body.get("original_database"),
                 new_database=body.get("new_database"),
                 schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             self._send_json(self.server.orchestrator.workload_source_preview())
+            return
+        if parsed.path == "/api/pgbench/recommend":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
+            self._send_json(self.server.orchestrator.recommend_pgbench_parameters())
+            return
+        if parsed.path == "/api/postgresql-conf":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
+            self._send_json(self.server.orchestrator.postgresql_conf_status())
+            return
+        if parsed.path == "/api/postgresql-conf/save":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
+            self._send_json(self.server.orchestrator.save_postgresql_conf(str(body.get("content", ""))))
             return
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
 

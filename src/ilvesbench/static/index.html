@@ -40,11 +40,33 @@
           <input id="workloadPath" type="text" placeholder="data/workload.sql">
           <small class="field-help">Relative paths resolve from the config file directory.</small>
         </label>
+        <label class="field">
+          <span>pgbench duration</span>
+          <input id="pgbenchDuration" type="number" min="1" value="30">
+        </label>
+        <label class="field">
+          <span>pgbench clients</span>
+          <input id="pgbenchClients" type="number" min="1" value="4">
+        </label>
+        <label class="field">
+          <span>pgbench jobs</span>
+          <input id="pgbenchJobs" type="number" min="1" value="1">
+        </label>
+        <label class="field">
+          <span>Transactions</span>
+          <input id="pgbenchTransactions" type="number" min="1" placeholder="time based">
+        </label>
+        <label class="field">
+          <span>postgresql.conf path</span>
+          <input id="postgresqlConfPath" type="text" placeholder="postgres-config/postgresql.conf">
+        </label>
         <div class="actions">
           <button id="runButton" class="primary">Start run</button>
           <button id="discoverButton">Discover databases</button>
           <button id="llmButton">Test LLM</button>
           <button id="postgresButton">Check PostgreSQL</button>
+          <button id="pgbenchRecommendButton">Recommend pgbench</button>
+          <button id="postgresqlConfLoadButton">Load postgresql.conf</button>
           <button id="refreshButton">Refresh</button>
         </div>
         <div id="dbSelectionStatus" class="selection-status"></div>

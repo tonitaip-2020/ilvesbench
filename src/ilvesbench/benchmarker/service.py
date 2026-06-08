@@ -6,7 +6,7 @@ from typing import Callable
 
 from ilvesbench.benchmark.energy import BenchmarkComparator, EnergyEstimator
 from ilvesbench.benchmark.index_advisor import IndexAdvisor
-from ilvesbench.benchmark.pgbench import PgBenchRunner
+from ilvesbench.benchmark.pgbench import PgBenchParameterAdvisor, PgBenchRunner
 from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
 from ilvesbench.benchmark.workload import WorkloadPlanner
 from ilvesbench.benchmarker.query_rewrite import QueryRewriteService
@@ -25,6 +25,7 @@ class BenchmarkerService:
         pgbench: PgBenchRunner | None = None,
     ) -> None:
         self.pgbench = pgbench or PgBenchRunner()
+        self.pgbench_advisor = PgBenchParameterAdvisor()
         self.query_rewrite = QueryRewriteService(config)
         self.query_migration = self.query_rewrite
         self.workload_planner = WorkloadPlanner(

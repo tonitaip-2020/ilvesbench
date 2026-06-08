@@ -56,6 +56,7 @@ class PipelineOrchestrator:
         self._logs = self._osops.logs
         self._workload_files = self._osops.workload_files
         self._pgbench = self._benchmarker.pgbench
+        self._pgbench_advisor = self._benchmarker.pgbench_advisor
         self._schema_transformer = self._llm_tasks.schema_transformer
         self._migration_planner = self._llm_tasks.migration_planner
         self._workload_planner = self._benchmarker.workload_planner
@@ -109,6 +110,19 @@ class PipelineOrchestrator:
 
     def workload_source_preview(self) -> dict:
         return self._osops.workload_source_preview()
+
+    def recommend_pgbench_parameters(self) -> dict:
+        try:
+            hardware = self._hardware.collect(self._config.resolve_path("."))
+        except Exception:
+            hardware = None
+        return self._pgbench_advisor.recommend(hardware, self._config.pgbench)
+
+    def postgresql_conf_status(self) -> dict:
+        return self._osops.postgresql_conf_status()
+
+    def save_postgresql_conf(self, content: str) -> dict:
+        return self._osops.save_postgresql_conf(content)
 
     def load_run_record(self, run_id: str) -> BenchmarkRunRecord:
         record = self._store.get_run_record(run_id)
@@ -1317,7 +1331,18 @@ class PipelineOrchestrator:
 
         try:
             if log_path.exists():
-                log_summary = self._logs.parse(log_path, max_lines=self._config.logs.max_lines)
+                log_workload_dir = (
+                    self._config.resolve_path(self._config.storage.artifact_dir)
+                    / record.run_id
+                    / "postgres_log_workloads"
+                )
+                log_summary = self._logs.parse(
+                    log_path,
+                    max_lines=self._config.logs.max_lines,
+                    output_dir=log_workload_dir,
+                    postgres=self._config.postgres,
+                    pgbench=self._config.pgbench,
+                )
             elif resolved_workload_path is not None and resolved_workload_path.exists():
                 log_summary = self._workload_files.parse(resolved_workload_path)
             else:
@@ -1367,6 +1392,8 @@ class PipelineOrchestrator:
                     "statements_detected": log_summary.statements_detected,
                     "transactions_detected": log_summary.transactions_detected,
                     "top_query_count": len(log_summary.top_queries),
+                    "workload_outputs": log_summary.workload_outputs,
+                    "skipped_statement_count": len(log_summary.skipped_statements),
                 },
             )
             return log_summary
@@ -2840,6 +2867,10 @@ class PipelineOrchestrator:
                     count=int(item.get("count", 0)),
                     total_duration_ms=float(item.get("total_duration_ms", 0.0)),
                     proportion=float(item.get("proportion", 0.0)),
+                    database_name=str(item.get("database_name", "")),
+                    normalized_sql=str(item.get("normalized_sql", "")),
+                    raw_sql=str(item.get("raw_sql", "")),
+                    parameters=list(item.get("parameters", [])),
                 )
                 for item in payload.get("top_queries", [])
             ],
@@ -2852,6 +2883,8 @@ class PipelineOrchestrator:
                 for item in payload.get("sampled_transactions", [])
             ],
             source_kind=str(payload.get("source_kind", "postgres_log")),
+            workload_outputs=dict(payload.get("workload_outputs", {})),
+            skipped_statements=list(payload.get("skipped_statements", [])),
         )
 
     def _resolve_run_artifact_path(self, record: BenchmarkRunRecord, name: str) -> Path | None:

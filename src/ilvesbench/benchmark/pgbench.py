@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 from ilvesbench.config import PgBenchConfig, PostgresConfig
-from ilvesbench.models import BenchmarkMetrics
+from ilvesbench.models import BenchmarkMetrics, HardwareSnapshot
 from ilvesbench.osops.subprocesses import SubprocessRunner
 
 
@@ -124,3 +124,51 @@ class PgBenchRunner:
         else:
             args.extend(["-T", str(config.duration_seconds)])
         return args
+
+
+class PgBenchParameterAdvisor:
+    def recommend(self, hardware: HardwareSnapshot | None, current: PgBenchConfig) -> dict:
+        cpu_count = int(hardware.cpu_count or 1) if hardware is not None else 1
+        memory_bytes = int(hardware.memory_total_bytes or 0) if hardware is not None and hardware.memory_total_bytes else 0
+        jobs = max(1, min(cpu_count, 8))
+        clients = max(4, jobs * 4)
+        if memory_bytes:
+            memory_gib = memory_bytes / (1024 ** 3)
+            clients = min(clients, max(4, int(memory_gib * 8)))
+        duration_seconds = max(int(current.duration_seconds or 0), 60)
+        recommendation = {
+            "enabled": current.enabled,
+            "command": current.command,
+            "duration_seconds": duration_seconds,
+            "clients": clients,
+            "jobs": jobs,
+            "transactions": current.transactions,
+            "source": "hardware_rule_of_thumb",
+            "hardware": {
+                "scope": hardware.scope if hardware else "unknown",
+                "cpu_count": cpu_count,
+                "memory_total_bytes": memory_bytes or None,
+                "container_name": hardware.container_name if hardware else None,
+            },
+            "rationale": [
+                f"Use up to {jobs} pgbench worker job(s), bounded by detected CPU count and a conservative cap.",
+                f"Start with {clients} client(s), roughly four clients per job unless memory limits are tight.",
+                "Use at least 60 seconds for benchmark duration so short startup effects matter less.",
+            ],
+        }
+        return {
+            "status": "recommended",
+            "summary": (
+                f"Recommended pgbench -T {duration_seconds} -c {clients} -j {jobs} "
+                "from detected hardware. Treat this as a starting point, not a capacity proof."
+            ),
+            "current": {
+                "enabled": current.enabled,
+                "command": current.command,
+                "duration_seconds": current.duration_seconds,
+                "clients": current.clients,
+                "jobs": current.jobs,
+                "transactions": current.transactions,
+            },
+            "recommended": recommendation,
+        }

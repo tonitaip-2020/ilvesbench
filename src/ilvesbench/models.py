@@ -87,6 +87,10 @@ class QueryObservation:
     count: int
     total_duration_ms: float = 0.0
     proportion: float = 0.0
+    database_name: str = ""
+    normalized_sql: str = ""
+    raw_sql: str = ""
+    parameters: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -106,6 +110,8 @@ class LogSummary:
     top_queries: list[QueryObservation]
     sampled_transactions: list[TransactionObservation]
     source_kind: str = "postgres_log"
+    workload_outputs: dict[str, dict] = field(default_factory=dict)
+    skipped_statements: list[dict] = field(default_factory=list)
 
 
 @dataclass(slots=True)
