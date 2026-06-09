@@ -28,6 +28,7 @@ let profileError = "";
 let latestProfilesContext = "";
 let latestPgbenchRecommendation = null;
 let latestPostgresqlConf = null;
+let latestWorkspace = null;
 
 const WORKSPACE_TABS = [
   { id: "setup", label: "Setup", steps: ["llm_gateway", "inspect_source_schema", "extract_workload_logs"] },
@@ -38,6 +39,7 @@ const WORKSPACE_TABS = [
   { id: "physical", label: "Physical design", steps: ["optimize_indexes", "create_secondary_indexes", "tune_postgresql_conf"] },
   { id: "benchmark", label: "Benchmark", steps: ["run_pgbench_original", "run_pgbench_new"] },
   { id: "compare", label: "Compare", steps: ["compare_disk_usage"] },
+  { id: "diagnostics", label: "Diagnostics", steps: [] },
 ];
 
 const STEP_TITLES = {
@@ -162,8 +164,13 @@ function selectionOnlyRun(sourceRun = null) {
     steps: [],
     artifacts: {},
     selectionOnly: true,
+    workspaceBacked: workspaceHasArtifacts(),
     previousRunId: sourceRun?.run_id || "",
   };
+}
+
+function workspaceHasArtifacts() {
+  return Boolean(latestWorkspace && Object.keys(latestWorkspace.artifacts || {}).length);
 }
 
 function workloadSourcePath(status) {
@@ -234,6 +241,20 @@ function rawSqlBlock(title, statements, path = "") {
     <details class="raw-sql">
       <summary>${escapeHtml(title)}${path ? `<span>${escapeHtml(path)}</span>` : ""}</summary>
       <textarea readonly spellcheck="false">${escapeHtml(sql)}</textarea>
+    </details>
+  `;
+}
+
+function editableSqlBlock(title, artifactKey, statements, path = "") {
+  const sql = Array.isArray(statements) ? statements.filter(Boolean).join("\n\n") : String(statements || "");
+  if (!sql.trim()) return "";
+  return `
+    <details class="raw-sql editable-sql" open>
+      <summary>${escapeHtml(title)}${path ? `<span>${escapeHtml(path)}</span>` : ""}</summary>
+      <textarea data-workspace-sql-editor="${escapeHtml(artifactKey)}" spellcheck="false">${escapeHtml(sql)}</textarea>
+      <div class="raw-sql-actions">
+        <button class="action-button primary-approval" type="button" data-workspace-sql-save="${escapeHtml(artifactKey)}">Save edited SQL for this database pair</button>
+      </div>
     </details>
   `;
 }
@@ -423,6 +444,9 @@ function effectiveStep(run, name) {
 }
 
 function aggregateStatus(run, names, tabId = "") {
+  if (tabId === "diagnostics") {
+    return run?.run_id ? "completed" : "pending";
+  }
   if (tabId === "setup") {
     const llm = latestLlmStatus?.status || step(run, "llm_gateway").status || "pending";
     const postgres = latestPostgresStatus?.status === "ok" ? "completed" : step(run, "inspect_source_schema").status || "pending";
@@ -628,6 +652,77 @@ async function fetchArtifact(runId, artifactName) {
   return api(`/api/runs/${runId}/artifacts/${artifactName}`);
 }
 
+async function fetchDiagnostics(runId) {
+  return api(`/api/runs/${runId}/diagnostics`);
+}
+
+async function refreshWorkspaceStatus() {
+  try {
+    latestWorkspace = await api("/api/workspace/status", {
+      method: "POST",
+      body: JSON.stringify(requestContext()),
+    });
+  } catch (error) {
+    latestWorkspace = null;
+  }
+}
+
+function hydrateRunFromWorkspace(run, workspace = latestWorkspace) {
+  if (!workspace?.artifacts) return run;
+  const existing = new Map((run.steps || []).map((item) => [item.name, item]));
+  const steps = [...(run.steps || [])];
+  for (const [name, artifact] of Object.entries(workspace.artifacts || {})) {
+    if (!STEP_TITLES[name]) continue;
+    const details = workspaceDetailsForStep(name, artifact || {});
+    const status = details.step_status || details.status || (details.sql_text || details.sql_statements?.length || details.statements?.length ? "planned" : "pending");
+    const nextStep = {
+      name,
+      title: STEP_TITLES[name],
+      status: ["completed", "planned", "failed", "input_required", "running", "pending"].includes(status) ? status : "planned",
+      details,
+      error: details.error || null,
+      planned_only: status === "planned",
+    };
+    if (existing.has(name)) {
+      const index = steps.findIndex((item) => item.name === name);
+      if (run.selectionOnly || statusRank(nextStep.status) >= statusRank(steps[index].status || "pending")) {
+        steps[index] = { ...steps[index], ...nextStep, details: { ...(steps[index].details || {}), ...details } };
+      }
+    } else {
+      steps.push(nextStep);
+    }
+  }
+  return {
+    ...run,
+    steps,
+    workspaceBacked: workspaceHasArtifacts(),
+    workspace_id: workspace.workspace_id || "",
+  };
+}
+
+function workspaceDetailsForStep(name, artifact) {
+  const details = { ...artifact };
+  const sqlText = String(details.sql_text || details.workload_sql || "");
+  if (sqlText && name === "migrate_data" && !details.statements) {
+    details.statements = splitSqlStatements(sqlText).map((sql) => ({ sql }));
+  } else if (sqlText && ["create_target_schema", "suggest_summary_tables", "optimize_indexes", "create_secondary_indexes"].includes(name) && !details.sql_statements) {
+    details.sql_statements = splitSqlStatements(sqlText);
+  } else if (sqlText && ["rewrite_queries", "generate_benchmark_workload"].includes(name) && !details.statements) {
+    details.statements = splitSqlStatements(sqlText);
+    details.workload_path = details.workload_path || details.sql_path || "";
+    details.workload_sql = details.workload_sql || sqlText;
+  }
+  return details;
+}
+
+function splitSqlStatements(sqlText) {
+  return String(sqlText || "")
+    .split(";")
+    .map((statement) => statement.trim())
+    .filter(Boolean)
+    .map((statement) => `${statement};`);
+}
+
 async function loadCurrentArtifacts(run) {
   const artifacts = {};
   const names = [
@@ -653,6 +748,13 @@ async function loadCurrentArtifacts(run) {
           .catch(() => {}),
       ),
   );
+  if (run.run_id) {
+    await fetchDiagnostics(run.run_id)
+      .then((payload) => {
+        artifacts.diagnostics = payload;
+      })
+      .catch(() => {});
+  }
   return artifacts;
 }
 
@@ -854,7 +956,7 @@ function renderRiskSignals(profile) {
 }
 
 function actionButton(run, action, label, tone = "", disabledReason = "", allowWithoutRun = false) {
-  const effectiveReason = disabledReason || (!run.run_id && !allowWithoutRun ? "Start a run for this database pair first." : "");
+  const effectiveReason = disabledReason || (!run.run_id && !allowWithoutRun && !run.workspaceBacked ? "Start a run for this database pair first." : "");
   const disabled = effectiveReason ? "disabled" : "";
   const title = effectiveReason ? ` title="${escapeHtml(effectiveReason)}"` : "";
   const reason = effectiveReason ? `<small>${escapeHtml(effectiveReason)}</small>` : "";
@@ -870,7 +972,7 @@ function originalActions(run) {
   const actions = [];
   const originalBench = step(run, "run_pgbench_original");
   const sourceName = selectedOriginalDatabase(run) || "source database";
-  const disabledReason = run.selectionOnly
+  const disabledReason = run.selectionOnly && !run.workspaceBacked
     ? `Start a run for ${sourceName} first.`
     : originalBench.details?.workload_path
     ? ""
@@ -904,7 +1006,7 @@ function targetActions(run, profile = latestProfiles?.target || {}) {
   const indexSqlCount = secondaryIndexSqlStatements(run).length;
   const hasIndexSql = indexSqlCount > 0;
   const readiness = targetReadiness(run, profile);
-  const selectionOnlyReason = run.selectionOnly ? `Start a run for ${selectedOriginalDatabase(run) || "the selected source database"} first.` : "";
+  const selectionOnlyReason = run.selectionOnly && !run.workspaceBacked ? `Start a run for ${selectedOriginalDatabase(run) || "the selected source database"} first.` : "";
   const querySourceReady = latestWorkloadStatus?.status === "ok"
     || (workloadStep.status === "completed" && Number(workloadStep.details?.statements_detected || 0) > 0);
   const noTargetReason = !readiness.exists && createStep.status !== "completed" ? `${targetName} does not exist yet.` : "";
@@ -1132,7 +1234,7 @@ function renderNormalize(run, targetProfile = latestProfiles?.target || {}, arti
             `).join("")}
           </div>
         ` : ""}
-        ${rawSqlBlock("Raw CREATE TABLE SQL", details.sql_statements || [], step(run, "create_target_schema").details?.sql_path || "")}
+        ${editableSqlBlock("Editable CREATE TABLE SQL for target structure", "create_target_schema", step(run, "create_target_schema").details?.sql_text || step(run, "create_target_schema").details?.sql_statements || details.sql_statements || [], step(run, "create_target_schema").details?.sql_path || "")}
         ${rawJsonBlock("Normalization data sent to LLM", normalizationArtifact.llm_request || details.llm_request || "")}
         ${rawJsonBlock("Normalization LLM/raw response", normalizationArtifact.raw_response_text || details.raw_response_text || "")}
         ${rawJsonBlock("Normalization proposal data sent toward DDL generation", {
@@ -1163,8 +1265,8 @@ function renderMigrate(run, targetProfile, artifacts = {}) {
         <article class="workspace-panel">
           <h2>Target Database</h2>
           ${renderStepCards(run, ["create_target_schema", "migrate_data"])}
-          ${rawSqlBlock("Raw CREATE TABLE SQL", createStep.details?.sql_statements || [], createStep.details?.sql_path || "")}
-          ${rawSqlBlock("Raw INSERT ... SELECT SQL", migrationSql, migrateStep.details?.sql_path || "")}
+          ${editableSqlBlock("Editable CREATE TABLE SQL", "create_target_schema", createStep.details?.sql_text || createStep.details?.sql_statements || [], createStep.details?.sql_path || "")}
+          ${editableSqlBlock("Editable INSERT ... SELECT SQL", "migrate_data", migrateStep.details?.sql_text || migrationSql, migrateStep.details?.sql_path || "")}
           ${rawJsonBlock("Normalization data sent to LLM", normalizationArtifact.llm_request || "")}
           ${rawJsonBlock("Normalization LLM/raw response", normalizationArtifact.raw_response_text || "")}
           ${rawJsonBlock("Data migration data sent to LLM", migrationArtifact.llm_request || migrateStep.details?.llm_request || "")}
@@ -1284,8 +1386,8 @@ function renderWorkload(run, artifacts) {
           ${rawJsonBlock("Query rewrite LLM raw response", rawResponse)}
           ${rawJsonBlock("Query validation comparisons", validation.details?.query_results || [])}
           ${rawJsonBlock("Generated workload proportions", workloadMix)}
-          ${rawSqlBlock("Generated pgbench workload SQL", generatedWorkloadSql, generatedWorkloadArtifact.workload_path || generatedWorkload.details?.workload_path || "")}
-          ${rawSqlBlock(`Raw rewritten query SQL for ${selectedTargetDatabase(run) || "target database"}`, rewrittenStatements, rewrite.details?.workload_path || "")}
+          ${editableSqlBlock("Generated pgbench workload SQL", "generate_benchmark_workload", generatedWorkloadArtifact.sql_text || generatedWorkloadSql, generatedWorkloadArtifact.workload_path || generatedWorkload.details?.workload_path || "")}
+          ${editableSqlBlock(`Editable rewritten query SQL for ${selectedTargetDatabase(run) || "target database"}`, "rewrite_queries", rewriteArtifact.sql_text || rewrittenStatements, rewrite.details?.workload_path || "")}
         </article>
         <article class="workspace-panel">
           <h2>Summary Tables</h2>
@@ -1301,7 +1403,7 @@ function renderWorkload(run, artifacts) {
               "discover-summary-tables",
               "Recommend summary tables",
               "",
-              run.selectionOnly
+              run.selectionOnly && !run.workspaceBacked
                 ? "Start a run for this database pair first."
                 : summaryTables.status === "running"
                 ? "Summary-table recommendation discovery is already running."
@@ -1317,7 +1419,7 @@ function renderWorkload(run, artifacts) {
               "create-summary-tables",
               `Create summary table structures${summarySql.length ? ` (${summarySql.length})` : ""}`,
               "primary-approval",
-              run.selectionOnly
+              run.selectionOnly && !run.workspaceBacked
                 ? "Start a run for this database pair first."
                 : pendingSummaryCount
                 ? "Approve or reject each summary-table candidate first."
@@ -1332,7 +1434,7 @@ function renderWorkload(run, artifacts) {
           ${renderSummaryTableReviews(run, candidates)}
           ${rawJsonBlock("Summary table data sent to LLM", summaryArtifact.llm_request || summaryTables.details?.llm_request || {})}
           ${rawJsonBlock("Summary table LLM raw response", summaryArtifact.raw_response_text || summaryTables.details?.raw_response_text || "")}
-          ${rawSqlBlock("Raw summary-table CREATE TABLE SQL", summarySql, summaryArtifact.sql_path || summaryTables.details?.sql_path || "")}
+          ${editableSqlBlock("Editable summary-table CREATE TABLE SQL", "suggest_summary_tables", summaryArtifact.sql_text || summarySql, summaryArtifact.sql_path || summaryTables.details?.sql_path || "")}
         </article>
       </div>
     </section>
@@ -1360,7 +1462,7 @@ function renderPhysical(run, artifacts = {}) {
           </div>
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("discover-index-recommendations") || html.includes("create-secondary-indexes")).join("")}</div>
           ${renderStepCards(run, ["optimize_indexes", "create_secondary_indexes"])}
-          ${rawSqlBlock("Raw index-change SQL", indexSql)}
+          ${editableSqlBlock("Editable index-change SQL", "optimize_indexes", indexArtifact.sql_text || indexSql)}
           ${rawJsonBlock("Index recommendation details", {
             recommendations,
             sql_statements: indexArtifact.sql_statements || indexes.details?.sql_statements || indexSql,
@@ -1469,6 +1571,71 @@ function renderCompare(run, artifacts) {
   `;
 }
 
+function renderDiagnostics(run, artifacts) {
+  const diagnostics = artifacts.diagnostics || {};
+  const events = diagnostics.events || [];
+  const paths = diagnostics.paths || {};
+  if (!run.run_id) {
+    return `
+      <section class="tab-panel">
+        <article class="workspace-panel">
+          <h2>Diagnostics</h2>
+          <div class="empty-inline">Start or select a run to see its raw diagnostic log.</div>
+        </article>
+      </section>
+    `;
+  }
+  return `
+    <section class="tab-panel">
+      <article class="workspace-panel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">Raw run log</span>
+            <h2>Diagnostics</h2>
+          </div>
+          ${pill(diagnostics.status || "empty", diagnostics.status === "ok" ? "completed" : "pending")}
+        </div>
+        <div class="metric-grid">
+          ${metricCard("Events", formatNumber(diagnostics.event_count || events.length))}
+          ${metricCard("JSONL", paths.jsonl || "not written")}
+          ${metricCard("Human log", paths.human || "not written")}
+        </div>
+        <div class="diagnostic-stream">
+          ${events.length ? events.map(renderDiagnosticEvent).join("") : `<div class="empty-inline">No diagnostic events have been written for this run yet.</div>`}
+        </div>
+        ${rawSqlBlock("Human-readable log", diagnostics.human_log || "", paths.human || "")}
+        ${rawJsonBlock("Structured events", events)}
+      </article>
+    </section>
+  `;
+}
+
+function renderDiagnosticEvent(event) {
+  const severity = event.severity || "info";
+  const details = event.details || {};
+  const artifacts = event.artifacts || {};
+  return `
+    <article class="diagnostic-event diagnostic-${escapeHtml(severity)}">
+      <div class="diagnostic-line">
+        <span class="diagnostic-severity">${escapeHtml(severity)}</span>
+        <strong>${escapeHtml(event.message || "")}</strong>
+        <time>${escapeHtml(event.timestamp || "")}</time>
+      </div>
+      <div class="diagnostic-meta">
+        <span>run: ${escapeHtml(event.run_id || "server")}</span>
+        <span>component: ${escapeHtml(event.component || "system")}</span>
+        <span>step: ${escapeHtml(event.step || "-")}</span>
+      </div>
+      ${Object.keys(artifacts).length ? `
+        <div class="diagnostic-artifacts">
+          ${Object.entries(artifacts).map(([label, path]) => `<span>${escapeHtml(label)}: ${escapeHtml(path)}</span>`).join("")}
+        </div>
+      ` : ""}
+      ${rawJsonBlock("Event details", details)}
+    </article>
+  `;
+}
+
 function renderActiveTab(run, artifacts, sourceProfile, targetProfile) {
   if (activeTab === "profile") return renderProfile(run, sourceProfile, targetProfile);
   if (activeTab === "normalize") return renderNormalize(run, targetProfile, artifacts);
@@ -1477,6 +1644,7 @@ function renderActiveTab(run, artifacts, sourceProfile, targetProfile) {
   if (activeTab === "physical") return renderPhysical(run, artifacts);
   if (activeTab === "benchmark") return renderBenchmark(run);
   if (activeTab === "compare") return renderCompare(run, artifacts);
+  if (activeTab === "diagnostics") return renderDiagnostics(run, artifacts);
   return renderSetup(run, sourceProfile);
 }
 
@@ -1574,21 +1742,26 @@ async function refreshWorkloadSourceStatus() {
 
 async function renderRuns(runs) {
   const latestRun = runs[0] || null;
-  const currentRun = runMatchesSelection(latestRun) ? latestRun : selectionOnlyRun(latestRun);
-  const artifacts = latestRun && runMatchesSelection(latestRun) ? await loadCurrentArtifacts(latestRun) : {};
+  const matchingRun = runs.find((run) => runMatchesSelection(run)) || null;
+  const baseRun = matchingRun || selectionOnlyRun(latestRun);
+  const runArtifacts = matchingRun ? await loadCurrentArtifacts(matchingRun) : {};
+  const workspaceArtifacts = latestWorkspace?.artifacts || {};
+  const artifacts = { ...runArtifacts, ...workspaceArtifacts };
+  if (runArtifacts.diagnostics) artifacts.diagnostics = runArtifacts.diagnostics;
+  const currentRun = hydrateRunFromWorkspace(baseRun, latestWorkspace);
   const sourceProfile = latestProfiles?.original
-    || (runMatchesSelection(latestRun) && artifacts.inspect_source_schema ? profileFromSchema(artifacts.inspect_source_schema) : null)
+    || (artifacts.inspect_source_schema ? profileFromSchema(artifacts.inspect_source_schema) : null)
     || pendingProfile(selectedOriginalDatabase(currentRun), "source");
   const targetProfile = latestProfiles?.target
-    || (runMatchesSelection(latestRun) ? targetProfileFromRun(currentRun) : null)
+    || targetProfileFromRun(currentRun)
     || pendingProfile(selectedTargetDatabase(currentRun), "target");
-  const headerLabel = currentRun.selectionOnly ? "Selected database pair" : "Current run";
-  const headerTitle = currentRun.selectionOnly
-    ? `${selectedOriginalDatabase(currentRun) || "source"} -> ${selectedTargetDatabase(currentRun) || "target"}`
-    : currentRun.run_id;
+  const headerLabel = "Database pair workspace";
+  const headerTitle = `${selectedOriginalDatabase(currentRun) || "source"} -> ${selectedTargetDatabase(currentRun) || "target"}`;
   const headerMeta = currentRun.selectionOnly
-    ? (latestRun ? `Latest saved run ${latestRun.run_id} uses a different database pair or query source.` : "No run exists for this database pair and query source yet.")
-    : currentRun.created_at;
+    ? (workspaceHasArtifacts()
+      ? `Workspace ${latestWorkspace.workspace_id} has saved artifacts for this database pair.`
+      : "No saved artifacts exist for this database pair yet.")
+    : `Latest execution run ${currentRun.run_id} from ${currentRun.created_at}.`;
   const switchLatestButton = currentRun.selectionOnly && latestRun?.summary?.original_database && latestRun?.summary?.new_database
     ? `<button class="action-button" type="button" data-use-run-selection data-original-database="${escapeHtml(latestRun.summary.original_database)}" data-new-database="${escapeHtml(latestRun.summary.new_database)}" data-workload-path="${escapeHtml(latestRun.summary.configured_workload_path || "")}">
         <span>Use latest run settings</span>
@@ -1616,6 +1789,7 @@ async function renderRuns(runs) {
 
 async function refreshRuns() {
   await refreshWorkloadSourceStatus();
+  await refreshWorkspaceStatus();
   const data = await api("/api/runs");
   const runs = data.runs || [];
   const contextKey = requestContextKey();
@@ -1784,6 +1958,29 @@ async function savePostgresqlConf() {
   });
   await refreshRuns();
   setStatus(latestPostgresqlConf.summary || "postgresql.conf saved.");
+}
+
+async function saveWorkspaceSql(artifactKey) {
+  const editor = document.querySelector(`[data-workspace-sql-editor="${artifactKey}"]`);
+  if (!editor) {
+    setStatus("Could not find the SQL editor for this artifact.", true);
+    return;
+  }
+  setStatus(`Saving ${artifactKey} SQL for this database pair...`);
+  const result = await api("/api/workspace/save-sql", {
+    method: "POST",
+    body: JSON.stringify({
+      ...requestContext(),
+      artifact_key: artifactKey,
+      content: editor.value,
+    }),
+  });
+  latestWorkspace = await api("/api/workspace/status", {
+    method: "POST",
+    body: JSON.stringify(requestContext()),
+  });
+  await refreshRuns();
+  setStatus(result.summary || "Saved SQL for this database pair.");
 }
 
 async function testLLM() {
@@ -1968,6 +2165,12 @@ runsContainer.addEventListener("click", (event) => {
     if (action === "apply-pgbench-recommendation") applyPgbenchRecommendation();
     if (action === "load-postgresql-conf") loadPostgresqlConf().catch((error) => setStatus(error.message, true));
     if (action === "save-postgresql-conf") savePostgresqlConf().catch((error) => setStatus(error.message, true));
+    return;
+  }
+
+  const workspaceSqlSave = event.target.closest("[data-workspace-sql-save]");
+  if (workspaceSqlSave) {
+    saveWorkspaceSql(workspaceSqlSave.dataset.workspaceSqlSave).catch((error) => setStatus(error.message, true));
     return;
   }
 

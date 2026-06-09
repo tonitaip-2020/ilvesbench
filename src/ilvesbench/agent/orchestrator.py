@@ -14,6 +14,7 @@ from ilvesbench.config import IlvesBenchConfig
 from ilvesbench.core.components import ComponentBundle
 from ilvesbench.core.run_state import RunStateService
 from ilvesbench.dbops.service import DBOpsService
+from ilvesbench.diagnostics import DiagnosticLogger, LoggingLLMGateway
 from ilvesbench.llm.gateway import LLMGateway
 from ilvesbench.models import (
     BenchmarkRunRecord,
@@ -27,6 +28,7 @@ from ilvesbench.models import (
 from ilvesbench.orchestrator.llm_tasks import LLMTaskService
 from ilvesbench.osops.service import OSOpsService
 from ilvesbench.store.repository import RunRepository
+from ilvesbench.store.workspace import DatabaseWorkspaceStore
 
 
 class PipelineOrchestrator:
@@ -36,8 +38,10 @@ class PipelineOrchestrator:
             config.resolve_path(config.storage.sqlite_path),
             config.resolve_path(config.storage.artifact_dir),
         )
+        self._workspace_store = DatabaseWorkspaceStore(config.resolve_path(config.storage.artifact_dir))
+        self._diagnostics = DiagnosticLogger(config.resolve_path(config.storage.artifact_dir))
         self._run_state = RunStateService()
-        self._llm = LLMGateway.from_config(config.llm)
+        self._llm = LoggingLLMGateway(LLMGateway.from_config(config.llm), self._diagnostics)
         self._components = ComponentBundle(
             dbops=DBOpsService(config.postgres),
             osops=OSOpsService(config),
@@ -84,10 +88,11 @@ class PipelineOrchestrator:
         self._benchmarker.workload_planner = self._workload_planner
 
     def test_llm(self) -> dict:
-        result = self._llm.generate(
-            [{"role": "user", "content": "Say hello in one short sentence."}],
-            max_tokens=50,
-        )
+        with self._diagnostics.scoped(step="llm_gateway", component="orchestrator"):
+            result = self._llm.generate(
+                [{"role": "user", "content": "Say hello in one short sentence."}],
+                max_tokens=50,
+            )
         return to_dict(result)
 
     def check_postgres_connection(self) -> dict:
@@ -124,10 +129,33 @@ class PipelineOrchestrator:
     def save_postgresql_conf(self, content: str) -> dict:
         return self._osops.save_postgresql_conf(content)
 
+    def diagnostic_log(self, run_id: str, *, limit: int = 300) -> dict:
+        if self._store.get_run(run_id) is None:
+            raise ValueError(f"Run not found: {run_id}")
+        return self._diagnostics.read_run_logs(run_id, limit=limit)
+
+    def workspace_status(self) -> dict:
+        return self._workspace_store.status(self._workspace_context())
+
+    def save_workspace_sql(self, artifact_key: str, content: str) -> dict:
+        allowed = {
+            "create_target_schema",
+            "migrate_data",
+            "rewrite_queries",
+            "generate_benchmark_workload",
+            "suggest_summary_tables",
+            "optimize_indexes",
+        }
+        if artifact_key not in allowed:
+            raise ValueError(f"Workspace SQL artifact cannot be edited: {artifact_key}")
+        record = self._workspace_store.save_sql(self._workspace_context(), artifact_key, content)
+        return {"status": "ok", "summary": f"Saved {artifact_key} SQL for this database pair.", "record": record}
+
     def load_run_record(self, run_id: str) -> BenchmarkRunRecord:
         record = self._store.get_run_record(run_id)
         if record is None:
             raise ValueError(f"Run not found: {run_id}")
+        self._diagnostics.activate(record.run_id, component="orchestrator")
         self._apply_run_database_context(record)
         return record
 
@@ -209,6 +237,13 @@ class PipelineOrchestrator:
             },
         )
         self._store.upsert_run(record)
+        self._diagnostics.event(
+            "Run created.",
+            severity="info",
+            component="orchestrator",
+            run_id=record.run_id,
+            details=record.summary,
+        )
         return record
 
     def create_state_resume_record(self) -> BenchmarkRunRecord:
@@ -230,12 +265,93 @@ class PipelineOrchestrator:
             },
         )
         self._store.upsert_run(record)
+        self._diagnostics.event(
+            "State-resume run created.",
+            severity="info",
+            component="orchestrator",
+            run_id=record.run_id,
+            details=record.summary,
+        )
         return record
+
+    def create_workspace_action_record(self) -> BenchmarkRunRecord:
+        record = self.create_state_resume_record()
+        record = self._hydrate_record_from_workspace(record)
+        record.summary["mode"] = "database_pair_action"
+        record.summary.update(self._summary_counts(record))
+        record.status = self._overall_status(record)
+        record.updated_at = datetime.now(UTC).isoformat()
+        self._store.upsert_run(record)
+        return record
+
+    def _hydrate_record_from_workspace(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        workspace = self.workspace_status()
+        artifacts = workspace.get("artifacts", {})
+        for key, payload in artifacts.items():
+            if not isinstance(payload, dict):
+                continue
+            details = dict(payload)
+            status = str(details.get("step_status") or details.get("status") or "planned")
+            if key == "create_target_schema":
+                details = self._workspace_create_schema_details(details)
+                status = "planned" if details.get("sql_statements") else status
+            elif key == "migrate_data":
+                details = self._workspace_migration_details(details)
+                status = "planned" if details.get("statements") else status
+            elif key in {"rewrite_queries", "generate_benchmark_workload"}:
+                details = self._workspace_workload_details(details)
+                status = "completed" if details.get("statements") or details.get("workload_path") else status
+            elif key in {"suggest_summary_tables", "optimize_indexes", "create_secondary_indexes"}:
+                details = self._workspace_sql_statement_details(details)
+                status = "planned" if key == "create_secondary_indexes" and details.get("sql_statements") else status
+            if key in {step.name for step in record.steps}:
+                record = self._replace_step(
+                    record,
+                    key,
+                    status=status if status in {"completed", "planned", "failed", "input_required"} else "planned",
+                    details=details,
+                    error=details.get("error"),
+                    planned_only=status == "planned",
+                )
+        return record
+
+    def _workspace_create_schema_details(self, details: dict) -> dict:
+        sql_text = str(details.get("sql_text") or "")
+        if sql_text and not details.get("sql_statements"):
+            details["sql_statements"] = self._split_sql_statements(sql_text)
+        return details
+
+    def _workspace_migration_details(self, details: dict) -> dict:
+        sql_text = str(details.get("sql_text") or "")
+        if sql_text and not details.get("statements"):
+            details["statements"] = [{"sql": statement} for statement in self._split_sql_statements(sql_text)]
+        return details
+
+    def _workspace_workload_details(self, details: dict) -> dict:
+        sql_text = str(details.get("sql_text") or details.get("workload_sql") or "")
+        if sql_text and not details.get("statements"):
+            details["statements"] = self._split_sql_statements(sql_text)
+        if sql_text and not details.get("workload_sql"):
+            details["workload_sql"] = sql_text
+        return details
+
+    def _workspace_sql_statement_details(self, details: dict) -> dict:
+        sql_text = str(details.get("sql_text") or "")
+        if sql_text and not details.get("sql_statements"):
+            details["sql_statements"] = self._split_sql_statements(sql_text)
+        return details
 
     def execute_query_migration_from_current_state(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         return self.execute_query_rewrite_from_current_state(record)
 
     def execute_query_rewrite_from_current_state(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        diagnostic_tokens = self._diagnostics.activate(record.run_id, component="orchestrator")
+        self._diagnostics.event(
+            "State-resume query rewrite workflow started.",
+            severity="info",
+            component="orchestrator",
+            details=record.summary,
+        )
         try:
             schema = self._run_schema_step(record)
             log_summary = self._run_logs_step(record)
@@ -333,9 +449,23 @@ class PipelineOrchestrator:
         finally:
             record.updated_at = datetime.now(UTC).isoformat()
             self._store.upsert_run(record)
+            self._diagnostics.event(
+                "State-resume query rewrite workflow finished.",
+                severity="success" if record.status != "failed" else "error",
+                component="orchestrator",
+                details={"status": record.status, "summary": record.summary},
+            )
+            self._diagnostics.reset(diagnostic_tokens)
         return record
 
     def execute_mvp_collection(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
+        diagnostic_tokens = self._diagnostics.activate(record.run_id, component="orchestrator")
+        self._diagnostics.event(
+            "Run execution started.",
+            severity="info",
+            component="orchestrator",
+            details=record.summary,
+        )
         try:
             record = self._run_llm_step(record)
             schema = self._run_schema_step(record)
@@ -350,7 +480,8 @@ class PipelineOrchestrator:
                     if first_normal_form_scan is not None
                     else []
                 )
-                proposal = self._schema_transformer.analyze(schema, first_normal_form_findings)
+                with self._diagnostics.scoped(step="propose_3nf_schema", component="orchestrator"):
+                    proposal = self._schema_transformer.analyze(schema, first_normal_form_findings)
                 proposal_dict = {
                     "status": proposal.status,
                     "summary": proposal.summary,
@@ -388,6 +519,12 @@ class PipelineOrchestrator:
                     record.run_id,
                     "normalization_proposal",
                     proposal_dict | {"raw_response_text": proposal.raw_response_text},
+                )
+                self._mirror_workspace_artifact(
+                    record,
+                    "propose_3nf_schema",
+                    proposal_dict | {"raw_response_text": proposal.raw_response_text},
+                    sql_text="\n\n".join(proposal_dict.get("sql_statements", [])),
                 )
                 if review_candidates:
                     record = self._input_required_step(record, "propose_3nf_schema", proposal_dict)
@@ -427,6 +564,13 @@ class PipelineOrchestrator:
         finally:
             record.updated_at = datetime.now(UTC).isoformat()
             self._store.upsert_run(record)
+            self._diagnostics.event(
+                "Run execution finished.",
+                severity="success" if record.status != "failed" else "error",
+                component="orchestrator",
+                details={"status": record.status, "summary": record.summary},
+            )
+            self._diagnostics.reset(diagnostic_tokens)
         return record
 
     def run_mvp_collection(self) -> BenchmarkRunRecord:
@@ -455,8 +599,29 @@ class PipelineOrchestrator:
             if not sql_statements:
                 raise ValueError("No schema-creation SQL is available for this run.")
 
+            self._diagnostics.event(
+                "Creating target database/schema.",
+                severity="info",
+                component="dbops",
+                step="create_target_schema",
+                details={
+                    "database": self._config.postgres.new_database,
+                    "statement_count": len(sql_statements),
+                },
+            )
             database_result = self._postgres.create_database_if_missing(self._config.postgres.new_database)
             executed = self._postgres.execute_statements(self._config.postgres.new_database, sql_statements)
+            self._diagnostics.event(
+                "Target schema SQL executed.",
+                severity="success",
+                component="dbops",
+                step="create_target_schema",
+                details={
+                    "database": self._config.postgres.new_database,
+                    "database_result": database_result,
+                    "executed_statement_count": len(executed),
+                },
+            )
             record = self._complete_step(
                 record,
                 "create_target_schema",
@@ -476,6 +641,13 @@ class PipelineOrchestrator:
             record.summary.update(self._summary_counts(record))
             record.status = self._overall_status(record)
         except Exception as exc:
+            self._diagnostics.event(
+                "Target schema creation failed.",
+                severity="error",
+                component="dbops",
+                step="create_target_schema",
+                details={"database": self._config.postgres.new_database, "error": str(exc)},
+            )
             record = self._replace_step(
                 record,
                 "create_target_schema",
@@ -556,11 +728,29 @@ class PipelineOrchestrator:
                 raise ValueError("No migration SQL is available for this run.")
 
             self._sync_component_aliases()
+            self._diagnostics.event(
+                "Executing data migration SQL.",
+                severity="info",
+                component="dbops",
+                step="migrate_data",
+                details={
+                    "source_database": self._config.postgres.original_database,
+                    "target_database": self._config.postgres.new_database,
+                    "statement_count": len(statements),
+                },
+            )
             execution = self._dbops.migration.execute_migration(
                 run_id=record.run_id,
                 schema=schema,
                 target_tables=migrate_step.details.get("target_tables", []),
                 statements=statements,
+            )
+            self._diagnostics.event(
+                "Data migration SQL executed.",
+                severity="success",
+                component="dbops",
+                step="migrate_data",
+                details=execution,
             )
             record = self._complete_step(
                 record,
@@ -584,6 +774,17 @@ class PipelineOrchestrator:
             record.summary.update(self._summary_counts(record))
             record.status = self._overall_status(record)
         except Exception as exc:
+            self._diagnostics.event(
+                "Data migration failed.",
+                severity="error",
+                component="dbops",
+                step="migrate_data",
+                details={
+                    "source_database": self._config.postgres.original_database,
+                    "target_database": self._config.postgres.new_database,
+                    "error": str(exc),
+                },
+            )
             record = self._fail_step(record, "migrate_data", str(exc))
             record.status = "failed"
             record.summary["error"] = str(exc)
@@ -806,7 +1007,21 @@ class PipelineOrchestrator:
             ]
             if not statements:
                 raise ValueError("No summary-table CREATE TABLE SQL is available.")
+            self._diagnostics.event(
+                "Creating approved summary table structures.",
+                severity="info",
+                component="dbops",
+                step="suggest_summary_tables",
+                details={"database": self._config.postgres.new_database, "statement_count": len(statements)},
+            )
             executed = self._postgres.execute_statements(self._config.postgres.new_database, statements)
+            self._diagnostics.event(
+                "Summary table structures created.",
+                severity="success",
+                component="dbops",
+                step="suggest_summary_tables",
+                details={"database": self._config.postgres.new_database, "executed_statement_count": len(executed)},
+            )
             details = dict(summary_step.details)
             candidates = [dict(candidate) for candidate in details.get("candidates", [])]
             approved_tables = {
@@ -838,6 +1053,13 @@ class PipelineOrchestrator:
             record = self._plan_pgbench_new_step(record)
             record.summary.pop("error", None)
         except Exception as exc:
+            self._diagnostics.event(
+                "Summary table creation failed.",
+                severity="error",
+                component="dbops",
+                step="suggest_summary_tables",
+                details={"database": self._config.postgres.new_database, "error": str(exc)},
+            )
             record = self._replace_step(
                 record,
                 "suggest_summary_tables",
@@ -1112,6 +1334,12 @@ class PipelineOrchestrator:
                         "normalization_proposal",
                         details,
                     )
+                    self._mirror_workspace_artifact(
+                        record,
+                        "propose_3nf_schema",
+                        details,
+                        sql_text="\n\n".join(details.get("sql_statements", [])),
+                    )
                     record = self._input_required_step(record, "propose_3nf_schema", details)
                     record.summary.update(self._summary_counts(record))
                     record.status = self._overall_status(record)
@@ -1138,6 +1366,12 @@ class PipelineOrchestrator:
             record.run_id,
             "normalization_proposal",
             details,
+        )
+        self._mirror_workspace_artifact(
+            record,
+            "propose_3nf_schema",
+            details,
+            sql_text="\n\n".join(details.get("sql_statements", [])),
         )
         record = self._complete_step(record, "propose_3nf_schema", details)
         record = self._plan_target_schema_step(record)
@@ -1179,12 +1413,13 @@ class PipelineOrchestrator:
             normalization_step = next(step for step in record.steps if step.name == "propose_3nf_schema")
             create_step = next(step for step in record.steps if step.name == "create_target_schema")
             self._sync_component_aliases()
-            repaired = self._llm_tasks.repair_schema(
-                schema,
-                normalization_step.details.get("target_tables", []),
-                normalization_step.details.get("sql_statements", []),
-                create_step.error or record.summary.get("error", ""),
-            )
+            with self._diagnostics.scoped(step="create_target_schema", component="orchestrator"):
+                repaired = self._llm_tasks.repair_schema(
+                    schema,
+                    normalization_step.details.get("target_tables", []),
+                    normalization_step.details.get("sql_statements", []),
+                    create_step.error or record.summary.get("error", ""),
+                )
             proposal_dict = {
                 "status": repaired.status,
                 "summary": repaired.summary,
@@ -1199,6 +1434,12 @@ class PipelineOrchestrator:
                 record.run_id,
                 "normalization_proposal",
                 proposal_dict | {"raw_response_text": repaired.raw_response_text},
+            )
+            self._mirror_workspace_artifact(
+                record,
+                "propose_3nf_schema",
+                proposal_dict | {"raw_response_text": repaired.raw_response_text},
+                sql_text="\n\n".join(proposal_dict.get("sql_statements", [])),
             )
             record = self._complete_step(record, "propose_3nf_schema", proposal_dict)
             record = self._plan_target_schema_step(record)
@@ -1378,6 +1619,7 @@ class PipelineOrchestrator:
             record.artifacts["extract_workload_logs"] = self._store.write_artifact(
                 record.run_id, "log_summary", log_dict
             )
+            self._mirror_workspace_artifact(record, "extract_workload_logs", log_dict)
             self._complete_step(
                 record,
                 "extract_workload_logs",
@@ -1405,6 +1647,20 @@ class PipelineOrchestrator:
         step = next(step for step in record.steps if step.name == "run_pgbench_original")
         workload_path = self._resolve_workload_path()
         try:
+            self._diagnostics.event(
+                "Starting pgbench against source database.",
+                severity="info",
+                component="benchmarker",
+                step="run_pgbench_original",
+                details={
+                    "database": self._config.postgres.original_database,
+                    "workload_path": str(workload_path) if workload_path else "",
+                    "duration_seconds": self._config.pgbench.duration_seconds,
+                    "clients": self._config.pgbench.clients,
+                    "jobs": self._config.pgbench.jobs,
+                    "transactions": self._config.pgbench.transactions,
+                },
+            )
             benchmark = self._pgbench.run(
                 self._config.pgbench,
                 self._config.postgres,
@@ -1419,6 +1675,13 @@ class PipelineOrchestrator:
                 workload_path=workload_path,
             )
         except Exception as exc:
+            self._diagnostics.event(
+                "pgbench source benchmark failed before result capture.",
+                severity="error",
+                component="benchmarker",
+                step="run_pgbench_original",
+                details={"database": self._config.postgres.original_database, "error": str(exc)},
+            )
             record = self._replace_step(
                 record,
                 "run_pgbench_original",
@@ -1438,6 +1701,20 @@ class PipelineOrchestrator:
         step = next(step for step in record.steps if step.name == "run_pgbench_new")
         workload_path = workload_path_override or self._rewritten_workload_path(record)
         try:
+            self._diagnostics.event(
+                "Starting pgbench against target database.",
+                severity="info",
+                component="benchmarker",
+                step="run_pgbench_new",
+                details={
+                    "database": self._config.postgres.new_database,
+                    "workload_path": str(workload_path) if workload_path else "",
+                    "duration_seconds": self._config.pgbench.duration_seconds,
+                    "clients": self._config.pgbench.clients,
+                    "jobs": self._config.pgbench.jobs,
+                    "transactions": self._config.pgbench.transactions,
+                },
+            )
             benchmark = self._pgbench.run(
                 self._config.pgbench,
                 self._config.postgres,
@@ -1453,6 +1730,13 @@ class PipelineOrchestrator:
                 extra_details={"workload_validation": validation_warning} if validation_warning else None,
             )
         except Exception as exc:
+            self._diagnostics.event(
+                "pgbench target benchmark failed before result capture.",
+                severity="error",
+                component="benchmarker",
+                step="run_pgbench_new",
+                details={"database": self._config.postgres.new_database, "error": str(exc)},
+            )
             record = self._replace_step(
                 record,
                 "run_pgbench_new",
@@ -1645,7 +1929,21 @@ class PipelineOrchestrator:
             if not statements:
                 raise ValueError("No secondary-index SQL statements are available for this run.")
 
+            self._diagnostics.event(
+                "Applying approved index changes.",
+                severity="info",
+                component="dbops",
+                step="create_secondary_indexes",
+                details={"database": self._config.postgres.new_database, "statement_count": len(statements)},
+            )
             executed = self._postgres.execute_statements(self._config.postgres.new_database, statements)
+            self._diagnostics.event(
+                "Approved index changes applied.",
+                severity="success",
+                component="dbops",
+                step="create_secondary_indexes",
+                details={"database": self._config.postgres.new_database, "executed_statement_count": len(executed)},
+            )
             record = self._complete_step(
                 record,
                 "create_secondary_indexes",
@@ -1660,6 +1958,13 @@ class PipelineOrchestrator:
                 [self._config.postgres.original_database, self._config.postgres.new_database],
             )
         except Exception as exc:
+            self._diagnostics.event(
+                "Index change execution failed.",
+                severity="error",
+                component="dbops",
+                step="create_secondary_indexes",
+                details={"database": self._config.postgres.new_database, "error": str(exc)},
+            )
             record = self._replace_step(
                 record,
                 "create_secondary_indexes",
@@ -1748,6 +2053,19 @@ class PipelineOrchestrator:
         if extra_details:
             details.update(extra_details)
         if benchmark.status == "completed":
+            self._diagnostics.event(
+                "pgbench completed.",
+                severity="success",
+                component="benchmarker",
+                step=step_name,
+                details={
+                    "database": benchmark.database,
+                    "throughput_tps": benchmark.throughput_tps,
+                    "average_latency_ms": benchmark.average_latency_ms,
+                    "command": benchmark.command,
+                },
+                artifacts={step_name: record.artifacts.get(step_name, "")},
+            )
             details["summary"] = (
                 f'pgbench completed against "{benchmark.database}" with '
                 f"{benchmark.throughput_tps} tps and {benchmark.average_latency_ms} ms average latency."
@@ -1755,10 +2073,37 @@ class PipelineOrchestrator:
             return self._complete_step(record, step_name, details)
 
         if benchmark.status == "skipped":
+            self._diagnostics.event(
+                "pgbench skipped.",
+                severity="warning",
+                component="benchmarker",
+                step=step_name,
+                details={
+                    "database": benchmark.database,
+                    "stderr": benchmark.stderr,
+                    "stdout": benchmark.stdout,
+                    "command": benchmark.command,
+                },
+                artifacts={step_name: record.artifacts.get(step_name, "")},
+            )
             details["summary"] = self._pgbench_error_summary(benchmark.stderr or benchmark.stdout) or "pgbench was skipped."
             return self._complete_step(record, step_name, details)
 
         fatal_error = self._pgbench_error_summary(benchmark.stderr or benchmark.stdout)
+        self._diagnostics.event(
+            "pgbench failed.",
+            severity="error",
+            component="benchmarker",
+            step=step_name,
+            details={
+                "database": benchmark.database,
+                "fatal_error": fatal_error,
+                "stderr": benchmark.stderr,
+                "stdout": benchmark.stdout,
+                "command": benchmark.command,
+            },
+            artifacts={step_name: record.artifacts.get(step_name, "")},
+        )
         details["fatal_error"] = fatal_error
         details["summary"] = fatal_error or "pgbench did not run."
         return self._replace_step(
@@ -1894,7 +2239,8 @@ class PipelineOrchestrator:
         target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
         try:
             self._sync_component_aliases()
-            proposal_dict = self._llm_tasks.plan_migration(schema, target_tables)
+            with self._diagnostics.scoped(step="migrate_data", component="orchestrator"):
+                proposal_dict = self._llm_tasks.plan_migration(schema, target_tables)
             raw_response_text = proposal_dict.pop("raw_response_text", "")
             if proposal_dict["statements"]:
                 migration_sql = "\n\n".join(statement["sql"] for statement in proposal_dict["statements"]) + "\n"
@@ -1910,6 +2256,12 @@ class PipelineOrchestrator:
                 record.run_id,
                 "migration_plan",
                 proposal_dict | {"raw_response_text": raw_response_text},
+            )
+            self._mirror_workspace_artifact(
+                record,
+                "migrate_data",
+                proposal_dict | {"raw_response_text": raw_response_text},
+                sql_text="\n\n".join(statement["sql"] for statement in proposal_dict.get("statements", [])),
             )
             if proposal_dict["statements"]:
                 return self._mark_planned(record, "migrate_data", proposal_dict)
@@ -1968,11 +2320,12 @@ class PipelineOrchestrator:
         if not target_tables:
             target_tables = self._existing_target_tables()
 
-        workload_plan = self._workload_planner.recommend_summary_tables(
-            log_summary,
-            source_tables=source_tables,
-            target_tables=target_tables,
-        )
+        with self._diagnostics.scoped(step="suggest_summary_tables", component="orchestrator"):
+            workload_plan = self._workload_planner.recommend_summary_tables(
+                log_summary,
+                source_tables=source_tables,
+                target_tables=target_tables,
+            )
         sql_statements = [
             str(candidate.get("sql_statement", "")).strip()
             for candidate in workload_plan.candidate_summary_tables
@@ -2019,6 +2372,12 @@ class PipelineOrchestrator:
             record.run_id,
             "summary_table_recommendations",
             details,
+        )
+        self._mirror_workspace_artifact(
+            record,
+            "suggest_summary_tables",
+            details,
+            sql_text="\n\n".join(sql_statements),
         )
         return record
 
@@ -2125,31 +2484,32 @@ class PipelineOrchestrator:
                 nonlocal record
                 record = self._save_query_rewrite_progress(record, progress, status="running")
 
-            result = self._benchmarker.query_rewrite.rewrite_incremental(
-                workload_sql=workload_sql,
-                source_statements=source_statements,
-                source_tables=source_tables,
-                target_tables=prompt_target_tables,
-                migration_statements=migration_statements,
-                rewrite_batch=lambda pending_sql, source_tables, target_tables, statements, batch_size: self._workload_planner.rewrite(
-                    pending_sql,
-                    target_tables,
-                    statements,
-                    batch_size=batch_size,
+            with self._diagnostics.scoped(step="rewrite_queries", component="orchestrator"):
+                result = self._benchmarker.query_rewrite.rewrite_incremental(
+                    workload_sql=workload_sql,
+                    source_statements=source_statements,
                     source_tables=source_tables,
-                ),
-                repair_rewrite=lambda source_statement, previous_rewrite, validation, source_tables, target_tables, statements, query_index, batch_size: self._workload_planner.repair_rewrite(
-                    source_statement,
-                    previous_rewrite,
-                    validation,
-                    target_tables,
-                    statements,
-                    query_index=query_index,
-                    source_tables=source_tables,
-                ),
-                validate_statement=self._validate_rewritten_query_statement,
-                on_progress=save_progress,
-            )
+                    target_tables=prompt_target_tables,
+                    migration_statements=migration_statements,
+                    rewrite_batch=lambda pending_sql, source_tables, target_tables, statements, batch_size: self._workload_planner.rewrite(
+                        pending_sql,
+                        target_tables,
+                        statements,
+                        batch_size=batch_size,
+                        source_tables=source_tables,
+                    ),
+                    repair_rewrite=lambda source_statement, previous_rewrite, validation, source_tables, target_tables, statements, query_index, batch_size: self._workload_planner.repair_rewrite(
+                        source_statement,
+                        previous_rewrite,
+                        validation,
+                        target_tables,
+                        statements,
+                        query_index=query_index,
+                        source_tables=source_tables,
+                    ),
+                    validate_statement=self._validate_rewritten_query_statement,
+                    on_progress=save_progress,
+                )
             progress = result.progress
             ordered_statements = result.ordered_statements
             invalid_count = result.invalid_count
@@ -2446,6 +2806,12 @@ class PipelineOrchestrator:
                 "benchmark_workload",
                 details | {"workload_sql": plan.workload_sql},
             )
+            self._mirror_workspace_artifact(
+                record,
+                "generate_benchmark_workload",
+                details | {"workload_sql": plan.workload_sql},
+                sql_text=plan.workload_sql,
+            )
             return self._complete_step(record, "generate_benchmark_workload", details)
 
         record.artifacts["generate_benchmark_workload"] = self._store.write_artifact(
@@ -2453,6 +2819,7 @@ class PipelineOrchestrator:
             "benchmark_workload",
             details,
         )
+        self._mirror_workspace_artifact(record, "generate_benchmark_workload", details)
         return self._mark_planned(record, "generate_benchmark_workload", details)
 
     def _existing_target_tables(self) -> list[dict]:
@@ -2498,15 +2865,42 @@ class PipelineOrchestrator:
             target_exists = self._postgres.database_exists(self._config.postgres.new_database)
         except Exception as exc:
             # Planning can run before PostgreSQL is available; validation is best-effort then.
+            self._diagnostics.event(
+                "Skipped target workload validation because target existence could not be checked.",
+                severity="warning",
+                component="dbops",
+                step="validate_query_results",
+                details={"database": self._config.postgres.new_database, "error": str(exc)},
+            )
             return []
         if not target_exists:
             return []
         try:
-            return self._postgres.validate_workload_statements(
+            errors = self._postgres.validate_workload_statements(
                 self._config.postgres.new_database,
                 statements,
             )
+            self._diagnostics.event(
+                "Validated rewritten workload statements against PostgreSQL.",
+                severity="warning" if errors else "success",
+                component="dbops",
+                step="validate_query_results",
+                details={
+                    "database": self._config.postgres.new_database,
+                    "statement_count": len(statements),
+                    "error_count": len(errors),
+                    "errors": errors[:10],
+                },
+            )
+            return errors
         except Exception as exc:
+            self._diagnostics.event(
+                "Target workload validation failed.",
+                severity="error",
+                component="dbops",
+                step="validate_query_results",
+                details={"database": self._config.postgres.new_database, "error": str(exc)},
+            )
             return [{"statement": "", "error": str(exc)}]
 
     def _split_sql_statements(self, text: str) -> list[str]:
@@ -2567,13 +2961,14 @@ class PipelineOrchestrator:
         target_tables = normalization_step.details.get("target_tables", []) if normalization_step else []
         try:
             workload_sql = self._load_rewritten_or_source_workload_text(record, log_summary)
-            plan = self._index_advisor.recommend(
-                schema=schema,
-                target_tables=target_tables,
-                workload_sql=workload_sql,
-                log_summary=log_summary,
-                use_llm=use_llm,
-            )
+            with self._diagnostics.scoped(step="optimize_indexes", component="orchestrator"):
+                plan = self._index_advisor.recommend(
+                    schema=schema,
+                    target_tables=target_tables,
+                    workload_sql=workload_sql,
+                    log_summary=log_summary,
+                    use_llm=use_llm,
+                )
             recommendations = [to_dict(item) for item in plan.recommendations]
             plan_dict = {
                 "status": plan.status,
@@ -2833,8 +3228,124 @@ class PipelineOrchestrator:
             planned_only=planned_only,
             template_step=template_step,
         )
+        severity = {
+            "completed": "success",
+            "failed": "error",
+            "input_required": "warning",
+            "planned": "info",
+            "running": "info",
+        }.get(status, "info")
+        self._diagnostics.event(
+            f"Step {name} is {status}.",
+            severity=severity,
+            component="orchestrator",
+            step=name,
+            run_id=record.run_id,
+            details={
+                "status": status,
+                "planned_only": planned_only,
+                "error": error,
+                "summary": details.get("summary") if isinstance(details, dict) else "",
+            },
+        )
+        self._mirror_step_to_workspace(record, name, status, details)
         self._store.upsert_run(record)
         return record
+
+    def _mirror_step_to_workspace(
+        self,
+        record: BenchmarkRunRecord,
+        name: str,
+        status: str,
+        details: dict,
+    ) -> None:
+        if status == "running" or not isinstance(details, dict):
+            return
+        workspace_steps = {
+            "extract_workload_logs",
+            "propose_3nf_schema",
+            "create_target_schema",
+            "migrate_data",
+            "rewrite_queries",
+            "validate_query_results",
+            "generate_benchmark_workload",
+            "suggest_summary_tables",
+            "optimize_indexes",
+            "create_secondary_indexes",
+            "run_pgbench_original",
+            "run_pgbench_new",
+        }
+        if name not in workspace_steps:
+            return
+        payload = {
+            **details,
+            "step_name": name,
+            "step_status": status,
+            "run_id": record.run_id,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        sql_text = self._step_sql_text(name, details)
+        self._mirror_workspace_artifact(record, name, payload, sql_text=sql_text or None)
+
+    def _step_sql_text(self, name: str, details: dict) -> str:
+        if name == "create_target_schema":
+            statements = details.get("sql_statements", [])
+            return "\n\n".join(str(statement).strip() for statement in statements if str(statement).strip())
+        if name == "migrate_data":
+            statements = details.get("statements", [])
+            sql_statements = [
+                str(statement.get("sql", "") if isinstance(statement, dict) else statement).strip()
+                for statement in statements
+            ]
+            return "\n\n".join(statement for statement in sql_statements if statement)
+        if name in {"rewrite_queries", "generate_benchmark_workload"}:
+            statements = details.get("statements", [])
+            if statements:
+                return "\n\n".join(str(statement).strip() for statement in statements if str(statement).strip())
+            return str(details.get("workload_sql", "") or details.get("sql_text", "") or "")
+        if name in {"suggest_summary_tables", "optimize_indexes", "create_secondary_indexes"}:
+            statements = details.get("sql_statements", [])
+            return "\n\n".join(str(statement).strip() for statement in statements if str(statement).strip())
+        return ""
+
+    def _workspace_context(self) -> dict:
+        resolved_workload_path = self._resolve_workload_path()
+        workload_source = {
+            "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
+            "resolved_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+            "log_path": str(self._config.resolve_path(self._config.logs.path)),
+        }
+        return self._workspace_store.context(
+            source_database=self._config.postgres.original_database,
+            target_database=self._config.postgres.new_database,
+            schemas=list(self._config.postgres.schemas),
+            workload_source=workload_source,
+        )
+
+    def _mirror_workspace_artifact(
+        self,
+        record: BenchmarkRunRecord,
+        key: str,
+        payload: dict,
+        *,
+        sql_text: str | None = None,
+    ) -> None:
+        try:
+            self._workspace_store.upsert_artifact(
+                self._workspace_context(),
+                key,
+                payload,
+                sql_text=sql_text,
+                source_run_id=record.run_id,
+            )
+        except Exception as exc:
+            self._diagnostics.event(
+                "Could not update database-pair workspace artifact.",
+                severity="warning",
+                component="orchestrator",
+                run_id=record.run_id,
+                details={"artifact_key": key, "error": str(exc)},
+            )
 
     def _load_schema_artifact(self, record: BenchmarkRunRecord) -> SchemaSnapshot:
         target = self._resolve_run_artifact_path(record, "inspect_source_schema")

@@ -79,6 +79,15 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             self.server.orchestrator.recover_stale_running_runs()
             self._send_json({"runs": self.server.orchestrator.store.list_runs()})
             return
+        if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/diagnostics"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 4:
+                run_id = parts[2]
+                try:
+                    self._send_json(self.server.orchestrator.diagnostic_log(run_id))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.NOT_FOUND)
+                return
         if "/artifacts/" in parsed.path and parsed.path.startswith("/api/runs/"):
             parts = parsed.path.strip("/").split("/")
             if len(parts) == 5:
@@ -156,7 +165,7 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 pgbench=body.get("pgbench"),
                 postgresql_conf_path=body.get("postgresql_conf_path"),
             )
-            record = self.server.orchestrator.create_state_resume_record()
+            record = self.server.orchestrator.create_workspace_action_record()
             thread = threading.Thread(
                 target=self.server.orchestrator.execute_query_rewrite_from_current_state,
                 args=(record,),
@@ -167,6 +176,74 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 {"status": "accepted", "run_id": record.run_id, "action": "regenerate-rewrite"},
                 status=HTTPStatus.ACCEPTED,
             )
+            return
+        if parsed.path.startswith("/api/runs/actions/"):
+            action = parsed.path.rsplit("/", 1)[-1]
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
+            record = self.server.orchestrator.create_workspace_action_record()
+            action_handlers = {
+                "create-schema": (
+                    self.server.orchestrator.begin_create_target_schema,
+                    self.server.orchestrator.execute_create_target_schema,
+                ),
+                "migrate-data": (
+                    self.server.orchestrator.begin_migrate_data,
+                    self.server.orchestrator.execute_migrate_data,
+                ),
+                "discover-summary-tables": (
+                    self.server.orchestrator.begin_discover_summary_tables,
+                    self.server.orchestrator.execute_discover_summary_tables,
+                ),
+                "create-summary-tables": (
+                    self.server.orchestrator.begin_create_summary_tables,
+                    self.server.orchestrator.execute_create_summary_tables,
+                ),
+                "discover-index-recommendations": (
+                    self.server.orchestrator.begin_discover_index_recommendations,
+                    self.server.orchestrator.execute_discover_index_recommendations,
+                ),
+                "create-secondary-indexes": (
+                    self.server.orchestrator.begin_create_secondary_indexes,
+                    self.server.orchestrator.execute_create_secondary_indexes,
+                ),
+                "run-pgbench-original": (
+                    self.server.orchestrator.begin_pgbench_original,
+                    self.server.orchestrator.execute_pgbench_original,
+                ),
+                "run-pgbench-new": (
+                    self.server.orchestrator.begin_pgbench_new,
+                    self.server.orchestrator.execute_pgbench_new,
+                ),
+                "reset-target-db": (
+                    self.server.orchestrator.begin_reset_target_db,
+                    self.server.orchestrator.execute_reset_target_db,
+                ),
+                "truncate-target-data": (
+                    self.server.orchestrator.begin_truncate_target_data,
+                    self.server.orchestrator.execute_truncate_target_data,
+                ),
+            }
+            if action not in action_handlers:
+                self._send_json({"error": "Unknown workspace action."}, status=HTTPStatus.NOT_FOUND)
+                return
+            begin, execute = action_handlers[action]
+            begin(record.run_id)
+            thread = threading.Thread(
+                target=execute,
+                args=(record.run_id,),
+                daemon=True,
+            )
+            thread.start()
+            self._send_json({"status": "accepted", "run_id": record.run_id, "action": action}, status=HTTPStatus.ACCEPTED)
             return
         if parsed.path.endswith("/actions/create-schema"):
             run_id = parsed.path.split("/")[-3]
@@ -423,6 +500,40 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
                 postgresql_conf_path=body.get("postgresql_conf_path"),
             )
             self._send_json(self.server.orchestrator.workload_source_preview())
+            return
+        if parsed.path == "/api/workspace/status":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
+            self._send_json(self.server.orchestrator.workspace_status())
+            return
+        if parsed.path == "/api/workspace/save-sql":
+            config_path = body.get("config_path", self.server.config_path)
+            self.server.reload_config(
+                config_path,
+                workload_path=body.get("workload_path"),
+                original_database=body.get("original_database"),
+                new_database=body.get("new_database"),
+                schemas=body.get("schemas"),
+                pgbench=body.get("pgbench"),
+                postgresql_conf_path=body.get("postgresql_conf_path"),
+            )
+            try:
+                self._send_json(
+                    self.server.orchestrator.save_workspace_sql(
+                        str(body.get("artifact_key", "")),
+                        str(body.get("content", "")),
+                    )
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         if parsed.path == "/api/pgbench/recommend":
             config_path = body.get("config_path", self.server.config_path)

@@ -155,3 +155,7 @@ python3 -m unittest discover -s tests
 - Safety: destructive steps are present as explicit approval-gated pipeline stages instead of hidden side effects.
 - Determinism: the executed MVP path is a normal Python workflow that can run without the LLM.
 - Extensibility: the schema transformer, migrator, and richer metrics collectors already have module boundaries, so later work can fill them in without reshaping the whole codebase.
+
+## Disclaimer
+
+This software is provided "as is", without warranty of any kind, express or implied. By using, modifying, or distributing this software, you acknowledge and agree that you do so entirely at your own risk. The authors, contributors, and maintainers shall not be liable for any claim, damages, loss, or other liability arising from or related to the use of this software.
