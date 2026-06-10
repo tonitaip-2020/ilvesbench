@@ -1,113 +1,83 @@
-# IlvesBench 0.2
+# IlvesBench
 
-IlvesBench is a system for automated PostgreSQL benchmarking and schema-evolution analysis.
+<p align="center">
+  <img src="docs/assets/ilvesbench-logo.png" alt="IlvesBench logo" width="180">
+</p>
 
-The current implementation follows the following architecture:
+IlvesBench is a PostgreSQL benchmarking and schema-evolution prototype. It compares a selected source database with a target database, helps generate and review normalization SQL, data migration SQL, query rewrites, summary table recommendations, index recommendations, and `pgbench` workloads.
 
-- `llm/`: interchangeable planner gateway clients
-- `agent/`: orchestration, run-state tracking, and policy enforcement
-- `db/`: PostgreSQL inspection and database-side tool wrappers
-- `osops/`: query-log parsing, hardware inspection, and subprocess wrappers
-- `benchmark/`: deterministic benchmark runners and future workload/schema modules
-- `store/`: durable run metadata and JSON artifact persistence
-- `api/`: lightweight HTTP API for a browser UI
+The prototype is intentionally human-in-the-loop: generated SQL is visible, editable, and approval-gated before PostgreSQL-side changes are executed.
 
-The LLM is intentionally constrained to planner/interpreter work. It never talks to PostgreSQL or the OS directly. All stateful actions go through typed Python tools.
+## Current Shape
 
-## Project layout
+- Database-pair workspaces are the main unit of state: selected source DB, target DB, schemas, saved SQL artifacts, workloads, and recommendations.
+- Runs are still kept as execution and diagnostics history.
+- Live database facts in the GUI come from PostgreSQL metadata where possible, not from old run state.
+- LLM calls are planner/interpreter actions only. The LLM does not access PostgreSQL or the OS directly.
 
-- `src/ilvesbench/`: application package
-- `tests/`: unit tests for the orchestrator and log parser
-- `ilvesbench.example.toml`: sample config for local development
-- `docker-compose.yml`: PostgreSQL starter stack
-- `postgres-config/`: starter PostgreSQL config files
-- `init-db/`: initialization SQL hooks
+## Architecture
 
-## Secrets and local config
+- `agent/`: orchestration and workflow coordination
+- `dbops/` and `db/`: PostgreSQL inspection, validation, schema creation, data migration, and database-side actions
+- `osops/`: hardware inspection, workload/log input, file access, and subprocess support
+- `benchmarker/` and `benchmark/`: query rewriting, workload generation, pgbench, tuning, summary table and index advisors
+- `llm/` and `orchestrator/`: LLM gateway and LLM-backed planning tasks
+- `store/`: run history, diagnostics, and database-pair workspace artifacts
+- `api/` and `static/`: HTTP API and browser GUI
 
-Do not commit LLM API keys. The sample config points to an ignored local secret file:
+## Setup
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+pip install "psycopg[binary]>=3.2,<4"
+```
+
+Start the bundled PostgreSQL stack if needed:
+
+```bash
+docker compose up -d
+```
+
+Launch the web UI:
+
+```bash
+python3 run_ilvesbench.py serve --config ilvesbench.example.toml
+```
+
+The sample config uses:
+
+```text
+http://127.0.0.1:8081
+```
+
+## Configuration
+
+Use `ilvesbench.example.toml` as the template. Keep local overrides in ignored files such as `ilvesbench.toml`, `*.local.toml`, `.env`, or `secrets/`.
+
+LLM API keys are resolved in this order:
+
+- `ILVESBENCH_LLM_API_KEY`
+- `[llm].api_key_file`
+- `[llm].api_key`
+
+For local secret-file use:
 
 ```bash
 mkdir -p secrets
 printf 'sk-your-key-here' > secrets/aviary_api_key
 ```
 
-IlvesBench resolves the LLM key in this order:
+## Workloads
 
-- `ILVESBENCH_LLM_API_KEY` environment variable
-- `[llm].api_key_file` in the TOML config
-- `[llm].api_key` in the TOML config
+IlvesBench can use a workload SQL file from the GUI or the configured `[workload].path`. PostgreSQL log extraction exists as an OSOps pathway, but workload-file based input is the main development path right now.
 
-For GitHub, keep committed files as examples only. Put personal overrides in `ilvesbench.toml`, `*.local.toml`, `.env`, or `secrets/`; these paths are ignored by Git.
+A workload is a set of SQL statements plus proportions. The prototype preserves constants in workload files unless the user explicitly supplies pgbench-style placeholders.
 
-## Run the web app
+## pgbench
 
-1. Create a virtual environment and install the package:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-And clone this repository.
-
-2. If you want live PostgreSQL inspection, also install the PostgreSQL client dependency:
-
-```bash
-pip install "psycopg[binary]>=3.2,<4"
-```
-
-3. Start PostgreSQL with Docker (if needed):
-
-```bash
-docker compose up -d
-```
-
-4. Launch the IlvesBench web server:
-
-```bash
-python3 run_ilvesbench.py serve --config ilvesbench.example.toml
-```
-
-5. Open the printed local URL, usually:
-
-```text
-http://127.0.0.1:8080
-```
-
-## CLI examples
-
-Run a single MVP collection pass:
-
-```bash
-python3 run_ilvesbench.py run --config ilvesbench.example.toml
-```
-
-Test only the LLM gateway:
-
-```bash
-python3 run_ilvesbench.py test-llm --config ilvesbench.example.toml
-```
-
-## Notes on Python environments
-
-- The direct launcher `run_ilvesbench.py` works from the repository root without installing the package.
-- `python3 -m ilvesbench ...` requires a working package install in the active virtual environment.
-- On some Python 3.13 setups, especially offline ones, `pip install -e .` can fail or create an editable install that does not resolve the `src/` path correctly.
-- If that happens, use `python3 run_ilvesbench.py ...` instead.
-
-## Workload input flow
-
-- IlvesBench first looks for the configured PostgreSQL log file.
-- If the log file is missing, you can provide a workload SQL file from the web UI.
-- If you leave the web field blank, IlvesBench uses `data/workload.sql` by default.
-- The workload file should contain SQL statements separated by semicolons.
-- If neither source exists, the run ends in `awaiting_input` and the UI explains what to provide next.
-
-## Enable pgbench
-
-`pgbench` is controlled by the `[pgbench]` section in your TOML config. A working setup looks like this:
+`pgbench` settings are editable in the GUI. IlvesBench can also recommend starting values from detected hardware.
 
 ```toml
 [pgbench]
@@ -118,43 +88,17 @@ clients = 4
 jobs = 1
 ```
 
-Notes:
+`pgbench` must be installed on the host running IlvesBench.
 
-- IlvesBench runs `pgbench` for 30 seconds against `db-original` when you press the benchmark button. This is too short timeframe for real benchmarking. This should be configurable by the user.
-- After approved schema creation, data migration, and workload rewriting, it can run `pgbench` against `db-new` from the UI.
-- The `db-original` run uses the workload SQL file passed in the UI, or `data/workload.sql` if the field is left blank.
-- The `db-new` run uses an LLM-rewritten workload artifact generated from the original workload and normalized target schema.
-- `pgbench` must be installed on the host machine because IlvesBench runs on the host.
+## Diagnostics
 
-## Benchmark comparison flow
+Each execution run writes human-readable and JSONL diagnostics under `data/artifacts/<run_id>/logs/`. LLM prompts, raw responses, PostgreSQL errors, and pgbench errors are saved as artifacts and shown in the GUI Diagnostics tab.
 
-1. Start an MVP run from the CLI or UI.
-2. Review the generated normalization, migration, rewritten workload, index, tuning, and metrics artifacts.
-3. In the UI, run the approval actions in order: create db-new schema, migrate data, run pgbench on db-original, then run pgbench on db-new.
-4. IlvesBench writes a `benchmark_comparison.json` artifact comparing throughput, latency, storage size, and energy-per-transaction when both pgbench runs complete.
-
-Energy estimates are controlled by the `[energy]` section:
-
-```toml
-[energy]
-enabled = true
-estimated_cpu_watts = 45.0
-estimated_watts_per_cpu = 12.0
-co2_grams_per_kwh = 110.0
-```
-
-## Run tests
+## Tests
 
 ```bash
-python3 -m unittest discover -s tests
+PYTHONPATH=src python3 -m unittest discover -s tests
 ```
-
-## Design notes
-
-- Reproducibility: each run records config path, step states, artifacts, model settings, and tool outputs.
-- Safety: destructive steps are present as explicit approval-gated pipeline stages instead of hidden side effects.
-- Determinism: the executed MVP path is a normal Python workflow that can run without the LLM.
-- Extensibility: the schema transformer, migrator, and richer metrics collectors already have module boundaries, so later work can fill them in without reshaping the whole codebase.
 
 ## Disclaimer
 
