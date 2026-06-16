@@ -10,8 +10,9 @@ from ilvesbench.benchmark.pgbench import PgBenchParameterAdvisor, PgBenchRunner
 from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
 from ilvesbench.benchmark.workload import WorkloadPlanner
 from ilvesbench.benchmarker.query_rewrite import QueryRewriteService
-from ilvesbench.config import IlvesBenchConfig
+from ilvesbench.config import IlvesBenchConfig, PgBenchConfig, PostgresConfig
 from ilvesbench.llm.gateway import LLMGateway
+from ilvesbench.models import BenchmarkMetrics
 
 
 class BenchmarkerService:
@@ -36,6 +37,21 @@ class BenchmarkerService:
         self.tuning_advisor = PostgresTuningAdvisor()
         self.energy_estimator = EnergyEstimator()
         self.benchmark_comparator = BenchmarkComparator()
+
+    def run_pgbench(
+        self,
+        config: PgBenchConfig,
+        postgres: PostgresConfig,
+        database: str,
+        *,
+        workload_path: Path | None = None,
+    ) -> BenchmarkMetrics:
+        return self.pgbench.run(
+            config,
+            postgres,
+            database,
+            workload_path=workload_path,
+        )
 
     def prepare_validated_workload(
         self,

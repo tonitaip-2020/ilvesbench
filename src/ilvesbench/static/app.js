@@ -277,6 +277,36 @@ function observedQuerySql(logs) {
     .filter(Boolean);
 }
 
+function renderSkippedStatementSummary(logs, extract) {
+  const summary = logs.skipped_summary || extract.details?.skipped_statement_summary || {};
+  const skippedStatements = logs.skipped_statements || [];
+  const total = Number(summary.total || extract.details?.skipped_statement_count || skippedStatements.length || 0);
+  if (!total) return "";
+  const reasons = summary.by_reason || extract.details?.skipped_statement_reasons || {};
+  const reasonText = Object.entries(reasons)
+    .map(([reason, count]) => `${formatNumber(count)} ${reason.replaceAll("_", " ")}`)
+    .join(", ");
+  const examples = (summary.examples || skippedStatements).slice(0, 3);
+  const recommendedAction = summary.recommended_action || extract.details?.recommended_action || "";
+  return `
+    <div class="ingestion-warning">
+      <strong>${escapeHtml(formatNumber(total))} observed statement${total === 1 ? "" : "s"} skipped</strong>
+      ${reasonText ? `<span>${escapeHtml(reasonText)}</span>` : ""}
+      ${recommendedAction ? `<p>${escapeHtml(recommendedAction)}</p>` : ""}
+      ${examples.length ? `
+        <ul>
+          ${examples.map((item) => `
+            <li>
+              <span>${escapeHtml(item.reason || "skipped")}</span>
+              <code>${escapeHtml(item.raw_sql || item.error || "")}</code>
+            </li>
+          `).join("")}
+        </ul>
+      ` : ""}
+    </div>
+  `;
+}
+
 function artifactOrStep(artifacts, artifactName, run, stepName = artifactName) {
   return artifacts?.[artifactName] || step(run, stepName).details || {};
 }
@@ -1355,6 +1385,7 @@ function renderWorkload(run, artifacts) {
             ${latestWorkloadStatus?.selected_path ? `<span>${escapeHtml(latestWorkloadStatus.selected_path)}</span>` : ""}
             ${latestWorkloadStatus?.resolved_workload_path ? `<span>Workload file resolves to ${escapeHtml(latestWorkloadStatus.resolved_workload_path)}</span>` : ""}
           </div>
+          ${renderSkippedStatementSummary(logs, extract)}
           ${topQueries.length ? `
             <div class="candidate-list">
               ${topQueries.map((query) => {

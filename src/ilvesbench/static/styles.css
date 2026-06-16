@@ -619,6 +619,39 @@ code {
   font-size: 0.86rem;
 }
 
+.ingestion-warning {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #ebc96f;
+  border-radius: 8px;
+  background: #fff8e6;
+  color: #684b0b;
+  overflow-wrap: anywhere;
+}
+
+.ingestion-warning p,
+.ingestion-warning ul {
+  margin: 0;
+}
+
+.ingestion-warning ul {
+  display: grid;
+  gap: 6px;
+  padding-left: 18px;
+}
+
+.ingestion-warning code {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .query-progress {
   display: grid;
   gap: 8px;

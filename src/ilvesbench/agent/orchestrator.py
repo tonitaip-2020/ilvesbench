@@ -83,8 +83,13 @@ class PipelineOrchestrator:
 
         if self._dbops.postgres is not self._postgres:
             self._dbops.replace_postgres(self._postgres)
+        self._osops.hardware = self._hardware
+        self._osops.logs = self._logs
+        self._osops.workload_files = self._workload_files
         self._llm_tasks.schema_transformer = self._schema_transformer
         self._llm_tasks.migration_planner = self._migration_planner
+        self._benchmarker.pgbench = self._pgbench
+        self._benchmarker.pgbench_advisor = self._pgbench_advisor
         self._benchmarker.workload_planner = self._workload_planner
 
     def test_llm(self) -> dict:
@@ -118,7 +123,8 @@ class PipelineOrchestrator:
 
     def recommend_pgbench_parameters(self) -> dict:
         try:
-            hardware = self._hardware.collect(self._config.resolve_path("."))
+            self._sync_component_aliases()
+            hardware = self._osops.collect_hardware()
         except Exception:
             hardware = None
         return self._pgbench_advisor.recommend(hardware, self._config.pgbench)
@@ -1545,7 +1551,8 @@ class PipelineOrchestrator:
 
     def _run_hardware_step(self, record: BenchmarkRunRecord) -> BenchmarkRunRecord:
         try:
-            hardware = self._hardware.collect(self._config.resolve_path("."))
+            self._sync_component_aliases()
+            hardware = self._osops.collect_hardware()
             hardware_dict = to_dict(hardware)
             record = self._complete_step(
                 record,
@@ -1567,32 +1574,26 @@ class PipelineOrchestrator:
         return record
 
     def _run_logs_step(self, record: BenchmarkRunRecord):
-        log_path = self._config.resolve_path(self._config.logs.path)
-        resolved_workload_path = self._resolve_workload_path()
-
         try:
-            if log_path.exists():
-                log_workload_dir = (
-                    self._config.resolve_path(self._config.storage.artifact_dir)
-                    / record.run_id
-                    / "postgres_log_workloads"
-                )
-                log_summary = self._logs.parse(
-                    log_path,
-                    max_lines=self._config.logs.max_lines,
-                    output_dir=log_workload_dir,
-                    postgres=self._config.postgres,
-                    pgbench=self._config.pgbench,
-                )
-            elif resolved_workload_path is not None and resolved_workload_path.exists():
-                log_summary = self._workload_files.parse(resolved_workload_path)
-            else:
+            self._sync_component_aliases()
+            workload_context = self._osops.workload_source_context()
+            log_workload_dir = (
+                self._config.resolve_path(self._config.storage.artifact_dir)
+                / record.run_id
+                / "postgres_log_workloads"
+            )
+            log_summary = self._osops.load_workload_source(
+                output_dir=log_workload_dir,
+                postgres=self._config.postgres,
+                pgbench=self._config.pgbench,
+            )
+            if log_summary is None:
                 record.summary.update(
                     {
                         "workload_source_kind": "missing",
                         "workload_source_path": "",
-                        "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
-                        "resolved_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                        "configured_workload_path": workload_context["configured_workload_path"],
+                        "resolved_workload_path": workload_context["resolved_workload_path"],
                     }
                 )
                 self._input_required_step(
@@ -1601,8 +1602,8 @@ class PipelineOrchestrator:
                     {
                         "summary": "No PostgreSQL log file or workload SQL file was found.",
                         "recommended_action": "Provide a workload file path in the UI and start a new run.",
-                        "checked_log_path": str(log_path),
-                        "checked_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                        "checked_log_path": workload_context["log_path"],
+                        "checked_workload_path": workload_context["resolved_workload_path"],
                     },
                 )
                 return None
@@ -1612,22 +1613,25 @@ class PipelineOrchestrator:
                 {
                     "workload_source_kind": log_summary.source_kind,
                     "workload_source_path": log_summary.path,
-                    "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
-                    "resolved_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                    "configured_workload_path": workload_context["configured_workload_path"],
+                    "resolved_workload_path": workload_context["resolved_workload_path"],
                 }
             )
             record.artifacts["extract_workload_logs"] = self._store.write_artifact(
                 record.run_id, "log_summary", log_dict
             )
             self._mirror_workspace_artifact(record, "extract_workload_logs", log_dict)
+            skipped_summary = log_summary.skipped_summary or self._skipped_statement_summary(log_summary.skipped_statements)
+            skipped_count = int(skipped_summary.get("total") or len(log_summary.skipped_statements))
             self._complete_step(
                 record,
                 "extract_workload_logs",
                 {
+                    "summary": self._workload_ingestion_summary(log_summary, skipped_count),
                     "source_kind": log_summary.source_kind,
                     "source_path": log_summary.path,
-                    "checked_log_path": str(log_path),
-                    "checked_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
+                    "checked_log_path": workload_context["log_path"],
+                    "checked_workload_path": workload_context["resolved_workload_path"],
                     "selected_query_source": (
                         "PostgreSQL query log" if log_summary.source_kind == "postgres_log" else "SQL workload file"
                     ),
@@ -1635,7 +1639,11 @@ class PipelineOrchestrator:
                     "transactions_detected": log_summary.transactions_detected,
                     "top_query_count": len(log_summary.top_queries),
                     "workload_outputs": log_summary.workload_outputs,
-                    "skipped_statement_count": len(log_summary.skipped_statements),
+                    "skipped_statement_count": skipped_count,
+                    "skipped_statement_reasons": skipped_summary.get("by_reason", {}),
+                    "skipped_statement_summary": skipped_summary,
+                    "recommended_action": skipped_summary.get("recommended_action", ""),
+                    "blocking": bool(log_summary.statements_detected and not log_summary.top_queries),
                 },
             )
             return log_summary
@@ -1647,6 +1655,7 @@ class PipelineOrchestrator:
         step = next(step for step in record.steps if step.name == "run_pgbench_original")
         workload_path = self._resolve_workload_path()
         try:
+            self._sync_component_aliases()
             self._diagnostics.event(
                 "Starting pgbench against source database.",
                 severity="info",
@@ -1661,7 +1670,7 @@ class PipelineOrchestrator:
                     "transactions": self._config.pgbench.transactions,
                 },
             )
-            benchmark = self._pgbench.run(
+            benchmark = self._benchmarker.run_pgbench(
                 self._config.pgbench,
                 self._config.postgres,
                 self._config.postgres.original_database,
@@ -1701,6 +1710,7 @@ class PipelineOrchestrator:
         step = next(step for step in record.steps if step.name == "run_pgbench_new")
         workload_path = workload_path_override or self._rewritten_workload_path(record)
         try:
+            self._sync_component_aliases()
             self._diagnostics.event(
                 "Starting pgbench against target database.",
                 severity="info",
@@ -1715,7 +1725,7 @@ class PipelineOrchestrator:
                     "transactions": self._config.pgbench.transactions,
                 },
             )
-            benchmark = self._pgbench.run(
+            benchmark = self._benchmarker.run_pgbench(
                 self._config.pgbench,
                 self._config.postgres,
                 self._config.postgres.new_database,
@@ -3309,12 +3319,7 @@ class PipelineOrchestrator:
         return ""
 
     def _workspace_context(self) -> dict:
-        resolved_workload_path = self._resolve_workload_path()
-        workload_source = {
-            "configured_workload_path": (self._config.workload.path or "").strip() or "data/workload.sql",
-            "resolved_workload_path": str(resolved_workload_path) if resolved_workload_path else "",
-            "log_path": str(self._config.resolve_path(self._config.logs.path)),
-        }
+        workload_source = self._osops.workload_source_context()
         return self._workspace_store.context(
             source_database=self._config.postgres.original_database,
             target_database=self._config.postgres.new_database,
@@ -3396,7 +3401,36 @@ class PipelineOrchestrator:
             source_kind=str(payload.get("source_kind", "postgres_log")),
             workload_outputs=dict(payload.get("workload_outputs", {})),
             skipped_statements=list(payload.get("skipped_statements", [])),
+            skipped_summary=dict(payload.get("skipped_summary", {})),
         )
+
+    def _skipped_statement_summary(self, skipped_statements: list[dict]) -> dict:
+        by_reason: dict[str, int] = {}
+        for item in skipped_statements:
+            reason = str(item.get("reason") or "unknown")
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+        recommended_action = ""
+        if by_reason:
+            recommended_action = "Review skipped SQL examples; only normalized statements are used for generated pgbench workloads."
+        return {
+            "total": len(skipped_statements),
+            "by_reason": by_reason,
+            "examples": skipped_statements[:5],
+            "recommended_action": recommended_action,
+        }
+
+    def _workload_ingestion_summary(self, log_summary: LogSummary, skipped_count: int) -> str:
+        if log_summary.statements_detected and not log_summary.top_queries:
+            return (
+                f"Found {log_summary.statements_detected} workload statement(s), but none could be normalized "
+                "for generated benchmark workloads."
+            )
+        if skipped_count:
+            return (
+                f"Extracted {len(log_summary.top_queries)} normalized query template(s); "
+                f"{skipped_count} observed statement(s) were skipped."
+            )
+        return f"Extracted {len(log_summary.top_queries)} query template(s) from {log_summary.source_kind}."
 
     def _resolve_run_artifact_path(self, record: BenchmarkRunRecord, name: str) -> Path | None:
         artifact_path = record.artifacts.get(name)

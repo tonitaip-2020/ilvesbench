@@ -73,4 +73,5 @@ class WorkloadLogPipeline:
             "workloads": workloads,
             "outputs": outputs,
             "skipped": self._aggregator.skipped,
+            "skipped_summary": self._aggregator.skipped_summary(),
         }

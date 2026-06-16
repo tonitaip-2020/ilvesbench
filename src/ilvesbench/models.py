@@ -112,6 +112,7 @@ class LogSummary:
     source_kind: str = "postgres_log"
     workload_outputs: dict[str, dict] = field(default_factory=dict)
     skipped_statements: list[dict] = field(default_factory=list)
+    skipped_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -13,6 +14,64 @@ from ilvesbench.config import IlvesBenchConfig
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+@dataclass(frozen=True)
+class AsyncActionSpec:
+    begin_method: str | None
+    execute_method: str
+    execute_arg: str = "run_id"
+    reload_config: bool = False
+
+
+WORKSPACE_ACTIONS: dict[str, AsyncActionSpec] = {
+    "regenerate-rewrite": AsyncActionSpec(
+        begin_method=None,
+        execute_method="execute_query_rewrite_from_current_state",
+        execute_arg="record",
+    ),
+    "create-schema": AsyncActionSpec("begin_create_target_schema", "execute_create_target_schema"),
+    "migrate-data": AsyncActionSpec("begin_migrate_data", "execute_migrate_data"),
+    "discover-summary-tables": AsyncActionSpec("begin_discover_summary_tables", "execute_discover_summary_tables"),
+    "create-summary-tables": AsyncActionSpec("begin_create_summary_tables", "execute_create_summary_tables"),
+    "discover-index-recommendations": AsyncActionSpec(
+        "begin_discover_index_recommendations",
+        "execute_discover_index_recommendations",
+    ),
+    "create-secondary-indexes": AsyncActionSpec("begin_create_secondary_indexes", "execute_create_secondary_indexes"),
+    "run-pgbench-original": AsyncActionSpec("begin_pgbench_original", "execute_pgbench_original"),
+    "run-pgbench-new": AsyncActionSpec("begin_pgbench_new", "execute_pgbench_new"),
+    "reset-target-db": AsyncActionSpec("begin_reset_target_db", "execute_reset_target_db"),
+    "truncate-target-data": AsyncActionSpec("begin_truncate_target_data", "execute_truncate_target_data"),
+}
+
+
+RUN_ACTIONS: dict[str, AsyncActionSpec] = {
+    "create-schema": AsyncActionSpec("begin_create_target_schema", "execute_create_target_schema"),
+    "reset-target-db": AsyncActionSpec("begin_reset_target_db", "execute_reset_target_db"),
+    "truncate-target-data": AsyncActionSpec("begin_truncate_target_data", "execute_truncate_target_data"),
+    "repair-schema": AsyncActionSpec("begin_repair_target_schema", "execute_repair_target_schema"),
+    "migrate-data": AsyncActionSpec("begin_migrate_data", "execute_migrate_data"),
+    "regenerate-rewrite": AsyncActionSpec(
+        "begin_regenerate_rewrite_queries",
+        "execute_regenerate_rewrite_queries",
+    ),
+    "create-summary-tables": AsyncActionSpec("begin_create_summary_tables", "execute_create_summary_tables"),
+    "discover-summary-tables": AsyncActionSpec("begin_discover_summary_tables", "execute_discover_summary_tables"),
+    "run-pgbench-original": AsyncActionSpec("begin_pgbench_original", "execute_pgbench_original", reload_config=True),
+    "run-pgbench-new": AsyncActionSpec("begin_pgbench_new", "execute_pgbench_new", reload_config=True),
+    "create-secondary-indexes": AsyncActionSpec("begin_create_secondary_indexes", "execute_create_secondary_indexes"),
+    "discover-index-recommendations": AsyncActionSpec(
+        "begin_discover_index_recommendations",
+        "execute_discover_index_recommendations",
+    ),
+}
+
+
+REVIEW_ACTIONS: dict[str, str] = {
+    "normalization-review": "apply_normalization_review",
+    "summary-table-review": "apply_summary_table_review",
+}
 
 
 class IlvesBenchServer(ThreadingHTTPServer):
@@ -128,304 +187,19 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         body = self._read_json_body()
         if parsed.path == "/api/runs":
-            config_path = body.get("config_path", self.server.config_path)
-            self.server.reload_config(
-                config_path,
-                workload_path=body.get("workload_path"),
-                original_database=body.get("original_database"),
-                new_database=body.get("new_database"),
-                schemas=body.get("schemas"),
-                pgbench=body.get("pgbench"),
-                postgresql_conf_path=body.get("postgresql_conf_path"),
-            )
-            record = self.server.orchestrator.create_mvp_record()
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_mvp_collection,
-                args=(record,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json(
-                {
-                    "status": "accepted",
-                    "config_path": self.server.config_path,
-                    "run_id": record.run_id,
-                },
-                status=HTTPStatus.ACCEPTED,
-            )
+            self._handle_create_run(body)
             return
-        if parsed.path == "/api/runs/actions/regenerate-rewrite":
-            config_path = body.get("config_path", self.server.config_path)
-            self.server.reload_config(
-                config_path,
-                workload_path=body.get("workload_path"),
-                original_database=body.get("original_database"),
-                new_database=body.get("new_database"),
-                schemas=body.get("schemas"),
-                pgbench=body.get("pgbench"),
-                postgresql_conf_path=body.get("postgresql_conf_path"),
-            )
-            record = self.server.orchestrator.create_workspace_action_record()
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_query_rewrite_from_current_state,
-                args=(record,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json(
-                {"status": "accepted", "run_id": record.run_id, "action": "regenerate-rewrite"},
-                status=HTTPStatus.ACCEPTED,
-            )
+        workspace_action = self._workspace_action_name(parsed.path)
+        if workspace_action:
+            self._handle_workspace_action(workspace_action, body)
             return
-        if parsed.path.startswith("/api/runs/actions/"):
-            action = parsed.path.rsplit("/", 1)[-1]
-            config_path = body.get("config_path", self.server.config_path)
-            self.server.reload_config(
-                config_path,
-                workload_path=body.get("workload_path"),
-                original_database=body.get("original_database"),
-                new_database=body.get("new_database"),
-                schemas=body.get("schemas"),
-                pgbench=body.get("pgbench"),
-                postgresql_conf_path=body.get("postgresql_conf_path"),
-            )
-            record = self.server.orchestrator.create_workspace_action_record()
-            action_handlers = {
-                "create-schema": (
-                    self.server.orchestrator.begin_create_target_schema,
-                    self.server.orchestrator.execute_create_target_schema,
-                ),
-                "migrate-data": (
-                    self.server.orchestrator.begin_migrate_data,
-                    self.server.orchestrator.execute_migrate_data,
-                ),
-                "discover-summary-tables": (
-                    self.server.orchestrator.begin_discover_summary_tables,
-                    self.server.orchestrator.execute_discover_summary_tables,
-                ),
-                "create-summary-tables": (
-                    self.server.orchestrator.begin_create_summary_tables,
-                    self.server.orchestrator.execute_create_summary_tables,
-                ),
-                "discover-index-recommendations": (
-                    self.server.orchestrator.begin_discover_index_recommendations,
-                    self.server.orchestrator.execute_discover_index_recommendations,
-                ),
-                "create-secondary-indexes": (
-                    self.server.orchestrator.begin_create_secondary_indexes,
-                    self.server.orchestrator.execute_create_secondary_indexes,
-                ),
-                "run-pgbench-original": (
-                    self.server.orchestrator.begin_pgbench_original,
-                    self.server.orchestrator.execute_pgbench_original,
-                ),
-                "run-pgbench-new": (
-                    self.server.orchestrator.begin_pgbench_new,
-                    self.server.orchestrator.execute_pgbench_new,
-                ),
-                "reset-target-db": (
-                    self.server.orchestrator.begin_reset_target_db,
-                    self.server.orchestrator.execute_reset_target_db,
-                ),
-                "truncate-target-data": (
-                    self.server.orchestrator.begin_truncate_target_data,
-                    self.server.orchestrator.execute_truncate_target_data,
-                ),
-            }
-            if action not in action_handlers:
-                self._send_json({"error": "Unknown workspace action."}, status=HTTPStatus.NOT_FOUND)
-                return
-            begin, execute = action_handlers[action]
-            begin(record.run_id)
-            thread = threading.Thread(
-                target=execute,
-                args=(record.run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": record.run_id, "action": action}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/create-schema"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_create_target_schema(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_create_target_schema,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "create-schema"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/reset-target-db"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_reset_target_db(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_reset_target_db,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "reset-target-db"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/truncate-target-data"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_truncate_target_data(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_truncate_target_data,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "truncate-target-data"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/repair-schema"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_repair_target_schema(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_repair_target_schema,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "repair-schema"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/normalization-review"):
-            run_id = parsed.path.split("/")[-3]
-            record = self.server.orchestrator.apply_normalization_review(
-                run_id,
-                str(body.get("candidate_id", "")),
-                str(body.get("decision", "")),
-            )
-            self._send_json(
-                {
-                    "status": "completed",
-                    "run_id": record.run_id,
-                    "action": "normalization-review",
-                    "run_status": record.status,
-                }
-            )
-            return
-        if parsed.path.endswith("/actions/summary-table-review"):
-            run_id = parsed.path.split("/")[-3]
-            record = self.server.orchestrator.apply_summary_table_review(
-                run_id,
-                str(body.get("candidate_id", "")),
-                str(body.get("decision", "")),
-            )
-            self._send_json(
-                {
-                    "status": "completed",
-                    "run_id": record.run_id,
-                    "action": "summary-table-review",
-                    "run_status": record.status,
-                }
-            )
-            return
-        if parsed.path.endswith("/actions/migrate-data"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_migrate_data(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_migrate_data,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "migrate-data"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/regenerate-rewrite"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_regenerate_rewrite_queries(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_regenerate_rewrite_queries,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "regenerate-rewrite"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/create-summary-tables"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_create_summary_tables(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_create_summary_tables,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "create-summary-tables"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/discover-summary-tables"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_discover_summary_tables(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_discover_summary_tables,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "discover-summary-tables"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/run-pgbench-original"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.reload_config(
-                body.get("config_path", self.server.config_path),
-                workload_path=body.get("workload_path"),
-                original_database=body.get("original_database"),
-                new_database=body.get("new_database"),
-                schemas=body.get("schemas"),
-                pgbench=body.get("pgbench"),
-                postgresql_conf_path=body.get("postgresql_conf_path"),
-            )
-            self.server.orchestrator.begin_pgbench_original(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_pgbench_original,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "run-pgbench-original"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/run-pgbench-new"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.reload_config(
-                body.get("config_path", self.server.config_path),
-                workload_path=body.get("workload_path"),
-                original_database=body.get("original_database"),
-                new_database=body.get("new_database"),
-                schemas=body.get("schemas"),
-                pgbench=body.get("pgbench"),
-                postgresql_conf_path=body.get("postgresql_conf_path"),
-            )
-            self.server.orchestrator.begin_pgbench_new(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_pgbench_new,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "run-pgbench-new"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/create-secondary-indexes"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_create_secondary_indexes(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_create_secondary_indexes,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "create-secondary-indexes"}, status=HTTPStatus.ACCEPTED)
-            return
-        if parsed.path.endswith("/actions/discover-index-recommendations"):
-            run_id = parsed.path.split("/")[-3]
-            self.server.orchestrator.begin_discover_index_recommendations(run_id)
-            thread = threading.Thread(
-                target=self.server.orchestrator.execute_discover_index_recommendations,
-                args=(run_id,),
-                daemon=True,
-            )
-            thread.start()
-            self._send_json({"status": "accepted", "run_id": run_id, "action": "discover-index-recommendations"}, status=HTTPStatus.ACCEPTED)
+        run_action = self._run_action(parsed.path)
+        if run_action is not None:
+            run_id, action = run_action
+            if action in REVIEW_ACTIONS:
+                self._handle_review_action(run_id, action, body)
+            else:
+                self._handle_run_action(run_id, action, body)
             return
         if parsed.path == "/api/llm/test":
             config_path = body.get("config_path", self.server.config_path)
@@ -575,6 +349,98 @@ class IlvesBenchRequestHandler(BaseHTTPRequestHandler):
             self._send_json(self.server.orchestrator.save_postgresql_conf(str(body.get("content", ""))))
             return
         self._send_json({"error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+
+    def _handle_create_run(self, body: dict) -> None:
+        self._reload_config_from_body(body)
+        record = self.server.orchestrator.create_mvp_record()
+        self._start_background(self.server.orchestrator.execute_mvp_collection, record)
+        self._send_json(
+            {
+                "status": "accepted",
+                "config_path": self.server.config_path,
+                "run_id": record.run_id,
+            },
+            status=HTTPStatus.ACCEPTED,
+        )
+
+    def _handle_workspace_action(self, action: str, body: dict) -> None:
+        spec = WORKSPACE_ACTIONS.get(action)
+        if spec is None:
+            self._send_json({"error": "Unknown workspace action."}, status=HTTPStatus.NOT_FOUND)
+            return
+        self._reload_config_from_body(body)
+        record = self.server.orchestrator.create_workspace_action_record()
+        if spec.begin_method:
+            getattr(self.server.orchestrator, spec.begin_method)(record.run_id)
+        execute_arg = record if spec.execute_arg == "record" else record.run_id
+        self._start_background(getattr(self.server.orchestrator, spec.execute_method), execute_arg)
+        self._send_accepted(record.run_id, action)
+
+    def _handle_run_action(self, run_id: str, action: str, body: dict) -> None:
+        spec = RUN_ACTIONS.get(action)
+        if spec is None:
+            self._send_json({"error": "Unknown run action."}, status=HTTPStatus.NOT_FOUND)
+            return
+        if spec.reload_config:
+            self._reload_config_from_body(body)
+        if spec.begin_method:
+            getattr(self.server.orchestrator, spec.begin_method)(run_id)
+        self._start_background(getattr(self.server.orchestrator, spec.execute_method), run_id)
+        self._send_accepted(run_id, action)
+
+    def _handle_review_action(self, run_id: str, action: str, body: dict) -> None:
+        method_name = REVIEW_ACTIONS[action]
+        record = getattr(self.server.orchestrator, method_name)(
+            run_id,
+            str(body.get("candidate_id", "")),
+            str(body.get("decision", "")),
+        )
+        self._send_json(
+            {
+                "status": "completed",
+                "run_id": record.run_id,
+                "action": action,
+                "run_status": record.status,
+            }
+        )
+
+    def _workspace_action_name(self, path: str) -> str | None:
+        prefix = "/api/runs/actions/"
+        if not path.startswith(prefix):
+            return None
+        action = path.removeprefix(prefix).strip("/")
+        return action if action and "/" not in action else None
+
+    def _run_action(self, path: str) -> tuple[str, str] | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 5 or parts[:2] != ["api", "runs"] or parts[3] != "actions":
+            return None
+        run_id = parts[2].strip()
+        action = parts[4].strip()
+        if not run_id or not action:
+            return None
+        return run_id, action
+
+    def _reload_config_from_body(self, body: dict) -> None:
+        self.server.reload_config(
+            body.get("config_path", self.server.config_path),
+            workload_path=body.get("workload_path"),
+            original_database=body.get("original_database"),
+            new_database=body.get("new_database"),
+            schemas=body.get("schemas"),
+            pgbench=body.get("pgbench"),
+            postgresql_conf_path=body.get("postgresql_conf_path"),
+        )
+
+    def _start_background(self, target, *args) -> None:
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        thread.start()
+
+    def _send_accepted(self, run_id: str, action: str) -> None:
+        self._send_json(
+            {"status": "accepted", "run_id": run_id, "action": action},
+            status=HTTPStatus.ACCEPTED,
+        )
 
     def log_message(self, format: str, *args) -> None:
         return

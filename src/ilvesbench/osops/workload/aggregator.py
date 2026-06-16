@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Iterable
 
@@ -45,13 +46,16 @@ class WorkloadAggregator:
         try:
             normalized = self._normalizer.normalize(observation.raw_sql)
         except SQLNormalizationError as exc:
+            reason, recommended_action = _skip_reason_and_action(str(exc))
             self._skipped.append(
                 {
                     "source_file": observation.source_file,
                     "source_line": observation.source_line,
                     "database_name": observation.database_name,
                     "raw_sql": observation.raw_sql,
+                    "reason": reason,
                     "error": str(exc),
+                    "recommended_action": recommended_action,
                 }
             )
             return
@@ -83,6 +87,17 @@ class WorkloadAggregator:
             result[database_name] = ordered
         return result
 
+    def skipped_summary(self) -> dict:
+        if not self._skipped:
+            return {"total": 0, "by_reason": {}, "examples": [], "recommended_action": ""}
+        by_reason = Counter(str(item.get("reason") or "unknown") for item in self._skipped)
+        return {
+            "total": len(self._skipped),
+            "by_reason": dict(sorted(by_reason.items())),
+            "examples": self._skipped[:5],
+            "recommended_action": _summary_recommended_action(by_reason),
+        }
+
     def _merge_parameter_examples(self, existing: list[SQLParameter], incoming: Iterable[SQLParameter]) -> None:
         by_position = {item.position: item for item in existing}
         for item in incoming:
@@ -105,3 +120,39 @@ class WorkloadAggregator:
             "parameters": [asdict(parameter) for parameter in entry.parameters],
             "total_duration_ms": round(entry.total_duration_ms, 3),
         }
+
+
+def _skip_reason_and_action(error: str) -> tuple[str, str]:
+    lowered = error.lower()
+    if "pglast is required" in lowered:
+        return (
+            "normalizer_unavailable",
+            "Install IlvesBench dependencies in the active virtual environment, then rerun ingestion.",
+        )
+    if "parser rejected" in lowered:
+        return (
+            "invalid_sql",
+            "Review the skipped SQL text or PostgreSQL logging configuration; the statement could not be parsed.",
+        )
+    if "empty" in lowered:
+        return (
+            "empty_statement",
+            "Remove empty statements from the workload source.",
+        )
+    if "expected one sql statement" in lowered:
+        return (
+            "multi_statement_observation",
+            "Configure logging so each observation contains one SQL statement.",
+        )
+    return (
+        "normalization_failed",
+        "Review the skipped SQL examples and adjust the workload source before benchmarking.",
+    )
+
+
+def _summary_recommended_action(by_reason: Counter[str]) -> str:
+    if by_reason.get("normalizer_unavailable"):
+        return "Install project dependencies in the active virtual environment before using PostgreSQL log workloads."
+    if by_reason.get("invalid_sql"):
+        return "Review skipped SQL examples; invalid statements were ignored while valid statements were preserved."
+    return "Review skipped SQL examples; only normalized statements are used for generated pgbench workloads."

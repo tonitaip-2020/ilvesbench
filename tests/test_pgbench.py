@@ -15,7 +15,7 @@ from ilvesbench.benchmark.workload import WorkloadRewriteProposal
 from ilvesbench.benchmarker.query_rewrite import QueryRewriteExecutionError, QueryRewriteService
 from ilvesbench.benchmarker.service import BenchmarkerService
 from ilvesbench.config import IlvesBenchConfig, PgBenchConfig, PostgresConfig, StorageConfig
-from ilvesbench.models import HardwareSnapshot
+from ilvesbench.models import BenchmarkMetrics, HardwareSnapshot
 
 
 class FakeRunner:
@@ -35,6 +35,23 @@ class FakeRunner:
         self.last_timeout = timeout
         self.last_env = env
         return subprocess.CompletedProcess(args, self.returncode, stdout=self.stdout, stderr=self.stderr)
+
+
+class FakePgBench:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def run(self, config, postgres, database, workload_path=None):
+        self.calls.append((config, postgres, database, workload_path))
+        return BenchmarkMetrics(
+            database=database,
+            status="completed",
+            command=["pgbench"],
+            duration_seconds=config.duration_seconds,
+            clients=config.clients,
+            jobs=config.jobs,
+            transactions=config.transactions,
+        )
 
 
 class PgBenchTests(unittest.TestCase):
@@ -125,6 +142,23 @@ class PgBenchTests(unittest.TestCase):
             self.assertEqual(warning["status"], "warning")
             self.assertEqual(warning["valid_statement_count"], 1)
             self.assertEqual(filtered.read_text(encoding="utf-8").strip(), "SELECT 1;")
+
+    def test_service_runs_pgbench_through_configured_runner(self) -> None:
+        fake_pgbench = FakePgBench()
+        config = IlvesBenchConfig(postgres=PostgresConfig(original_database="source_db", new_database="target_db"))
+        service = BenchmarkerService(config, pgbench=fake_pgbench)
+        pgbench_config = PgBenchConfig(enabled=True, duration_seconds=30, clients=2, jobs=1)
+        workload = Path("/tmp/workload.sql")
+
+        result = service.run_pgbench(
+            pgbench_config,
+            config.postgres,
+            "source_db",
+            workload_path=workload,
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(fake_pgbench.calls, [(pgbench_config, config.postgres, "source_db", workload)])
 
     def test_query_rewrite_batches_and_progress_payload(self) -> None:
         config = IlvesBenchConfig(postgres=PostgresConfig(original_database="source_db", new_database="target_db"))

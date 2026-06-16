@@ -55,6 +55,7 @@ class PostgresLogParser:
             source_kind="postgres_log",
             workload_outputs=result["outputs"],
             skipped_statements=result["skipped"][:100],
+            skipped_summary=result["skipped_summary"],
         )
 
     def _parse_transactions(
