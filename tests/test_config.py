@@ -73,7 +73,7 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.llm.api_key, "literal-key")
 
-    def test_llm_model_is_defined_only_in_code(self) -> None:
+    def test_llm_model_can_be_selected_in_toml(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             config_path = root / "config.toml"
@@ -87,7 +87,7 @@ class ConfigTests(unittest.TestCase):
 
             config = IlvesBenchConfig.from_toml(config_path)
 
-            self.assertEqual(config.llm.model, DEFAULT_LLM_MODEL)
+            self.assertEqual(config.llm.model, "phi4-14b")
 
 
 if __name__ == "__main__":

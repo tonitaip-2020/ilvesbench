@@ -1,0 +1,4 @@
+database,llm,normalization_model_only,normalization_system_assisted,data_migration,query_rewrites_successful,query_rewrites_total,query_rewrites_percent,notes
+DVD Rental,Gemma-4-26B-A4B-it-AIC,Fail,Pass,Pass,10,10,100,"Raw response ended at token limit with no answer content; deterministic 1NF finding approved"
+IMDb 5000,Gemma-4-26B-A4B-it-AIC,Fail,Pass,Pass,10,10,100,"Raw response ended at token limit with no answer content; five deterministic 1NF findings approved"
+NYC Yellow 5000,Gemma-4-26B-A4B-it-AIC,Pass (no change),Pass,Pass (no-op/copy control),5,5,100,"All rewrites identical to source SQL; queries 3 and 4 have incomplete tie-breaking before LIMIT"

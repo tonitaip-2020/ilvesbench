@@ -141,6 +141,7 @@ class MigrationPlanner:
         statements: list[dict] = []
         copy_tables = [table for table in target_tables if table.get("migration_strategy") == "copy_distinct"]
         split_tables = [table for table in target_tables if table.get("migration_strategy") == "split_delimited"]
+        array_tables = [table for table in target_tables if table.get("migration_strategy") == "unnest_array"]
         for table in copy_tables:
             source_table = self._single_source_table(table)
             if not source_table:
@@ -198,6 +199,36 @@ class MigrationPlanner:
                 }
             )
 
+        for table in array_tables:
+            source_table = self._single_source_table(table)
+            source_column = str(table.get("split_source_column", "")).strip()
+            value_column = str(table.get("split_value_column", "")).strip()
+            if not source_table or not source_column or not value_column:
+                continue
+            target_columns = [str(column.get("name", "")) for column in table.get("columns", []) if column.get("name")]
+            parent_columns = [column for column in target_columns if column != value_column]
+            if not parent_columns:
+                continue
+            target_column_sql = ", ".join(self._quote_identifier(column) for column in target_columns)
+            selected_columns = ", ".join(
+                [self._quote_identifier(column) for column in parent_columns] + ["extracted_value"]
+            )
+            resolved_source_column = self._source_column_name(schema, source_table, source_column)
+            source_column_sql = self._quote_identifier(resolved_source_column)
+            statements.append(
+                {
+                    "target_table": table["name"],
+                    "purpose": f"Expand array values from {source_table}.{source_column}.",
+                    "sql": (
+                        f"INSERT INTO {self._quote_identifier(table['name'])} ({target_column_sql}) "
+                        f"SELECT DISTINCT {selected_columns} "
+                        f"FROM __SOURCE_SCHEMA__.{self._quote_identifier(self._source_table_name(source_table))} "
+                        f"CROSS JOIN LATERAL unnest({source_column_sql}) AS extracted_value "
+                        f"WHERE {source_column_sql} IS NOT NULL;"
+                    ),
+                }
+            )
+
         if not statements:
             return None
         return MigrationProposal(
@@ -205,7 +236,7 @@ class MigrationPlanner:
             summary=f"Generated {len(statements)} deterministic migration statement(s) for 1NF decomposition.",
             rationale=[
                 "Copied regular tables from the source database.",
-                "Populated child tables by splitting detected delimited multi-value columns.",
+                "Populated child tables by splitting delimited values or expanding PostgreSQL arrays.",
             ],
             statements=statements,
             source="deterministic_1nf",

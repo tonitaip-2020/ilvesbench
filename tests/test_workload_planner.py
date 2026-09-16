@@ -465,6 +465,29 @@ class WorkloadPlannerTests(unittest.TestCase):
         self.assertEqual(plan.status, "placeholder")
         self.assertEqual(plan.workload_sql, "")
 
+    def test_rewrite_prompt_preserves_projection_order_and_quoted_identifiers(self) -> None:
+        planner = WorkloadPlanner()
+        messages = planner._build_rewrite_messages(
+            ['SELECT "PULocationID", "DOLocationID" FROM yellow_trips;'],
+            target_tables=[
+                {
+                    "name": "yellow_trips",
+                    "columns": [
+                        {"name": "PULocationID", "data_type": "integer"},
+                        {"name": "DOLocationID", "data_type": "integer"},
+                    ],
+                }
+            ],
+            migration_statements=[],
+            source_tables=[],
+        )
+        prompt = "\n".join(message["content"] for message in messages)
+
+        self.assertIn("exact projection column count and positional order", prompt)
+        self.assertIn("exact spelling, case, and double quoting", prompt)
+        self.assertIn("return that SQL statement unchanged", prompt)
+        self.assertIn("Never invent table or column names", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

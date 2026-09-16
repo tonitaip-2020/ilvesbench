@@ -1,0 +1,126 @@
+{
+  "label": "Ministral 3 8B",
+  "target_database": "nyc_yellow_march_2026_5000_ministral",
+  "select_passed": 6,
+  "select_total": 6,
+  "dml_passed": 4,
+  "dml_total": 4,
+  "overall_passed": 10,
+  "overall_total": 10,
+  "results": [
+    {
+      "query_index": 1,
+      "kind": "SELECT",
+      "sql_identical": true,
+      "passed": true,
+      "columns_equal": true,
+      "exact_order_equal": true,
+      "unordered_equal": true,
+      "source_row_count": 100,
+      "target_row_count": 100
+    },
+    {
+      "query_index": 2,
+      "kind": "SELECT",
+      "sql_identical": true,
+      "passed": true,
+      "columns_equal": true,
+      "exact_order_equal": true,
+      "unordered_equal": true,
+      "source_row_count": 98,
+      "target_row_count": 98
+    },
+    {
+      "query_index": 3,
+      "kind": "SELECT",
+      "sql_identical": true,
+      "passed": true,
+      "columns_equal": true,
+      "exact_order_equal": true,
+      "unordered_equal": true,
+      "source_row_count": 50,
+      "target_row_count": 50
+    },
+    {
+      "query_index": 4,
+      "kind": "SELECT",
+      "sql_identical": true,
+      "passed": true,
+      "columns_equal": true,
+      "exact_order_equal": true,
+      "unordered_equal": true,
+      "source_row_count": 5,
+      "target_row_count": 5
+    },
+    {
+      "query_index": 5,
+      "kind": "SELECT",
+      "sql_identical": true,
+      "passed": true,
+      "columns_equal": true,
+      "exact_order_equal": true,
+      "unordered_equal": true,
+      "source_row_count": 102,
+      "target_row_count": 102
+    },
+    {
+      "query_index": 6,
+      "kind": "SELECT",
+      "sql_identical": true,
+      "passed": true,
+      "columns_equal": true,
+      "exact_order_equal": true,
+      "unordered_equal": true,
+      "source_row_count": 100,
+      "target_row_count": 100
+    },
+    {
+      "query_index": 7,
+      "kind": "INSERT",
+      "sql_identical": true,
+      "passed": true,
+      "source_affected": 1,
+      "target_affected": 1,
+      "affected_equal": true,
+      "post_state_equal": true,
+      "source_post_count": 5001,
+      "target_post_count": 5001
+    },
+    {
+      "query_index": 8,
+      "kind": "UPDATE",
+      "sql_identical": true,
+      "passed": true,
+      "source_affected": 1,
+      "target_affected": 1,
+      "affected_equal": true,
+      "post_state_equal": true,
+      "source_post_count": 5000,
+      "target_post_count": 5000
+    },
+    {
+      "query_index": 9,
+      "kind": "UPDATE",
+      "sql_identical": true,
+      "passed": true,
+      "source_affected": 1,
+      "target_affected": 1,
+      "affected_equal": true,
+      "post_state_equal": true,
+      "source_post_count": 5000,
+      "target_post_count": 5000
+    },
+    {
+      "query_index": 10,
+      "kind": "DELETE",
+      "sql_identical": true,
+      "passed": true,
+      "source_affected": 1,
+      "target_affected": 1,
+      "affected_equal": true,
+      "post_state_equal": true,
+      "source_post_count": 4999,
+      "target_post_count": 4999
+    }
+  ]
+}

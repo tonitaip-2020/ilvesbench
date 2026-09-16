@@ -30,7 +30,7 @@ class NormalizationWorkflow:
         reviewable_findings = [
             finding
             for finding in first_normal_form_findings
-            if finding.get("pattern") == "delimited_multi_value_column"
+            if finding.get("pattern") in {"delimited_multi_value_column", "collection_typed_column"}
             and str(finding.get("table", "")).strip()
             and str(finding.get("column", "")).strip()
         ]

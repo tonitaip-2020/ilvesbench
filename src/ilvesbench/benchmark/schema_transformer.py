@@ -392,9 +392,12 @@ class SchemaTransformer:
             ],
         }
         system_prompt = (
-            "You are a database normalization planner. Infer candidate functional dependencies from schema semantics "
-            "using world knowledge when helpful, but mark uncertain conclusions conservatively. "
-            "Return JSON only. Do not include markdown fences."
+            "You are a conservative database normalization planner. Treat functional dependencies as valid only when "
+            "they are supported by declared primary-key or unique-constraint evidence, or by explicit deterministic "
+            "sample evidence supplied in the prompt. Never infer uniqueness from a column name or world knowledge. "
+            "When evidence is insufficient, return insufficient_evidence with empty functional_dependencies and "
+            "target_tables arrays. Return one complete RFC 8259 JSON object only: no markdown fences, comments, "
+            "trailing commas, placeholders, or text outside the JSON object."
         )
         user_prompt = (
             "Analyze the PostgreSQL schema package below. "
@@ -408,7 +411,18 @@ class SchemaTransformer:
             "5. Keep the proposal deterministic and practical for SQL generation.\n"
             "6. Be explicit about candidate functional dependencies, 1NF warnings, and confidence.\n"
             "7. Prefer concise table names in snake_case.\n\n"
-            "8. Treat deterministic 1NF findings as evidence that a column may contain repeated values inside a single cell. "
+            "8. Do not invent hypothetical columns, lookup descriptions, keys, constraints, or source values.\n"
+            "9. Do not claim that an identifier determines event-level timestamps or measurements unless a declared key, "
+            "unique constraint, or supplied sample result proves that dependency.\n"
+            "10. A data type, repeated categorical code, derived total, readability concern, or possible performance benefit "
+            "is not by itself evidence of a 1NF or 3NF violation.\n"
+            "11. Every primary-key, unique, and foreign-key column must occur exactly once in its target table. Every "
+            "referenced table and referenced column must exist in the proposal.\n"
+            "12. If no evidence-supported decomposition exists, set assessment.status to insufficient_evidence, return "
+            "empty functional_dependencies and target_tables arrays, and do not propose a decomposition.\n"
+            "13. Output strict JSON only. Do not use // comments, block comments, trailing commas, markdown fences, "
+            "ellipsis, or explanatory text outside the JSON object. Finish and close the complete JSON object.\n\n"
+            "14. Treat deterministic 1NF findings as evidence that a column may contain repeated values inside a single cell. "
             "For delimited multi-value columns, prefer a child relation with the parent key plus one extracted value per row. "
             "When a candidate reference is supplied, use it as a likely foreign-key target if type-compatible.\n\n"
             "Return JSON with this shape:\n"
@@ -712,10 +726,13 @@ class SchemaTransformer:
         split_findings = [
             finding
             for finding in first_normal_form_findings
-            if finding.get("pattern") == "delimited_multi_value_column"
+            if finding.get("pattern") in {"delimited_multi_value_column", "collection_typed_column"}
             and finding.get("table")
             and finding.get("column")
-            and finding.get("evidence", {}).get("delimiter")
+            and (
+                finding.get("evidence", {}).get("delimiter")
+                or finding.get("evidence", {}).get("collection_kind") == "array"
+            )
         ]
         if not split_findings:
             return None
@@ -806,6 +823,11 @@ class SchemaTransformer:
                     "source_table": source_table_name,
                     "source_column": source_column_name,
                     "name": value_column_name,
+                    **(
+                        {"data_type": self._array_element_type(str(evidence.get("data_type", "")))}
+                        if evidence.get("collection_kind") == "array"
+                        else {}
+                    ),
                 }
             )
             foreign_keys = []
@@ -845,7 +867,9 @@ class SchemaTransformer:
                     "primary_key": [self._sanitize_identifier(column_name) for column_name in parent_key] + [value_column_name],
                     "uniques": [],
                     "foreign_keys": foreign_keys,
-                    "migration_strategy": "split_delimited",
+                    "migration_strategy": (
+                        "unnest_array" if evidence.get("collection_kind") == "array" else "split_delimited"
+                    ),
                     "split_source_column": source_column_name,
                     "split_value_column": value_column_name,
                     "split_delimiter": str(evidence.get("delimiter", ",")),
@@ -865,7 +889,7 @@ class SchemaTransformer:
             status="candidate_normalization",
             summary=(
                 f"Generated deterministic 1NF decomposition with {len(target_tables)} target table(s), "
-                f"including {len(split_findings)} child table(s) for delimited multi-value columns."
+                f"including {len(split_findings)} child table(s) for multi-value columns."
             ),
             target_database=self._target_database,
             rationale=[
@@ -1026,8 +1050,9 @@ class SchemaTransformer:
                 nullable = source.is_nullable and column["name"] not in table["primary_key"]
                 null_sql = "" if nullable else " NOT NULL"
                 default_sql = f" DEFAULT {source.default}" if source.default else ""
+                target_data_type = str(column.get("data_type") or source.data_type)
                 definitions.append(
-                    f'  "{column["name"]}" {source.data_type.upper()}{default_sql}{null_sql}'
+                    f'  "{column["name"]}" {target_data_type.upper()}{default_sql}{null_sql}'
                 )
 
             if table["primary_key"]:
@@ -1193,6 +1218,10 @@ class SchemaTransformer:
                             f"{local_column} ({local_type}) -> {foreign_key['references_table']}.{referenced_column} "
                             f"({referenced_type})."
                         )
+
+    def _array_element_type(self, value: str) -> str:
+        normalized = value.strip()
+        return normalized[:-2].strip() if normalized.endswith("[]") else normalized
 
     def _canonical_data_type(self, value: str) -> str:
         normalized = re.sub(r"\s+", " ", value.strip().lower())

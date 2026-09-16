@@ -35,4 +35,3 @@ The final validation must leave the source and both targets at 5,000 trip rows b
 ## Data source
 
 The full trip records, taxi-zone lookup table, and data dictionary are published by the NYC Taxi and Limousine Commission: https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page
-

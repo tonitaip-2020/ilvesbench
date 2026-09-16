@@ -147,4 +147,3 @@ WHERE "VendorID" = 2
   AND "DOLocationID" = 75
   AND trip_distance = 4.11
   AND total_amount = 42.72;
-
