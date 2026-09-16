@@ -21,8 +21,10 @@ from ilvesbench.models import ColumnMetadata, LLMResult, LogSummary, QueryObserv
 class StaticGateway:
     def __init__(self, response_text: str = "hello") -> None:
         self._response_text = response_text
+        self.last_max_tokens: int | None = None
 
     def generate(self, messages, model=None, max_tokens=256) -> LLMResult:
+        self.last_max_tokens = max_tokens
         return LLMResult(
             backend="aviary",
             model=model or "fake-model",
@@ -268,6 +270,16 @@ class FakeOrchestrator(PipelineOrchestrator):
         return self._fake_schema
 
 class OrchestratorTests(unittest.TestCase):
+    def test_llm_probe_allows_reasoning_model_output_budget(self) -> None:
+        orchestrator = PipelineOrchestrator(IlvesBenchConfig())
+        gateway = StaticGateway()
+        orchestrator._llm = gateway
+
+        result = orchestrator.test_llm()
+
+        self.assertEqual(result["response_text"], "hello")
+        self.assertEqual(gateway.last_max_tokens, 256)
+
     def test_run_requests_human_input_when_no_workload_source_exists(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

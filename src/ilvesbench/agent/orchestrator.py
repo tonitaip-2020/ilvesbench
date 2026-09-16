@@ -96,7 +96,7 @@ class PipelineOrchestrator:
         with self._diagnostics.scoped(step="llm_gateway", component="orchestrator"):
             result = self._llm.generate(
                 [{"role": "user", "content": "Say hello in one short sentence."}],
-                max_tokens=50,
+                max_tokens=256,
             )
         return to_dict(result)
 
