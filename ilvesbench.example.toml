@@ -37,6 +37,8 @@ command = "pgbench"
 duration_seconds = 30
 clients = 4
 jobs = 1
+# pgbench emits one persisted TPS/latency sample at this interval.
+progress_interval_seconds = 1
 
 [energy]
 enabled = true

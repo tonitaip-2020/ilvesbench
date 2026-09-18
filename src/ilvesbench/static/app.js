@@ -766,6 +766,10 @@ async function loadCurrentArtifacts(run) {
     "create_secondary_indexes",
     "collect_extended_metrics",
     "compare_disk_usage",
+    "run_pgbench_original",
+    "run_pgbench_new",
+    "run_pgbench_original_energy",
+    "run_pgbench_new_energy",
   ];
   await Promise.all(
     names
@@ -1534,12 +1538,56 @@ function renderPostgresqlConfEditor() {
   `;
 }
 
-function renderBenchmark(run) {
+function renderTimeSeriesChart(title, samples, valueKey, unit, emptyMessage) {
+  const values = (samples || [])
+    .map((sample) => ({ x: Number(sample.elapsed_seconds), y: Number(sample[valueKey]) }))
+    .filter((sample) => Number.isFinite(sample.x) && Number.isFinite(sample.y));
+  if (!values.length) return `<div class="empty-inline">${escapeHtml(emptyMessage)}</div>`;
+  const width = 640;
+  const height = 240;
+  const left = 58;
+  const right = 18;
+  const top = 24;
+  const bottom = 42;
+  const xMax = Math.max(...values.map((sample) => sample.x), 1);
+  const rawMin = Math.min(...values.map((sample) => sample.y));
+  const rawMax = Math.max(...values.map((sample) => sample.y));
+  const padding = Math.max((rawMax - rawMin) * 0.1, 0.1);
+  const yMin = Math.max(0, rawMin - padding);
+  const yMax = rawMax + padding;
+  const x = (value) => left + (value / xMax) * (width - left - right);
+  const y = (value) => top + (1 - (value - yMin) / Math.max(yMax - yMin, 0.1)) * (height - top - bottom);
+  const points = values.map((sample) => `${x(sample.x).toFixed(2)},${y(sample.y).toFixed(2)}`).join(" ");
+  const grid = [0, 0.5, 1].map((fraction) => {
+    const value = yMin + (yMax - yMin) * fraction;
+    const yPos = y(value);
+    return `<line x1="${left}" x2="${width - right}" y1="${yPos}" y2="${yPos}" class="chart-grid-line"/><text x="${left - 8}" y="${yPos + 4}" text-anchor="end" class="chart-axis-label">${value.toFixed(1)}</text>`;
+  }).join("");
+  return `
+    <div class="benchmark-chart" role="img" aria-label="${escapeHtml(title)} over benchmark time">
+      <h3>${escapeHtml(title)}</h3>
+      <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+        ${grid}
+        <line x1="${left}" x2="${width - right}" y1="${height - bottom}" y2="${height - bottom}" class="chart-axis-line"/>
+        <line x1="${left}" x2="${left}" y1="${top}" y2="${height - bottom}" class="chart-axis-line"/>
+        <polyline points="${points}" class="chart-series-line"/>
+        <text x="${width / 2}" y="${height - 8}" text-anchor="middle" class="chart-axis-title">Elapsed time (s)</text>
+        <text x="14" y="${height / 2}" text-anchor="middle" transform="rotate(-90 14 ${height / 2})" class="chart-axis-title">${escapeHtml(unit)}</text>
+      </svg>
+    </div>
+  `;
+}
+
+function renderBenchmark(run, artifacts = {}) {
   const original = step(run, "run_pgbench_original");
   const target = step(run, "run_pgbench_new");
   const sourceName = selectedOriginalDatabase(run) || "source database";
   const targetName = selectedTargetDatabase(run) || "target database";
   const recommended = latestPgbenchRecommendation?.recommended || {};
+  const originalSeries = artifacts.run_pgbench_original?.progress_samples || [];
+  const targetSeries = artifacts.run_pgbench_new?.progress_samples || [];
+  const originalEnergy = artifacts.run_pgbench_original_energy || {};
+  const targetEnergy = artifacts.run_pgbench_new_energy || {};
   return `
     <section class="tab-panel">
       <div class="panel-grid two">
@@ -1579,6 +1627,14 @@ function renderBenchmark(run) {
           </div>
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("run-pgbench-new")).join("")}</div>
           ${renderStepCards(run, ["run_pgbench_new"])}
+        </article>
+        <article class="workspace-panel">
+          ${renderTimeSeriesChart(`${sourceName}: TPS over time`, originalSeries, "throughput_tps", "TPS", "No pgbench progress samples are available for this run.")}
+          ${renderTimeSeriesChart(`${sourceName}: energy use over time`, originalEnergy.samples, "watts", "Power (W)", originalEnergy.summary || "No NETIO power samples are available for this run.")}
+        </article>
+        <article class="workspace-panel">
+          ${renderTimeSeriesChart(`${targetName}: TPS over time`, targetSeries, "throughput_tps", "TPS", "No pgbench progress samples are available for this run.")}
+          ${renderTimeSeriesChart(`${targetName}: energy use over time`, targetEnergy.samples, "watts", "Power (W)", targetEnergy.summary || "No NETIO power samples are available for this run.")}
         </article>
       </div>
     </section>
@@ -1675,7 +1731,7 @@ function renderActiveTab(run, artifacts, sourceProfile, targetProfile) {
   if (activeTab === "migrate") return renderMigrate(run, targetProfile, artifacts);
   if (activeTab === "workload") return renderWorkload(run, artifacts);
   if (activeTab === "physical") return renderPhysical(run, artifacts);
-  if (activeTab === "benchmark") return renderBenchmark(run);
+  if (activeTab === "benchmark") return renderBenchmark(run, artifacts);
   if (activeTab === "compare") return renderCompare(run, artifacts);
   if (activeTab === "diagnostics") return renderDiagnostics(run, artifacts);
   return renderSetup(run, sourceProfile);
@@ -1955,6 +2011,10 @@ async function recommendPgbench() {
 
 function applyPgbenchRecommendation() {
   const recommended = latestPgbenchRecommendation?.recommended || {};
+  const originalSeries = artifacts.run_pgbench_original?.progress_samples || [];
+  const targetSeries = artifacts.run_pgbench_new?.progress_samples || [];
+  const originalEnergy = artifacts.run_pgbench_original_energy || {};
+  const targetEnergy = artifacts.run_pgbench_new_energy || {};
   if (!recommended.clients) {
     setStatus("No pgbench recommendation has been loaded yet.", true);
     return;

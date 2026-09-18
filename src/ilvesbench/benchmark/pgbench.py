@@ -10,6 +10,10 @@ from ilvesbench.osops.subprocesses import SubprocessRunner
 
 TPS_RE = re.compile(r"tps = (?P<tps>[0-9.]+)")
 LATENCY_RE = re.compile(r"latency average = (?P<latency>[0-9.]+) ms")
+PROGRESS_RE = re.compile(
+    r"progress:\s+(?P<elapsed>[0-9.]+)\s+s,\s+(?P<tps>[0-9.]+)\s+tps,\s+lat\s+(?P<latency>[0-9.]+)\s+ms",
+    re.IGNORECASE,
+)
 
 
 class PgBenchRunner:
@@ -80,6 +84,7 @@ class PgBenchRunner:
         output = result.stdout + "\n" + result.stderr
         tps_match = TPS_RE.search(output)
         latency_match = LATENCY_RE.search(output)
+        progress_samples = self._parse_progress_samples(output)
         return BenchmarkMetrics(
             database=database,
             status="completed" if result.returncode == 0 else "failed",
@@ -90,6 +95,7 @@ class PgBenchRunner:
             transactions=config.transactions,
             throughput_tps=float(tps_match.group("tps")) if tps_match else None,
             average_latency_ms=float(latency_match.group("latency")) if latency_match else None,
+            progress_samples=progress_samples,
             stdout=result.stdout,
             stderr=result.stderr,
         )
@@ -116,6 +122,8 @@ class PgBenchRunner:
             "-j",
             str(config.jobs),
             "-n",
+            "-P",
+            str(max(1, config.progress_interval_seconds)),
         ]
         if workload_path is not None:
             args.extend(["-f", str(workload_path)])
@@ -124,6 +132,17 @@ class PgBenchRunner:
         else:
             args.extend(["-T", str(config.duration_seconds)])
         return args
+
+    @staticmethod
+    def _parse_progress_samples(output: str) -> list[dict[str, float]]:
+        return [
+            {
+                "elapsed_seconds": float(match.group("elapsed")),
+                "throughput_tps": float(match.group("tps")),
+                "average_latency_ms": float(match.group("latency")),
+            }
+            for match in PROGRESS_RE.finditer(output)
+        ]
 
 
 class PgBenchParameterAdvisor:

@@ -22,8 +22,8 @@ class NetioEnergyMonitorTests(unittest.TestCase):
     def test_measurement_averages_load_and_uses_energy_counters(self) -> None:
         monitor = NetioEnergyMonitor(NetioConfig(url="http://netio.local"))
         readings = [
-            NetioReading(20, {"1": 12, "2": 8}, {"1": 100, "2": 50}, "NETIO 4KF"),
-            NetioReading(30, {"1": 18, "2": 12}, {"1": 100.1, "2": 50.05}, "NETIO 4KF"),
+            NetioReading(1.0, 20, {"1": 12, "2": 8}, {"1": 100, "2": 50}, "NETIO 4KF"),
+            NetioReading(2.0, 30, {"1": 18, "2": 12}, {"1": 100.1, "2": 50.05}, "NETIO 4KF"),
         ]
         with patch.object(monitor, "_fetch_reading", side_effect=readings):
             monitor._capture()
@@ -33,6 +33,7 @@ class NetioEnergyMonitorTests(unittest.TestCase):
         self.assertEqual(measurement["average_watts"], 25.0)
         self.assertAlmostEqual(measurement["energy_delta_wh"], 0.15, places=5)
         self.assertEqual(measurement["sockets"]["1"]["average_load_watts"], 15.0)
+        self.assertEqual(measurement["samples"][1]["elapsed_seconds"], 1.0)
 
 
 if __name__ == "__main__":

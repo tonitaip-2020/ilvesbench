@@ -103,7 +103,7 @@ clients = 4
 jobs = 1
 ```
 
-`pgbench` must be installed on the host running IlvesBench.
+`pgbench` must be installed on the host running IlvesBench. IlvesBench requests periodic `pgbench` progress reports (one second by default) and stores interval TPS and latency samples. After a benchmark finishes, the Benchmark page renders TPS-over-time charts and, when NETIO is configured, sampled power-over-time charts from the persisted run artifacts.
 
 ## Diagnostics
 

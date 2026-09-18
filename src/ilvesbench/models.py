@@ -148,6 +148,7 @@ class BenchmarkMetrics:
     transactions: int | None
     throughput_tps: float | None = None
     average_latency_ms: float | None = None
+    progress_samples: list[dict[str, float]] = field(default_factory=list)
     stdout: str = ""
     stderr: str = ""
 

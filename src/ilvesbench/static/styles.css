@@ -602,6 +602,46 @@ code {
   font-size: 1.18rem;
 }
 
+.benchmark-chart {
+  margin-top: 18px;
+}
+
+.benchmark-chart h3 {
+  margin: 0 0 8px;
+  font-size: 0.94rem;
+}
+
+.benchmark-chart svg {
+  display: block;
+  width: 100%;
+  height: 230px;
+  overflow: visible;
+}
+
+.chart-grid-line,
+.chart-axis-line {
+  stroke: #d9e0e7;
+  stroke-width: 1;
+}
+
+.chart-series-line {
+  fill: none;
+  stroke: #0b6e99;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.chart-axis-label,
+.chart-axis-title {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.chart-axis-title {
+  font-size: 12px;
+}
+
 .signal-list,
 .cluster-list,
 .candidate-list,

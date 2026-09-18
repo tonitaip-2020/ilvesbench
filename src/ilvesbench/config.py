@@ -62,6 +62,7 @@ class PgBenchConfig:
     clients: int = 4
     jobs: int = 1
     transactions: int | None = None
+    progress_interval_seconds: int = 1
 
 
 @dataclass(slots=True)

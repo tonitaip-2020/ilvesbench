@@ -81,6 +81,7 @@ class PgBenchTests(unittest.TestCase):
     def test_runner_uses_workload_script_and_parses_metrics(self) -> None:
         fake_runner = FakeRunner(
             stdout="latency average = 12.34 ms\ntps = 456.78 (without initial connection time)\n",
+            stderr="progress: 1.0 s, 400.0 tps, lat 11.0 ms stddev 0.2\nprogress: 2.0 s, 450.0 tps, lat 10.0 ms stddev 0.2\n",
         )
         runner = PgBenchRunner(runner=fake_runner)
         config = PgBenchConfig(enabled=True, duration_seconds=30, clients=2, jobs=1)
@@ -98,6 +99,8 @@ class PgBenchTests(unittest.TestCase):
         self.assertIn(str(workload), fake_runner.last_args)
         self.assertIn("-T", fake_runner.last_args)
         self.assertIn("30", fake_runner.last_args)
+        self.assertIn("-P", fake_runner.last_args)
+        self.assertEqual(result.progress_samples[1]["throughput_tps"], 450.0)
         self.assertEqual(fake_runner.last_env, {"PGPASSWORD": "secret"})
 
     def test_runner_skips_when_workload_is_missing(self) -> None:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 from statistics import fmean
 from threading import Event, Lock, Thread
+from time import monotonic
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -13,6 +14,7 @@ from ilvesbench.config import NetioConfig
 
 @dataclass(slots=True)
 class NetioReading:
+    sampled_at: float
     total_load_watts: float
     socket_load_watts: dict[str, float]
     socket_energy_wh: dict[str, float]
@@ -55,13 +57,17 @@ class NetioEnergyMonitor:
             return {"status": "unavailable", "source": "netio_json_api", "summary": f"NETIO energy measurement hardware was configured but unavailable: {reason}", "error": reason, "sample_count": 0}
         loads = [reading.total_load_watts for reading in readings]
         first, last = readings[0], readings[-1]
+        samples = [
+            {"elapsed_seconds": round(reading.sampled_at - first.sampled_at, 3), "watts": reading.total_load_watts}
+            for reading in readings
+        ]
         sockets = {}
         for socket_id in sorted({key for reading in readings for key in reading.socket_load_watts}):
             socket_loads = [reading.socket_load_watts.get(socket_id, 0.0) for reading in readings]
             start_energy, end_energy = first.socket_energy_wh.get(socket_id), last.socket_energy_wh.get(socket_id)
             sockets[socket_id] = {"average_load_watts": round(fmean(socket_loads), 3), "energy_delta_wh": round(end_energy - start_energy, 6) if start_energy is not None and end_energy is not None else None}
         total_delta_wh = sum(value["energy_delta_wh"] for value in sockets.values() if value["energy_delta_wh"] is not None)
-        return {"status": "measured", "source": "netio_json_api", "device_name": next((reading.device_name for reading in readings if reading.device_name), None), "sample_count": len(readings), "average_watts": round(fmean(loads), 3), "minimum_watts": round(min(loads), 3), "maximum_watts": round(max(loads), 3), "energy_delta_wh": round(total_delta_wh, 6), "sockets": sockets, "summary": f"Measured {round(fmean(loads), 2)} W average power from NETIO across {len(readings)} sample(s).", "warnings": errors}
+        return {"status": "measured", "source": "netio_json_api", "device_name": next((reading.device_name for reading in readings if reading.device_name), None), "sample_count": len(readings), "average_watts": round(fmean(loads), 3), "minimum_watts": round(min(loads), 3), "maximum_watts": round(max(loads), 3), "energy_delta_wh": round(total_delta_wh, 6), "samples": samples, "sockets": sockets, "summary": f"Measured {round(fmean(loads), 2)} W average power from NETIO across {len(readings)} sample(s).", "warnings": errors}
 
     def _poll(self) -> None:
         interval = max(0.2, float(self._config.poll_interval_seconds))
@@ -92,7 +98,7 @@ class NetioEnergyMonitor:
         socket_energy = {str(item.get("ID")): float(item.get("Energy")) for item in outputs if item.get("Energy") is not None}
         global_measure = payload.get("GlobalMeasure") or {}
         total_load = global_measure.get("TotalLoad")
-        return NetioReading(float(total_load) if total_load is not None else sum(socket_loads.values()), socket_loads, socket_energy, (payload.get("Agent") or {}).get("DeviceName"))
+        return NetioReading(monotonic(), float(total_load) if total_load is not None else sum(socket_loads.values()), socket_loads, socket_energy, (payload.get("Agent") or {}).get("DeviceName"))
 
     @staticmethod
     def _not_configured_result() -> dict:
