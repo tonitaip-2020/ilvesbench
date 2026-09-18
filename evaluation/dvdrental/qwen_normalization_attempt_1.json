@@ -1,0 +1,30 @@
+{
+  "database": "dvdrental",
+  "model": "qwen2.5:7b-instruct",
+  "provider": "local Ollama",
+  "task": "normalization",
+  "attempt": 1,
+  "source_table_count": 15,
+  "prompt_source": "IlvesBench SchemaTransformer normalization prompt",
+  "llm_output_valid": false,
+  "llm_task_success": false,
+  "failure_reason": "LLM response did not contain a JSON object.",
+  "ilvesbench_fallback_used": true,
+  "workflow_status_after_fallback": "candidate_normalization",
+  "workflow_summary": "IlvesBench rejected the invalid LLM response and used metadata-only analysis.",
+  "deterministic_findings": [
+    {
+      "table": "public.film",
+      "column": "special_features",
+      "data_type": "text[]",
+      "pattern": "collection_typed_column",
+      "confidence": 0.86,
+      "interpretation": "The array may store multiple logical values in one column and should be reviewed as a 1NF candidate."
+    }
+  ],
+  "target_tables_generated": 0,
+  "ddl_statements_generated": 0,
+  "migration_status": "not_run_no_accepted_target_schema",
+  "query_rewrite_status": "not_run_no_migrated_target_database",
+  "notes": "This record distinguishes raw LLM task success from recovery by deterministic IlvesBench components. The final paper table should state which definition is used."
+}

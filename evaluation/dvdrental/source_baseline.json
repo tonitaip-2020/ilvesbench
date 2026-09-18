@@ -1,0 +1,19 @@
+{
+  "database": "dvdrental",
+  "workload_query_count": 10,
+  "successful_source_queries": 10,
+  "failed_source_queries": 0,
+  "hash_method": "SHA-256 over JSON containing ordered column names and returned rows",
+  "queries": [
+    {"query": 1, "status": "success", "rows": 10, "sha256": "77fb97d2ceed6c1cd1ba4281983234153ecdfa732284a21322fdd86ea1f08f82"},
+    {"query": 2, "status": "success", "rows": 33, "sha256": "ae0ddfe7e0a306d763319267d8f2531e791b02259f77940053f4a1fb3ae49963"},
+    {"query": 3, "status": "success", "rows": 16, "sha256": "3425b529e363e5d97c306cbf40f6f01035927824c6cbeca99e684c2ebae93cb9"},
+    {"query": 4, "status": "success", "rows": 2, "sha256": "4b2bf306b7aed6f2cd4d67a1a6fb4ce87270c93f9be5bfb10c95ee959eaf95d0"},
+    {"query": 5, "status": "success", "rows": 100, "sha256": "ed236d2d189f79a1d1f4809a48fba135b06536877f135c5ffb06abe14c807f19"},
+    {"query": 6, "status": "success", "rows": 100, "sha256": "36d8799ddea24565242323f08c8fd9f86c57a2c11285c787569913b8229c49d4"},
+    {"query": 7, "status": "success", "rows": 100, "sha256": "f3b3c671df2c522e1b3e4d5417d8ac67523622a731923491e7a4efac2acc3a9e"},
+    {"query": 8, "status": "success", "rows": 100, "sha256": "6c49fdc15f8098391aef508eca730d6166aea10a6baccf7432c8766845a011c9"},
+    {"query": 9, "status": "success", "rows": 190, "sha256": "c87ce2dd9fa4cf237851ccc73114a6a81306349bead2721b72f232adfcbb1111"},
+    {"query": 10, "status": "success", "rows": 5, "sha256": "1c184f64c16639e77fd713f34c70fabbf343b261a9e169aea8160a14d049d3f4"}
+  ]
+}

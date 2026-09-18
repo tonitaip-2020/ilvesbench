@@ -1,0 +1,4 @@
+database,llm,normalization,data_migration,query_rewrites
+DVD Rental,Ministral 3 8B Instruct,Fail model-only; pass system-assisted,Pass after PostgreSQL prerequisite repair,100% (10/10)
+NYC Yellow Taxi 5000,Ministral 3 8B Instruct,Pass; no decomposition needed,Pass; no-op,100% (5/5)
+IMDb 5000,Ministral 3 8B Instruct,Fail model-only; pass system-assisted,Pass after privilege setup,100% (10/10)

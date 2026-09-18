@@ -505,5 +505,93 @@ class SchemaTransformerTests(unittest.TestCase):
         self.assertIn("fell back to metadata-only analysis", proposal.summary)
 
 
+    def test_array_finding_gets_deterministic_1nf_decomposition(self) -> None:
+        schema = SchemaSnapshot(
+            database="demo",
+            collected_at="2026-09-03T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="film",
+                    columns=[
+                        ColumnMetadata(name="film_id", data_type="integer", is_nullable=False),
+                        ColumnMetadata(name="title", data_type="text", is_nullable=False),
+                        ColumnMetadata(name="special_features", data_type="text[]", is_nullable=False),
+                    ],
+                    unique_constraints=[UniqueConstraintMetadata(name="film_pkey", columns=["film_id"])],
+                )
+            ],
+        )
+        finding = {
+            "table": "public.film",
+            "column": "special_features",
+            "confidence": 0.95,
+            "pattern": "collection_typed_column",
+            "summary": "Most sampled films contain multiple special features.",
+            "evidence": {
+                "data_type": "text[]",
+                "collection_kind": "array",
+                "sampled_non_null_rows": 250,
+                "multi_value_rows": 184,
+            },
+        }
+
+        proposal = SchemaTransformer().analyze(schema, [finding])
+
+        child = next(table for table in proposal.target_tables if table["name"] == "film_special_features")
+        value_column = next(column for column in child["columns"] if column["name"] == "special_feature")
+        self.assertEqual(proposal.source, "deterministic_1nf_fallback")
+        self.assertEqual(child["migration_strategy"], "unnest_array")
+        self.assertEqual(value_column["data_type"], "text")
+        self.assertTrue(any('"special_feature" TEXT' in statement for statement in proposal.sql_statements))
+
+    def test_array_finding_is_routed_to_human_review(self) -> None:
+        schema = SchemaSnapshot(
+            database="demo",
+            collected_at="2026-09-03T00:00:00+00:00",
+            tables=[TableMetadata(schema="public", name="film", columns=[])],
+        )
+        reviews = NormalizationWorkflow().review_candidates(
+            schema,
+            [
+                {
+                    "table": "public.film",
+                    "column": "special_features",
+                    "pattern": "collection_typed_column",
+                    "summary": "Array contains repeated values.",
+                    "evidence": {"collection_kind": "array"},
+                }
+            ],
+            [],
+        )
+
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["suspicious_columns"], ["special_features"])
+
+    def test_normalization_prompt_forbids_unsupported_dependencies_and_invalid_json(self) -> None:
+        schema = SchemaSnapshot(
+            database="demo",
+            collected_at="2026-09-09T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="yellow_trips",
+                    columns=[
+                        ColumnMetadata(name="VendorID", data_type="integer", is_nullable=True),
+                        ColumnMetadata(name="tpep_pickup_datetime", data_type="timestamp", is_nullable=True),
+                    ],
+                )
+            ],
+        )
+
+        messages = SchemaTransformer()._build_messages(schema, [])
+        prompt = "\n".join(message["content"] for message in messages)
+
+        self.assertIn("Never infer uniqueness from a column name", prompt)
+        self.assertIn("Do not invent hypothetical columns", prompt)
+        self.assertIn("Do not use // comments", prompt)
+        self.assertIn("return insufficient_evidence", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

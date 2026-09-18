@@ -1,55 +1,52 @@
 [llm]
 backend = "openai_compatible"
-base_url = "https://api.openai.com/v1/chat/completions"
-model = "gpt-5.6-sol"
+base_url = "http://127.0.0.1:11434/v1/chat/completions"
+model = "llama3.2:3b"
 api_key = ""
-api_key_file = "secrets/openai_api_key"
-timeout_seconds = 180
+timeout_seconds = 300
 
 [postgres]
 host = "127.0.0.1"
 port = 5432
 user = "llm"
 password = "llm"
-original_database = "mvp_db"
-new_database = "mvp_db_new"
+original_database = "dvdrental"
+new_database = "dvdrental_ilvesbench_llama32_3b"
 admin_database = "postgres"
 schemas = ["public"]
 connect_timeout_seconds = 10
 
 [logs]
-path = "data/postgresql.log"
+path = "../../data/postgresql.log"
 max_lines = 5000
 
 [workload]
-path = "data/workload.sql"
+path = "workload.sql"
 
 [postgresql_conf]
-path = "postgres-config/postgresql.conf"
+path = "../../postgres-config/postgresql.conf"
 
 [docker]
 postgres_container_name = "ilvesbench-postgres"
 prefer_container_snapshot = true
 
 [pgbench]
-enabled = true
+enabled = false
 command = "pgbench"
 duration_seconds = 30
 clients = 4
 jobs = 1
 
 [energy]
-enabled = true
-# Optional: set a measured host/container wattage for better estimates.
-# If omitted, IlvesBench estimates from detected CPU count.
+enabled = false
 estimated_cpu_watts = 45.0
 estimated_watts_per_cpu = 12.0
 co2_grams_per_kwh = 110.0
 
 [storage]
-sqlite_path = "data/ilvesbench_runs.sqlite3"
-artifact_dir = "data/artifacts"
+sqlite_path = "../../data/dvdrental_llama32_3b_evaluation.sqlite3"
+artifact_dir = "../../data/artifacts/dvdrental_llama32_3b"
 
 [web]
 host = "127.0.0.1"
-port = 8081
+port = 8086

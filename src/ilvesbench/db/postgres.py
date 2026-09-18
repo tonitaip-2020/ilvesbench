@@ -281,6 +281,26 @@ class PostgresInspector:
         findings = scanner.schema_findings(schema)
         conn = self._connect(schema.database)
         try:
+            for finding in findings:
+                if finding.pattern != "collection_typed_column":
+                    continue
+                evidence = self._load_collection_column_evidence(
+                    conn,
+                    finding.table,
+                    finding.column,
+                    str(finding.evidence.get("data_type", "")),
+                    sample_limit,
+                )
+                finding.evidence.update(evidence)
+                sampled_rows = int(evidence.get("sampled_non_null_rows", 0) or 0)
+                multi_value_rows = int(evidence.get("multi_value_rows", 0) or 0)
+                if sampled_rows and multi_value_rows:
+                    ratio = multi_value_rows / sampled_rows
+                    finding.confidence = round(min(0.98, 0.86 + (0.12 * ratio)), 2)
+                    finding.summary = (
+                        f"{finding.table}.{finding.column} uses {finding.evidence['data_type']} and stores multiple "
+                        f"values in {round(ratio * 100, 1)}% of {sampled_rows} sampled non-null rows."
+                    )
             for table in schema.tables:
                 for column in table.columns:
                     if not scanner.should_sample_column(column.data_type):
@@ -320,6 +340,59 @@ class PostgresInspector:
                 }
                 for finding in scan.findings
             ],
+        }
+
+    def _load_collection_column_evidence(
+        self,
+        conn,
+        qualified_table: str,
+        column_name: str,
+        data_type: str,
+        sample_limit: int,
+    ) -> dict:
+        if "." not in qualified_table or not data_type.lower().strip().endswith("[]"):
+            return {"collection_kind": "other"}
+        schema_name, table_name = qualified_table.split(".", 1)
+        query = sql.SQL(
+            """
+            WITH sampled AS (
+                SELECT {column} AS value
+                FROM {schema}.{table}
+                WHERE {column} IS NOT NULL
+                LIMIT {sample_limit}
+            )
+            SELECT
+                COUNT(*) AS sampled_non_null_rows,
+                COUNT(*) FILTER (WHERE cardinality(value) > 1) AS multi_value_rows,
+                MIN(cardinality(value)) AS min_cardinality,
+                MAX(cardinality(value)) AS max_cardinality,
+                ARRAY(
+                    SELECT DISTINCT value::text
+                    FROM sampled
+                    ORDER BY value::text
+                    LIMIT 8
+                ) AS value_samples
+            FROM sampled
+            """
+        ).format(
+            column=sql.Identifier(column_name),
+            schema=sql.Identifier(schema_name),
+            table=sql.Identifier(table_name),
+            sample_limit=sql.Literal(sample_limit),
+        )
+        with conn.cursor() as cur:
+            cur.execute(query)
+            row = cur.fetchone() or {}
+        sampled_rows = int(row.get("sampled_non_null_rows", 0) or 0)
+        multi_value_rows = int(row.get("multi_value_rows", 0) or 0)
+        return {
+            "collection_kind": "array",
+            "sampled_non_null_rows": sampled_rows,
+            "multi_value_rows": multi_value_rows,
+            "multi_value_ratio": round(multi_value_rows / sampled_rows, 4) if sampled_rows else 0.0,
+            "min_cardinality": row.get("min_cardinality"),
+            "max_cardinality": row.get("max_cardinality"),
+            "value_samples": list(row.get("value_samples") or []),
         }
 
     def validate_workload_statements(self, database: str, statements: list[str]) -> list[dict]:
@@ -897,24 +970,28 @@ class PostgresInspector:
     def _load_foreign_keys(self, conn) -> list[dict]:
         query = """
             SELECT
-                tc.table_schema,
-                tc.table_name,
-                tc.constraint_name,
-                array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS columns,
-                ccu.table_schema AS foreign_table_schema,
-                ccu.table_name AS foreign_table_name,
-                array_agg(ccu.column_name ORDER BY kcu.ordinal_position) AS foreign_columns
-            FROM information_schema.table_constraints AS tc
-            JOIN information_schema.key_column_usage AS kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-            JOIN information_schema.constraint_column_usage AS ccu
-              ON ccu.constraint_name = tc.constraint_name
-             AND ccu.constraint_schema = tc.table_schema
-            WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND tc.table_schema = ANY(%s)
-            GROUP BY tc.table_schema, tc.table_name, tc.constraint_name, ccu.table_schema, ccu.table_name
-            ORDER BY tc.table_schema, tc.table_name, tc.constraint_name
+                ns.nspname AS table_schema,
+                rel.relname AS table_name,
+                con.conname AS constraint_name,
+                array_agg(att.attname ORDER BY keys.ordinality) AS columns,
+                foreign_ns.nspname AS foreign_table_schema,
+                foreign_rel.relname AS foreign_table_name,
+                array_agg(foreign_att.attname ORDER BY keys.ordinality) AS foreign_columns
+            FROM pg_catalog.pg_constraint AS con
+            JOIN pg_catalog.pg_class AS rel ON rel.oid = con.conrelid
+            JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace
+            JOIN pg_catalog.pg_class AS foreign_rel ON foreign_rel.oid = con.confrelid
+            JOIN pg_catalog.pg_namespace AS foreign_ns ON foreign_ns.oid = foreign_rel.relnamespace
+            CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
+              WITH ORDINALITY AS keys(attnum, foreign_attnum, ordinality)
+            JOIN pg_catalog.pg_attribute AS att
+              ON att.attrelid = con.conrelid AND att.attnum = keys.attnum
+            JOIN pg_catalog.pg_attribute AS foreign_att
+              ON foreign_att.attrelid = con.confrelid AND foreign_att.attnum = keys.foreign_attnum
+            WHERE con.contype = 'f'
+              AND ns.nspname = ANY(%s)
+            GROUP BY ns.nspname, rel.relname, con.conname, foreign_ns.nspname, foreign_rel.relname
+            ORDER BY ns.nspname, rel.relname, con.conname
         """
         with conn.cursor() as cur:
             cur.execute(query, (self._config.schemas,))
@@ -923,18 +1000,21 @@ class PostgresInspector:
     def _load_unique_constraints(self, conn) -> list[dict]:
         query = """
             SELECT
-                tc.table_schema,
-                tc.table_name,
-                tc.constraint_name,
-                kcu.column_name,
-                kcu.ordinal_position
-            FROM information_schema.table_constraints AS tc
-            JOIN information_schema.key_column_usage AS kcu
-              ON tc.constraint_name = kcu.constraint_name
-             AND tc.table_schema = kcu.table_schema
-            WHERE tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
-              AND tc.table_schema = ANY(%s)
-            ORDER BY tc.table_schema, tc.table_name, tc.constraint_name, kcu.ordinal_position
+                ns.nspname AS table_schema,
+                rel.relname AS table_name,
+                con.conname AS constraint_name,
+                att.attname AS column_name,
+                keys.ordinality AS ordinal_position
+            FROM pg_catalog.pg_constraint AS con
+            JOIN pg_catalog.pg_class AS rel ON rel.oid = con.conrelid
+            JOIN pg_catalog.pg_namespace AS ns ON ns.oid = rel.relnamespace
+            CROSS JOIN LATERAL unnest(con.conkey)
+              WITH ORDINALITY AS keys(attnum, ordinality)
+            JOIN pg_catalog.pg_attribute AS att
+              ON att.attrelid = con.conrelid AND att.attnum = keys.attnum
+            WHERE con.contype IN ('p', 'u')
+              AND ns.nspname = ANY(%s)
+            ORDER BY ns.nspname, rel.relname, con.conname, keys.ordinality
         """
         with conn.cursor() as cur:
             cur.execute(query, (self._config.schemas,))

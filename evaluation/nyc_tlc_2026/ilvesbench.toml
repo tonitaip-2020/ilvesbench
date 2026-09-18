@@ -3,53 +3,51 @@ backend = "openai_compatible"
 base_url = "https://api.openai.com/v1/chat/completions"
 model = "gpt-5.6-sol"
 api_key = ""
-api_key_file = "secrets/openai_api_key"
-timeout_seconds = 180
+api_key_file = "../../secrets/openai_api_key"
+timeout_seconds = 300
 
 [postgres]
 host = "127.0.0.1"
 port = 5432
 user = "llm"
 password = "llm"
-original_database = "mvp_db"
-new_database = "mvp_db_new"
+original_database = "nyc_tlc_2026"
+new_database = "nyc_tlc_2026_ilvesbench"
 admin_database = "postgres"
 schemas = ["public"]
-connect_timeout_seconds = 10
+connect_timeout_seconds = 15
 
 [logs]
-path = "data/postgresql.log"
+path = "../../data/postgresql.log"
 max_lines = 5000
 
 [workload]
-path = "data/workload.sql"
+path = "workload.sql"
 
 [postgresql_conf]
-path = "postgres-config/postgresql.conf"
+path = "../../postgres-config/postgresql.conf"
 
 [docker]
 postgres_container_name = "ilvesbench-postgres"
 prefer_container_snapshot = true
 
 [pgbench]
-enabled = true
+enabled = false
 command = "pgbench"
 duration_seconds = 30
-clients = 4
+clients = 1
 jobs = 1
 
 [energy]
-enabled = true
-# Optional: set a measured host/container wattage for better estimates.
-# If omitted, IlvesBench estimates from detected CPU count.
+enabled = false
 estimated_cpu_watts = 45.0
 estimated_watts_per_cpu = 12.0
 co2_grams_per_kwh = 110.0
 
 [storage]
-sqlite_path = "data/ilvesbench_runs.sqlite3"
-artifact_dir = "data/artifacts"
+sqlite_path = "../../data/nyc_tlc_2026_evaluation.sqlite3"
+artifact_dir = "../../data/artifacts/nyc_tlc_2026"
 
 [web]
 host = "127.0.0.1"
-port = 8081
+port = 8084

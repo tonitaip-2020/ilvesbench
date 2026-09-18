@@ -152,5 +152,34 @@ class MigrationPlannerTests(unittest.TestCase):
         self.assertIn("uses columns not present", str(ctx.exception))
 
 
+    def test_generates_deterministic_array_unnest_migration(self) -> None:
+        proposal = MigrationPlanner().plan(
+            schema=None,
+            target_tables=[
+                {
+                    "name": "film",
+                    "source_tables": ["public.film"],
+                    "columns": [{"source_column": "film_id", "name": "film_id"}],
+                    "migration_strategy": "copy_distinct",
+                },
+                {
+                    "name": "film_special_features",
+                    "source_tables": ["public.film"],
+                    "columns": [
+                        {"source_column": "film_id", "name": "film_id"},
+                        {"source_column": "special_features", "name": "special_feature"},
+                    ],
+                    "migration_strategy": "unnest_array",
+                    "split_source_column": "special_features",
+                    "split_value_column": "special_feature",
+                },
+            ],
+        )
+
+        self.assertEqual(proposal.source, "deterministic_1nf")
+        self.assertIn('unnest("special_features")', proposal.statements[1]["sql"])
+        self.assertNotIn("string_to_array", proposal.statements[1]["sql"])
+
+
 if __name__ == "__main__":
     unittest.main()

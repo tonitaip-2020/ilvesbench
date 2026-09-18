@@ -6,7 +6,7 @@ from pathlib import Path
 import tomllib
 
 
-DEFAULT_LLM_MODEL = "llama3.2-3b"
+DEFAULT_LLM_MODEL = "gpt-5.6-sol"
 
 
 @dataclass(slots=True)
@@ -103,7 +103,6 @@ class IlvesBenchConfig:
         config_path = Path(path).expanduser().resolve()
         data = tomllib.loads(config_path.read_text(encoding="utf-8"))
         llm_data = dict(data.get("llm", {}))
-        llm_data.pop("model", None)
         llm_config = LLMConfig(**llm_data)
         llm_config.api_key = _resolve_llm_api_key(llm_config, config_path.parent)
         config = cls(

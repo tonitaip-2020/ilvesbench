@@ -1,0 +1,2 @@
+database,llm,normalization,data_migration,query_rewrites
+IMDb 5000,Ministral 3 8B Instruct,Fail model-only; pass system-assisted,Pass after privilege setup,100% (10/10)
