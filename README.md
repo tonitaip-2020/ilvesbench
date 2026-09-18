@@ -1,7 +1,7 @@
 # IlvesBench
 
 <p align="center">
-  <img src="docs/assets/ilvesbench-logo.png" alt="IlvesBench logo" width="210">
+  <img src="docs/assets/ilvesbench-logo.png" alt="IlvesBench logo" width="250">
 </p>
 
 IlvesBench is a human-guided PostgreSQL benchmarking and schema-evolution tool. It helps researchers and database practitioners evaluate how normalization, query rewrites, indexing, summary tables, and configuration choices affect a database workload.
