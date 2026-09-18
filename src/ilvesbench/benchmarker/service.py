@@ -6,11 +6,12 @@ from typing import Callable
 
 from ilvesbench.benchmark.energy import BenchmarkComparator, EnergyEstimator
 from ilvesbench.benchmark.index_advisor import IndexAdvisor
+from ilvesbench.benchmark.netio import NetioEnergyMonitor
 from ilvesbench.benchmark.pgbench import PgBenchParameterAdvisor, PgBenchRunner
 from ilvesbench.benchmark.tuning import PostgresTuningAdvisor
 from ilvesbench.benchmark.workload import WorkloadPlanner
 from ilvesbench.benchmarker.query_rewrite import QueryRewriteService
-from ilvesbench.config import IlvesBenchConfig, PgBenchConfig, PostgresConfig
+from ilvesbench.config import IlvesBenchConfig, NetioConfig, PgBenchConfig, PostgresConfig
 from ilvesbench.llm.gateway import LLMGateway
 from ilvesbench.models import BenchmarkMetrics
 
@@ -37,6 +38,8 @@ class BenchmarkerService:
         self.tuning_advisor = PostgresTuningAdvisor()
         self.energy_estimator = EnergyEstimator()
         self.benchmark_comparator = BenchmarkComparator()
+        self._netio_config = getattr(config, "netio", NetioConfig())
+        self.last_energy_measurement: dict = {}
 
     def run_pgbench(
         self,
@@ -46,12 +49,17 @@ class BenchmarkerService:
         *,
         workload_path: Path | None = None,
     ) -> BenchmarkMetrics:
-        return self.pgbench.run(
-            config,
-            postgres,
-            database,
-            workload_path=workload_path,
-        )
+        monitor = NetioEnergyMonitor(self._netio_config)
+        monitor.start()
+        try:
+            return self.pgbench.run(
+                config,
+                postgres,
+                database,
+                workload_path=workload_path,
+            )
+        finally:
+            self.last_energy_measurement = monitor.stop()
 
     def prepare_validated_workload(
         self,

@@ -69,6 +69,21 @@ mkdir -p secrets
 printf 'sk-your-key-here' > secrets/aviary_api_key
 ```
 
+## NETIO energy measurement
+
+NETIO 4KF / PowerBOX measurement is optional. Add credentials only to a local configuration file, then run the benchmark normally:
+
+```toml
+[netio]
+url = "http://192.168.1.78/netio.json"
+username = "netio"
+password = "netio"
+poll_interval_seconds = 1.0
+timeout_seconds = 5.0
+```
+
+IlvesBench polls the NETIO JSON API throughout each `pgbench` run and stores average, minimum, and maximum watts; per-socket average watts; and the NETIO energy-counter delta. The Benchmark page shows average power alongside TPS and latency. If `url` is empty, it reports: “No energy measurement hardware was found.”
+
 ## Workloads
 
 IlvesBench can use a workload SQL file from the GUI or the configured `[workload].path`. PostgreSQL log extraction exists as an OSOps pathway, but workload-file based input is the main development path right now.

@@ -2057,6 +2057,8 @@ class PipelineOrchestrator:
             "throughput_tps": benchmark.throughput_tps,
             "average_latency_ms": benchmark.average_latency_ms,
             "energy_status": energy_dict.get("status"),
+            "energy_summary": energy_dict.get("summary"),
+            "average_watts": energy_dict.get("average_watts"),
             "energy_joules": energy_dict.get("energy_joules"),
             "joules_per_transaction": energy_dict.get("joules_per_transaction"),
         }
@@ -2171,9 +2173,16 @@ class PipelineOrchestrator:
         return self._benchmarker.normalize_sql_for_compare(statement)
 
     def _store_energy_estimate(self, record: BenchmarkRunRecord, step_name: str, benchmark) -> dict:
-        hardware = self._load_optional_artifact(record, "capture_hardware") or {}
-        energy = self._energy_estimator.estimate(benchmark, hardware, self._config.energy)
-        energy_dict = to_dict(energy)
+        measurement = dict(self._benchmarker.last_energy_measurement)
+        if measurement.get("status") == "measured":
+            energy_joules = float(measurement.get("energy_delta_wh") or 0) * 3600
+            transactions = (benchmark.throughput_tps or 0) * benchmark.duration_seconds
+            measurement.update({
+                "energy_joules": round(energy_joules, 3),
+                "joules_per_transaction": round(energy_joules / transactions, 6) if transactions else None,
+                "average_watts": measurement.get("average_watts"),
+            })
+        energy_dict = measurement
         record.artifacts[f"{step_name}_energy"] = self._store.write_artifact(
             record.run_id,
             f"{step_name}_energy",

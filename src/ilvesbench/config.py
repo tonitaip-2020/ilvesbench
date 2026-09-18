@@ -73,6 +73,17 @@ class EnergyConfig:
 
 
 @dataclass(slots=True)
+class NetioConfig:
+    """Optional NETIO PowerBOX JSON API settings."""
+
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    poll_interval_seconds: float = 1.0
+    timeout_seconds: float = 5.0
+
+
+@dataclass(slots=True)
 class StorageConfig:
     sqlite_path: str = "data/ilvesbench_runs.sqlite3"
     artifact_dir: str = "data/artifacts"
@@ -94,6 +105,7 @@ class IlvesBenchConfig:
     docker: DockerConfig = field(default_factory=DockerConfig)
     pgbench: PgBenchConfig = field(default_factory=PgBenchConfig)
     energy: EnergyConfig = field(default_factory=EnergyConfig)
+    netio: NetioConfig = field(default_factory=NetioConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     web: WebConfig = field(default_factory=WebConfig)
     config_path: str = ""
@@ -114,6 +126,7 @@ class IlvesBenchConfig:
             docker=DockerConfig(**data.get("docker", {})),
             pgbench=PgBenchConfig(**data.get("pgbench", {})),
             energy=EnergyConfig(**data.get("energy", {})),
+            netio=NetioConfig(**data.get("netio", {})),
             storage=StorageConfig(**data.get("storage", {})),
             web=WebConfig(**data.get("web", {})),
             config_path=str(config_path),

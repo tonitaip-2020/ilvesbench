@@ -1563,7 +1563,8 @@ function renderBenchmark(run) {
           <div class="metric-grid">
             ${metricCard("TPS", original.details?.throughput_tps ?? "pending")}
             ${metricCard("Latency", original.details?.average_latency_ms ? `${original.details.average_latency_ms} ms` : "pending")}
-            ${metricCard("Energy", original.details?.joules_per_transaction ? `${original.details.joules_per_transaction} J/tx` : "pending")}
+            ${metricCard("Average power", original.details?.average_watts !== undefined && original.details?.average_watts !== null ? `${original.details.average_watts} W` : (original.details?.energy_status === "no_hardware" ? "No hardware found" : "pending"))}
+            ${metricCard("Energy", original.details?.joules_per_transaction ? `${original.details.joules_per_transaction} J/tx` : (original.details?.energy_summary || "pending"))}
           </div>
           <div class="action-shelf">${originalActions(run).join("")}</div>
           ${renderStepCards(run, ["run_pgbench_original"])}
@@ -1573,7 +1574,8 @@ function renderBenchmark(run) {
           <div class="metric-grid">
             ${metricCard("TPS", target.details?.throughput_tps ?? "pending")}
             ${metricCard("Latency", target.details?.average_latency_ms ? `${target.details.average_latency_ms} ms` : "pending")}
-            ${metricCard("Energy", target.details?.joules_per_transaction ? `${target.details.joules_per_transaction} J/tx` : "pending")}
+            ${metricCard("Average power", target.details?.average_watts !== undefined && target.details?.average_watts !== null ? `${target.details.average_watts} W` : (target.details?.energy_status === "no_hardware" ? "No hardware found" : "pending"))}
+            ${metricCard("Energy", target.details?.joules_per_transaction ? `${target.details.joules_per_transaction} J/tx` : (target.details?.energy_summary || "pending"))}
           </div>
           <div class="action-shelf">${targetActions(run).filter((html) => html.includes("run-pgbench-new")).join("")}</div>
           ${renderStepCards(run, ["run_pgbench_new"])}
