@@ -1,77 +1,52 @@
 # IlvesBench
 
 <p align="center">
-  <img src="docs/assets/ilvesbench-logo.png" alt="IlvesBench logo" width="180">
+  <img src="docs/assets/ilvesbench-logo.png" alt="IlvesBench logo" width="210">
 </p>
 
-IlvesBench is a PostgreSQL benchmarking and schema-evolution prototype. It compares a selected source database with a target database, helps generate and review normalization SQL, data migration SQL, query rewrites, summary table recommendations, index recommendations, and `pgbench` workloads.
+IlvesBench is a human-guided PostgreSQL benchmarking and schema-evolution tool. It helps researchers and database practitioners evaluate how normalization, query rewrites, indexing, summary tables, and configuration choices affect a database workload.
 
-The prototype is intentionally human-in-the-loop: generated SQL is visible, editable, and approval-gated before PostgreSQL-side changes are executed.
+It profiles an existing source database, derives or ingests a representative workload, helps construct and validate a target database, and compares the two with `pgbench`. The web interface keeps generated SQL visible, editable, and approval-gated before database changes are applied. Results include throughput, latency, storage metrics, and—when optional NETIO hardware is configured—measured power and energy data, including post-run TPS and power-over-time charts.
 
-## Current Shape
+This matters because schema and physical-design changes are often evaluated using incomplete workloads or isolated metrics. IlvesBench provides a repeatable workflow that connects database structure, real query behavior, and performance and energy measurements.
 
-- Database-pair workspaces are the main unit of state: selected source DB, target DB, schemas, saved SQL artifacts, workloads, and recommendations.
-- Runs are still kept as execution and diagnostics history.
-- Live database facts in the GUI come from PostgreSQL metadata where possible, not from old run state.
-- LLM calls are planner/interpreter actions only. The LLM does not access PostgreSQL or the OS directly.
+## Scope and limitations
 
-## Architecture
+- PostgreSQL only.
+- IlvesBench assumes that a source database already exists, or is otherwise available in a form that can be loaded into PostgreSQL.
+- It is a decision-support and benchmarking tool, not an autonomous database administrator: schema changes, data migration, index changes, and other consequential actions require user review and approval.
+- Benchmark results depend on the workload, hardware, PostgreSQL configuration, and benchmark settings. They should be interpreted as comparative evidence for the tested environment.
 
-- `agent/`: orchestration and workflow coordination
-- `dbops/` and `db/`: PostgreSQL inspection, validation, schema creation, data migration, and database-side actions
-- `osops/`: hardware inspection, workload/log input, file access, and subprocess support
-- `benchmarker/` and `benchmark/`: query rewriting, workload generation, pgbench, tuning, summary table and index advisors
-- `llm/` and `orchestrator/`: LLM gateway and LLM-backed planning tasks
-- `store/`: run history, diagnostics, and database-pair workspace artifacts
-- `api/` and `static/`: HTTP API and browser GUI
+## Install and run
 
-## Setup
+Prerequisites: Python 3.11+, PostgreSQL client tools including `pgbench`, and optionally Docker for the bundled PostgreSQL stack.
 
 ```bash
+git clone https://github.com/tonitaip-2020/ilvesbench.git
+cd ilvesbench
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .
-pip install "psycopg[binary]>=3.2,<4"
+pip install -e ".[postgres]"
 ```
 
-Start the bundled PostgreSQL stack if needed:
+Create a local configuration file from the example and add your PostgreSQL connection details and LLM credentials:
+
+```bash
+cp ilvesbench.example.toml ilvesbench.toml
+python3 run_ilvesbench.py serve --config ilvesbench.toml
+```
+
+Open the address configured under `[web]` (the example uses `http://127.0.0.1:8081`). If you need the bundled database stack, start it first with:
 
 ```bash
 docker compose up -d
 ```
 
-Launch the web UI:
+Use the browser interface to select the source and target databases, inspect the source, prepare or import a workload, review generated SQL, and run the source and target benchmarks.
 
-```bash
-python3 run_ilvesbench.py serve --config ilvesbench.example.toml
-```
+### Optional NETIO energy measurement
 
-The sample config uses:
-
-```text
-http://127.0.0.1:8081
-```
-
-## Configuration
-
-Use `ilvesbench.example.toml` as the template. Keep local overrides in ignored files such as `ilvesbench.toml`, `*.local.toml`, `.env`, or `secrets/`.
-
-LLM API keys are resolved in this order:
-
-- `ILVESBENCH_LLM_API_KEY`
-- `[llm].api_key_file`
-- `[llm].api_key`
-
-For local secret-file use:
-
-```bash
-mkdir -p secrets
-printf 'sk-your-key-here' > secrets/aviary_api_key
-```
-
-## NETIO energy measurement
-
-NETIO 4KF / PowerBOX measurement is optional. Add credentials only to a local configuration file, then run the benchmark normally:
+To record power measurements during `pgbench`, configure a NETIO 4KF or compatible PowerBOX in `ilvesbench.toml`:
 
 ```toml
 [netio]
@@ -82,38 +57,7 @@ poll_interval_seconds = 1.0
 timeout_seconds = 5.0
 ```
 
-IlvesBench polls the NETIO JSON API throughout each `pgbench` run and stores average, minimum, and maximum watts; per-socket average watts; and the NETIO energy-counter delta. The Benchmark page shows average power alongside TPS and latency. If `url` is empty, it reports: “No energy measurement hardware was found.”
-
-## Workloads
-
-IlvesBench can use a workload SQL file from the GUI or the configured `[workload].path`. PostgreSQL log extraction exists as an OSOps pathway, but workload-file based input is the main development path right now.
-
-A workload is a set of SQL statements plus proportions. The prototype preserves constants in workload files unless the user explicitly supplies pgbench-style placeholders.
-
-## pgbench
-
-`pgbench` settings are editable in the GUI. IlvesBench can also recommend starting values from detected hardware.
-
-```toml
-[pgbench]
-enabled = true
-command = "pgbench"
-duration_seconds = 30
-clients = 4
-jobs = 1
-```
-
-`pgbench` must be installed on the host running IlvesBench. IlvesBench requests periodic `pgbench` progress reports (one second by default) and stores interval TPS and latency samples. After a benchmark finishes, the Benchmark page renders TPS-over-time charts and, when NETIO is configured, sampled power-over-time charts from the persisted run artifacts.
-
-## Diagnostics
-
-Each execution run writes human-readable and JSONL diagnostics under `data/artifacts/<run_id>/logs/`. LLM prompts, raw responses, PostgreSQL errors, and pgbench errors are saved as artifacts and shown in the GUI Diagnostics tab.
-
-## Tests
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests
-```
+NETIO is optional. Without it, IlvesBench continues to benchmark normally and reports that no energy-measurement hardware is configured.
 
 ## Disclaimer
 
