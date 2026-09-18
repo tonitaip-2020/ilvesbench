@@ -61,4 +61,4 @@ NETIO is optional. Without it, IlvesBench continues to benchmark normally and re
 
 ## Disclaimer
 
-This software is provided "as is", without warranty of any kind, express or implied. By using, modifying, or distributing this software, you acknowledge and agree that you do so entirely at your own risk. The authors, contributors, and maintainers shall not be liable for any claim, damages, loss, or other liability arising from or related to the use of this software.
+This software is provided "as is", without warranty of any kind, express or implied. By using, modifying, or distributing this software, you acknowledge and agree that you do so entirely at your own risk. The authors, contributors, and maintainers shall not be liable for any claim, damages, loss, or other liability arising from or related to the use of this software. Do not run IlvesBench in a production environment.
