@@ -14,6 +14,7 @@ class LLMTaskService:
         self.schema_transformer = SchemaTransformer(
             llm=llm,
             target_database=config.postgres.new_database,
+            chunking=config.schema_chunking,
         )
         self.migration_planner = MigrationPlanner(llm=llm)
 

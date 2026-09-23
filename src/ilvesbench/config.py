@@ -20,6 +20,15 @@ class LLMConfig:
 
 
 @dataclass(slots=True)
+class SchemaChunkingConfig:
+    enabled: bool = True
+    context_window_tokens: int = 32768
+    reserved_output_tokens: int = 8000
+    safety_margin_tokens: int = 2048
+    estimated_characters_per_token: float = 3.0
+
+
+@dataclass(slots=True)
 class PostgresConfig:
     host: str = "127.0.0.1"
     port: int = 5432
@@ -99,6 +108,7 @@ class WebConfig:
 @dataclass(slots=True)
 class IlvesBenchConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
+    schema_chunking: SchemaChunkingConfig = field(default_factory=SchemaChunkingConfig)
     postgres: PostgresConfig = field(default_factory=PostgresConfig)
     logs: LogConfig = field(default_factory=LogConfig)
     workload: WorkloadConfig = field(default_factory=WorkloadConfig)
@@ -120,6 +130,7 @@ class IlvesBenchConfig:
         llm_config.api_key = _resolve_llm_api_key(llm_config, config_path.parent)
         config = cls(
             llm=llm_config,
+            schema_chunking=SchemaChunkingConfig(**data.get("schema_chunking", {})),
             postgres=PostgresConfig(**data.get("postgres", {})),
             logs=LogConfig(**data.get("logs", {})),
             workload=WorkloadConfig(**data.get("workload", {})),

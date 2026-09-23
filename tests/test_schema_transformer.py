@@ -10,6 +10,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from ilvesbench.benchmark.schema_transformer import SchemaTransformer
+from ilvesbench.config import SchemaChunkingConfig
 from ilvesbench.dbops.normalization import NormalizationWorkflow
 from ilvesbench.models import ColumnMetadata, LLMResult, SchemaSnapshot, TableMetadata, UniqueConstraintMetadata
 
@@ -27,7 +28,113 @@ class StaticGateway:
         )
 
 
+class RecordingGateway(StaticGateway):
+    def __init__(self, payload: dict) -> None:
+        super().__init__(payload)
+        self.calls: list[list[dict[str, str]]] = []
+
+    def generate(self, messages, model=None, max_tokens=256) -> LLMResult:
+        self.calls.append(messages)
+        return super().generate(messages, model=model, max_tokens=max_tokens)
+
+
 class SchemaTransformerTests(unittest.TestCase):
+    def _chunking_policy(self) -> SchemaChunkingConfig:
+        return SchemaChunkingConfig(
+            context_window_tokens=5000,
+            reserved_output_tokens=500,
+            safety_margin_tokens=500,
+            estimated_characters_per_token=4.0,
+        )
+
+    def _wide_test_schema(self, table_count: int, column_count: int) -> SchemaSnapshot:
+        return SchemaSnapshot(
+            database="demo",
+            collected_at="2026-09-23T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name=f"table_{table_index}",
+                    columns=[
+                        ColumnMetadata(
+                            name=f"attribute_{table_index}_{column_index}_long_name",
+                            data_type="text",
+                            is_nullable=True,
+                        )
+                        for column_index in range(column_count)
+                    ],
+                )
+                for table_index in range(table_count)
+            ],
+        )
+
+    def test_schema_chunking_keeps_each_table_atomic(self) -> None:
+        schema = self._wide_test_schema(table_count=3, column_count=40)
+        transformer = SchemaTransformer(chunking=self._chunking_policy())
+
+        chunks, blocked, _catalog = transformer._normalization_chunks(schema, [])
+
+        self.assertEqual(blocked, [])
+        self.assertGreater(len(chunks), 1)
+        chunked_names = [table.name for chunk in chunks for table in chunk.tables]
+        self.assertCountEqual(chunked_names, [table.name for table in schema.tables])
+        self.assertEqual(len(chunked_names), len(set(chunked_names)))
+
+    def test_schema_chunking_stops_at_oversized_single_table_boundary(self) -> None:
+        schema = self._wide_test_schema(table_count=1, column_count=400)
+        gateway = RecordingGateway(
+            {
+                "assessment": {"status": "appears_3nf", "summary": "No change.", "reasoning": []},
+                "table_findings": [],
+                "functional_dependencies": [],
+                "target_tables": [],
+            }
+        )
+        transformer = SchemaTransformer(llm=gateway, chunking=self._chunking_policy())
+
+        proposal = transformer.analyze(schema)
+
+        self.assertEqual(proposal.status, "requires_human_schema_partitioning")
+        self.assertEqual(proposal.source, "schema_chunking_boundary")
+        self.assertEqual(proposal.target_tables, [])
+        self.assertEqual(gateway.calls, [])
+        self.assertEqual(
+            proposal.request_payload["chunking"]["blocked_atomic_tables"],
+            ["public.table_0"],
+        )
+
+    def test_chunk_prompt_keeps_global_unverified_relationship_context(self) -> None:
+        schema = SchemaSnapshot(
+            database="demo",
+            collected_at="2026-09-23T00:00:00+00:00",
+            tables=[
+                TableMetadata(
+                    schema="public",
+                    name="orders",
+                    columns=[ColumnMetadata(name="customer_id", data_type="integer", is_nullable=False)],
+                ),
+                TableMetadata(
+                    schema="public",
+                    name="customers",
+                    columns=[ColumnMetadata(name="customer_id", data_type="integer", is_nullable=False)],
+                ),
+            ],
+        )
+        transformer = SchemaTransformer(chunking=self._chunking_policy())
+        catalog = transformer._schema_relationship_catalog(schema)
+        messages = transformer._build_messages(
+            transformer._subset_schema(schema, [schema.tables[0]]),
+            [],
+            global_catalog=catalog,
+            chunk_scope=["public.orders"],
+        )
+        prompt = "\n".join(message["content"] for message in messages)
+
+        self.assertIn("public.orders.customer_id", prompt)
+        self.assertIn("public.customers.customer_id", prompt)
+        self.assertIn("unverified", prompt)
+        self.assertIn("Analyze only the fully described tables", prompt)
+
     def test_detects_repeating_groups_as_normalization_candidate(self) -> None:
         schema = SchemaSnapshot(
             database="demo",

@@ -89,6 +89,28 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.llm.model, "phi4-14b")
 
+    def test_schema_chunking_policy_can_be_selected_in_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.toml"
+            config_path.write_text(
+                """
+                [schema_chunking]
+                enabled = true
+                context_window_tokens = 65536
+                reserved_output_tokens = 4096
+                safety_margin_tokens = 1024
+                estimated_characters_per_token = 3.5
+                """,
+                encoding="utf-8",
+            )
+
+            config = IlvesBenchConfig.from_toml(config_path)
+
+            self.assertEqual(config.schema_chunking.context_window_tokens, 65536)
+            self.assertEqual(config.schema_chunking.reserved_output_tokens, 4096)
+            self.assertEqual(config.schema_chunking.safety_margin_tokens, 1024)
+            self.assertEqual(config.schema_chunking.estimated_characters_per_token, 3.5)
+
 
 if __name__ == "__main__":
     unittest.main()

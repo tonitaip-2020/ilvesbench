@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import defaultdict, deque
+import math
 import json
 import re
 
+from ilvesbench.config import SchemaChunkingConfig
 from ilvesbench.llm.gateway import LLMGateway
-from ilvesbench.models import SchemaSnapshot
+from ilvesbench.models import SchemaSnapshot, TableMetadata
 
 
 @dataclass(slots=True)
@@ -26,9 +29,15 @@ class NormalizationProposal:
 class SchemaTransformer:
     """LLM-assisted normalization proposal with deterministic validation and SQL generation."""
 
-    def __init__(self, llm: LLMGateway | None = None, target_database: str | None = None) -> None:
+    def __init__(
+        self,
+        llm: LLMGateway | None = None,
+        target_database: str | None = None,
+        chunking: SchemaChunkingConfig | None = None,
+    ) -> None:
         self._llm = llm
         self._target_database = target_database
+        self._chunking = chunking or SchemaChunkingConfig()
 
     def analyze(
         self,
@@ -45,9 +54,12 @@ class SchemaTransformer:
         if self._llm is not None:
             try:
                 request_payload = self._request_payload(schema, first_normal_form_findings)
+                full_messages = self._build_messages(schema, first_normal_form_findings)
+                if self._chunking.enabled and not self._messages_fit(full_messages):
+                    return self._analyze_in_chunks(schema, first_normal_form_findings)
                 llm_result = self._llm.generate(
-                    self._build_messages(schema, first_normal_form_findings),
-                    max_tokens=1800,
+                    full_messages,
+                    max_tokens=self._chunking.reserved_output_tokens,
                 )
                 proposal = self._proposal_from_llm_response(schema, llm_result.response_text)
                 proposal.raw_response_text = llm_result.response_text
@@ -133,9 +145,12 @@ class SchemaTransformer:
 
         request_payload = self._fd_request_payload(schema, target_tables)
         try:
+            full_messages = self._build_fd_discovery_messages(schema, target_tables)
+            if self._chunking.enabled and not self._messages_fit(full_messages):
+                return self._discover_functional_dependencies_in_chunks(schema, target_tables)
             llm_result = self._llm.generate(
-                self._build_fd_discovery_messages(schema, target_tables),
-                max_tokens=2400,
+                full_messages,
+                max_tokens=self._chunking.reserved_output_tokens,
             )
             payload = self._extract_json_object(llm_result.response_text)
             functional_dependencies = self._normalize_functional_dependencies(payload.get("functional_dependencies", []))
@@ -233,6 +248,537 @@ class SchemaTransformer:
             "one_nf_target_tables": target_tables,
             "target_database": self._target_database,
         }
+
+    def _prompt_budget_tokens(self) -> int:
+        return max(
+            1,
+            self._chunking.context_window_tokens
+            - self._chunking.reserved_output_tokens
+            - self._chunking.safety_margin_tokens,
+        )
+
+    def _estimate_message_tokens(self, messages: list[dict[str, str]]) -> int:
+        characters = sum(len(message.get("role", "")) + len(message.get("content", "")) for message in messages)
+        characters_per_token = max(1.0, float(self._chunking.estimated_characters_per_token))
+        return math.ceil(characters / characters_per_token)
+
+    def _messages_fit(self, messages: list[dict[str, str]]) -> bool:
+        return self._estimate_message_tokens(messages) <= self._prompt_budget_tokens()
+
+    def _subset_schema(self, schema: SchemaSnapshot, tables: list[TableMetadata]) -> SchemaSnapshot:
+        return SchemaSnapshot(
+            database=schema.database,
+            collected_at=schema.collected_at,
+            tables=tables,
+            database_size_bytes=schema.database_size_bytes,
+        )
+
+    def _schema_relationship_catalog(self, schema: SchemaSnapshot) -> dict:
+        possible_associations = self._possible_implicit_associations(schema)
+        return {
+            "database": schema.database,
+            "tables": [
+                {
+                    "table": f"{table.schema}.{table.name}",
+                    "column_count": len(table.columns),
+                    "unique_constraints": [constraint.columns for constraint in table.unique_constraints],
+                    "foreign_keys": [
+                        {
+                            "columns": foreign_key.columns,
+                            "referenced_table": foreign_key.referenced_table,
+                            "referenced_columns": foreign_key.referenced_columns,
+                        }
+                        for foreign_key in table.foreign_keys
+                    ],
+                }
+                for table in schema.tables
+            ],
+            "possible_associations": possible_associations,
+            "association_warning": (
+                "Possible associations are name/type matches only. They are not declared constraints or proof of a relationship."
+            ),
+        }
+
+    def _possible_implicit_associations(self, schema: SchemaSnapshot) -> list[dict]:
+        occurrences: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for table in schema.tables:
+            table_name = f"{table.schema}.{table.name}"
+            for column in table.columns:
+                key = (column.name.casefold(), self._canonical_data_type(column.data_type))
+                occurrences[key].append(table_name)
+
+        associations: list[dict] = []
+        for (column_name, data_type), table_names in sorted(occurrences.items()):
+            distinct_tables = sorted(set(table_names))
+            if len(distinct_tables) < 2 or len(distinct_tables) > 8:
+                continue
+            if column_name in {"id", "name", "date", "type", "status", "value", "description"}:
+                continue
+            for index, left in enumerate(distinct_tables):
+                for right in distinct_tables[index + 1 :]:
+                    associations.append(
+                        {
+                            "left": f"{left}.{column_name}",
+                            "right": f"{right}.{column_name}",
+                            "data_type": data_type,
+                            "status": "unverified",
+                        }
+                    )
+                    if len(associations) >= 200:
+                        return associations
+        return associations
+
+    def _relationship_order(self, schema: SchemaSnapshot, catalog: dict) -> list[TableMetadata]:
+        tables_by_name = {f"{table.schema}.{table.name}": table for table in schema.tables}
+        adjacency: dict[str, set[str]] = {name: set() for name in tables_by_name}
+        for table_name, table in tables_by_name.items():
+            for foreign_key in table.foreign_keys:
+                referenced = foreign_key.referenced_table
+                if referenced in adjacency:
+                    adjacency[table_name].add(referenced)
+                    adjacency[referenced].add(table_name)
+        for association in catalog.get("possible_associations", []):
+            left = str(association.get("left", "")).rsplit(".", 1)[0]
+            right = str(association.get("right", "")).rsplit(".", 1)[0]
+            if left in adjacency and right in adjacency:
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+
+        ordered: list[TableMetadata] = []
+        visited: set[str] = set()
+        for start in sorted(tables_by_name):
+            if start in visited:
+                continue
+            queue = deque([start])
+            visited.add(start)
+            while queue:
+                current = queue.popleft()
+                ordered.append(tables_by_name[current])
+                for neighbor in sorted(adjacency[current]):
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+        return ordered
+
+    def _normalization_chunks(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+    ) -> tuple[list[SchemaSnapshot], list[str], dict]:
+        catalog = self._schema_relationship_catalog(schema)
+        chunks: list[SchemaSnapshot] = []
+        blocked: list[str] = []
+        current: list[TableMetadata] = []
+        for table in self._relationship_order(schema, catalog):
+            table_name = f"{table.schema}.{table.name}"
+            atomic_schema = self._subset_schema(schema, [table])
+            atomic_findings = [item for item in first_normal_form_findings if item.get("table") == table_name]
+            atomic_messages = self._build_messages(
+                atomic_schema,
+                atomic_findings,
+                global_catalog=catalog,
+                chunk_scope=[table_name],
+            )
+            if not self._messages_fit(atomic_messages):
+                if current:
+                    chunks.append(self._subset_schema(schema, current))
+                    current = []
+                blocked.append(table_name)
+                continue
+
+            candidate = current + [table]
+            candidate_schema = self._subset_schema(schema, candidate)
+            candidate_names = {f"{item.schema}.{item.name}" for item in candidate}
+            candidate_findings = [
+                item for item in first_normal_form_findings if item.get("table") in candidate_names
+            ]
+            candidate_messages = self._build_messages(
+                candidate_schema,
+                candidate_findings,
+                global_catalog=catalog,
+                chunk_scope=sorted(candidate_names),
+            )
+            if current and not self._messages_fit(candidate_messages):
+                chunks.append(self._subset_schema(schema, current))
+                current = [table]
+            else:
+                current = candidate
+        if current:
+            chunks.append(self._subset_schema(schema, current))
+        return chunks, blocked, catalog
+
+    def _analyze_in_chunks(
+        self,
+        schema: SchemaSnapshot,
+        first_normal_form_findings: list[dict],
+    ) -> NormalizationProposal:
+        chunks, blocked_tables, catalog = self._normalization_chunks(schema, first_normal_form_findings)
+        proposals: list[NormalizationProposal] = []
+        chunk_records: list[dict] = []
+        failures: list[str] = []
+        raw_responses: list[dict] = []
+
+        for index, chunk in enumerate(chunks, start=1):
+            table_names = [f"{table.schema}.{table.name}" for table in chunk.tables]
+            findings = [item for item in first_normal_form_findings if item.get("table") in set(table_names)]
+            messages = self._build_messages(
+                chunk,
+                findings,
+                global_catalog=catalog,
+                chunk_scope=table_names,
+            )
+            record = {
+                "chunk": index,
+                "tables": table_names,
+                "estimated_input_tokens": self._estimate_message_tokens(messages),
+            }
+            try:
+                result = self._llm.generate(messages, max_tokens=self._chunking.reserved_output_tokens)
+                proposal = self._proposal_from_llm_response(schema, result.response_text)
+                self._validate_normalization_chunk_scope(proposal, set(table_names))
+                proposals.append(proposal)
+                record["status"] = "completed"
+                raw_responses.append({"chunk": index, "tables": table_names, "response_text": result.response_text})
+            except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
+                failures.append(f"Chunk {index} ({', '.join(table_names)}): {exc}")
+            chunk_records.append(record)
+
+        functional_dependencies = self._deduplicate_functional_dependencies(
+            [fd for proposal in proposals for fd in proposal.functional_dependencies]
+        )
+        table_findings = list(dict.fromkeys(finding for proposal in proposals for finding in proposal.table_findings))
+        rationale = list(dict.fromkeys(reason for proposal in proposals for reason in proposal.rationale))
+        target_tables = self._merge_chunk_target_tables(proposals)
+        incomplete_tables = blocked_tables or failures
+        if blocked_tables:
+            table_findings.extend(
+                f"{table_name} is too large to analyze atomically within the configured prompt budget."
+                for table_name in blocked_tables
+            )
+        if incomplete_tables:
+            target_tables = []
+            sql_statements: list[str] = []
+            status = "requires_human_schema_partitioning" if blocked_tables else "insufficient_evidence"
+            summary = (
+                f"Chunked analysis completed for {len(chunks) - len(failures)} chunk(s), but automatic normalization "
+                f"stopped because {len(blocked_tables)} table(s) exceeded the atomic-table prompt boundary."
+                if blocked_tables
+                else f"Chunked analysis was incomplete because {len(failures)} chunk(s) failed."
+            )
+        else:
+            if target_tables:
+                target_tables = self._ensure_complete_target_schema(schema, target_tables)
+            sql_statements = self._generate_sql(target_tables, schema)
+            status = "candidate_normalization" if target_tables else self._combined_noop_status(proposals)
+            summary = (
+                f"Analyzed {len(schema.tables)} table(s) in {len(chunks)} relationship-aware schema chunk(s); "
+                f"produced {len(target_tables)} target table(s)."
+            )
+
+        return NormalizationProposal(
+            status=status,
+            summary=summary,
+            target_database=self._target_database,
+            rationale=[
+                "The full schema exceeded the configured prompt budget, so IlvesBench used table-atomic chunks.",
+                "Every chunk included a compact global relationship catalog; unverified name/type matches were context only.",
+                *rationale,
+                *failures,
+            ],
+            table_findings=table_findings,
+            functional_dependencies=functional_dependencies,
+            target_tables=target_tables,
+            sql_statements=sql_statements,
+            source="schema_chunking_boundary" if blocked_tables else "llm_chunked",
+            raw_response_text=json.dumps(raw_responses, ensure_ascii=True),
+            request_payload={
+                "source_schema": self._schema_summary(schema),
+                "first_normal_form_findings": first_normal_form_findings,
+                "target_database": self._target_database,
+                "chunking": self._chunking_manifest(chunk_records, blocked_tables),
+            },
+        )
+
+    def _discover_functional_dependencies_in_chunks(
+        self,
+        schema: SchemaSnapshot,
+        target_tables: list[dict],
+    ) -> NormalizationProposal:
+        source_catalog = self._schema_relationship_catalog(schema)
+        target_catalog = [
+            {
+                "table": table.get("name", ""),
+                "column_count": len(table.get("columns", [])),
+                "primary_key": table.get("primary_key", []),
+                "uniques": table.get("uniques", []),
+                "foreign_keys": table.get("foreign_keys", []),
+            }
+            for table in target_tables
+        ]
+        dependencies: list[dict] = []
+        findings: list[str] = []
+        rationale: list[str] = []
+        blocked_tables: list[str] = []
+        failures: list[str] = []
+        chunk_records: list[dict] = []
+        raw_responses: list[dict] = []
+
+        for index, table in enumerate(target_tables, start=1):
+            table_name = str(table.get("name", ""))
+            messages = self._build_fd_discovery_messages(
+                schema,
+                [table],
+                source_catalog=source_catalog,
+                target_catalog=target_catalog,
+                chunk_scope=[table_name],
+            )
+            record = {
+                "chunk": index,
+                "tables": [table_name],
+                "estimated_input_tokens": self._estimate_message_tokens(messages),
+            }
+            if not self._messages_fit(messages):
+                blocked_tables.append(table_name)
+                record["status"] = "requires_human_schema_partitioning"
+                chunk_records.append(record)
+                continue
+            try:
+                result = self._llm.generate(messages, max_tokens=self._chunking.reserved_output_tokens)
+                payload = self._extract_json_object(result.response_text)
+                chunk_dependencies = self._normalize_functional_dependencies(payload.get("functional_dependencies", []))
+                self._validate_fd_chunk_scope(table, chunk_dependencies)
+                dependencies.extend(chunk_dependencies)
+                findings.extend(self._to_string_list(payload.get("table_findings", [])))
+                rationale.extend(self._to_string_list(payload.get("reasoning", [])))
+                record["status"] = "completed"
+                raw_responses.append({"chunk": index, "tables": [table_name], "response_text": result.response_text})
+            except Exception as exc:
+                record["status"] = "failed"
+                record["error"] = str(exc)
+                failures.append(f"FD chunk for {table_name}: {exc}")
+            chunk_records.append(record)
+
+        dependencies = self._deduplicate_functional_dependencies(dependencies)
+        if blocked_tables:
+            status = "requires_human_schema_partitioning"
+            summary = (
+                f"FD discovery skipped {len(blocked_tables)} table(s) because each table must fit atomically in one prompt."
+            )
+        elif failures:
+            status = "insufficient_evidence"
+            summary = f"FD discovery was incomplete because {len(failures)} table-scoped request(s) failed."
+        else:
+            status = "candidate_normalization" if dependencies else "appears_3nf"
+            summary = f"Found {len(dependencies)} candidate functional dependenc(ies) in table-scoped chunks."
+        return NormalizationProposal(
+            status=status,
+            summary=summary,
+            target_database=self._target_database,
+            rationale=[
+                "The combined FD request exceeded the prompt budget, so each target table was analyzed atomically.",
+                *list(dict.fromkeys(rationale)),
+                *failures,
+            ],
+            table_findings=list(dict.fromkeys(findings)) + [
+                f"{table_name} requires human schema partitioning before LLM-based FD discovery."
+                for table_name in blocked_tables
+            ],
+            functional_dependencies=dependencies,
+            target_tables=target_tables,
+            source="fd_schema_chunking_boundary" if blocked_tables else "llm_fd_discovery_chunked",
+            raw_response_text=json.dumps(raw_responses, ensure_ascii=True),
+            request_payload={
+                "source_schema": self._schema_summary(schema),
+                "one_nf_target_tables": target_tables,
+                "target_database": self._target_database,
+                "chunking": self._chunking_manifest(chunk_records, blocked_tables),
+            },
+        )
+
+    def _chunking_manifest(self, chunks: list[dict], blocked_tables: list[str]) -> dict:
+        return {
+            "enabled": self._chunking.enabled,
+            "context_window_tokens": self._chunking.context_window_tokens,
+            "reserved_output_tokens": self._chunking.reserved_output_tokens,
+            "safety_margin_tokens": self._chunking.safety_margin_tokens,
+            "estimated_characters_per_token": self._chunking.estimated_characters_per_token,
+            "prompt_budget_tokens": self._prompt_budget_tokens(),
+            "chunks": chunks,
+            "blocked_atomic_tables": blocked_tables,
+        }
+
+    def _deduplicate_functional_dependencies(self, dependencies: list[dict]) -> list[dict]:
+        result: list[dict] = []
+        seen: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
+        for dependency in dependencies:
+            key = (
+                str(dependency.get("table", "")),
+                tuple(str(item) for item in dependency.get("determinant", [])),
+                tuple(str(item) for item in dependency.get("dependent", [])),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(dependency)
+        return result
+
+    def _validate_normalization_chunk_scope(
+        self,
+        proposal: NormalizationProposal,
+        allowed_source_tables: set[str],
+    ) -> None:
+        for dependency in proposal.functional_dependencies:
+            table_name = str(dependency.get("table", ""))
+            if table_name and table_name not in allowed_source_tables:
+                raise ValueError(
+                    f"Schema chunk returned a functional dependency for catalog-only table {table_name}."
+                )
+        for table in proposal.target_tables:
+            proposed_sources = {str(item) for item in table.get("source_tables", [])}
+            column_sources = {str(column.get("source_table", "")) for column in table.get("columns", [])}
+            outside_scope = (proposed_sources | column_sources) - allowed_source_tables
+            if outside_scope:
+                raise ValueError(
+                    f"Schema chunk target table {table.get('name', '')} uses catalog-only source table(s): "
+                    f"{', '.join(sorted(outside_scope))}."
+                )
+
+    def _validate_fd_chunk_scope(self, table: dict, dependencies: list[dict]) -> None:
+        table_name = str(table.get("name", ""))
+        valid_columns = {
+            str(column.get("name", ""))
+            for column in table.get("columns", [])
+            if str(column.get("name", ""))
+        }
+        for dependency in dependencies:
+            if str(dependency.get("table", "")) != table_name:
+                raise ValueError(
+                    f"FD chunk for {table_name} returned a dependency for another table: "
+                    f"{dependency.get('table', '')}."
+                )
+            referenced_columns = {
+                str(column)
+                for column in dependency.get("determinant", []) + dependency.get("dependent", [])
+            }
+            unknown_columns = referenced_columns - valid_columns
+            if unknown_columns:
+                raise ValueError(
+                    f"FD chunk for {table_name} returned unknown column(s): {', '.join(sorted(unknown_columns))}."
+                )
+
+    def _merge_chunk_target_tables(self, proposals: list[NormalizationProposal]) -> list[dict]:
+        merged: dict[str, dict] = {}
+        for proposal in proposals:
+            for table in proposal.target_tables:
+                name = str(table.get("name", ""))
+                if name in merged and merged[name] != table:
+                    raise ValueError(f"Schema chunks proposed conflicting definitions for target table {name}.")
+                merged[name] = table
+        return list(merged.values())
+
+    def _combined_noop_status(self, proposals: list[NormalizationProposal]) -> str:
+        statuses = {proposal.status for proposal in proposals}
+        if statuses and statuses.issubset({"appears_3nf"}):
+            return "appears_3nf"
+        return "insufficient_evidence"
+
+    def _ensure_complete_target_schema(self, schema: SchemaSnapshot, target_tables: list[dict]) -> list[dict]:
+        covered_sources = {
+            str(source_table)
+            for table in target_tables
+            for source_table in table.get("source_tables", [])
+        }
+        missing = [
+            table
+            for table in schema.tables
+            if f"{table.schema}.{table.name}" not in covered_sources
+        ]
+        if not missing:
+            return target_tables
+        name_map = self._target_table_name_map(schema.tables)
+        used_names = {str(table.get("name", "")) for table in target_tables}
+        result = [self._copy_target_table(table) for table in target_tables]
+        copied_by_source: dict[str, dict] = {}
+        for table in missing:
+            source_name = f"{table.schema}.{table.name}"
+            desired_name = name_map[source_name]
+            target_name = desired_name if desired_name not in used_names else self._unique_target_name(desired_name, used_names)
+            used_names.add(target_name)
+            primary_key = self._first_unique_constraint(
+                table,
+                {self._sanitize_identifier(column.name) for column in table.columns},
+            )
+            copied = {
+                "name": target_name,
+                "purpose": f"Unchanged table copied from {source_name} after chunked analysis.",
+                "source_tables": [source_name],
+                "columns": [
+                    {
+                        "source_table": source_name,
+                        "source_column": column.name,
+                        "name": self._sanitize_identifier(column.name),
+                    }
+                    for column in table.columns
+                ],
+                "primary_key": primary_key,
+                "uniques": [
+                    self._sanitize_identifier_list(constraint.columns)
+                    for constraint in table.unique_constraints
+                    if self._sanitize_identifier_list(constraint.columns) != primary_key
+                ],
+                "foreign_keys": [],
+                "migration_strategy": "copy_distinct",
+            }
+            result.append(copied)
+            copied_by_source[source_name] = copied
+
+        source_tables = {f"{table.schema}.{table.name}": table for table in schema.tables}
+        for source_name, copied in copied_by_source.items():
+            source_table = source_tables[source_name]
+            local_names = {
+                str(column.get("source_column", "")): str(column.get("name", ""))
+                for column in copied["columns"]
+            }
+            for foreign_key in source_table.foreign_keys:
+                referenced = self._target_for_source_key(
+                    result,
+                    foreign_key.referenced_table,
+                    foreign_key.referenced_columns,
+                )
+                if referenced is None:
+                    raise ValueError(
+                        f"Chunked target schema cannot preserve foreign key {foreign_key.name} from {source_name}."
+                    )
+                referenced_table, referenced_columns = referenced
+                copied["foreign_keys"].append(
+                    {
+                        "columns": [local_names[column] for column in foreign_key.columns],
+                        "references_table": referenced_table,
+                        "references_columns": referenced_columns,
+                    }
+                )
+        return result
+
+    def _target_for_source_key(
+        self,
+        target_tables: list[dict],
+        source_table: str,
+        source_columns: list[str],
+    ) -> tuple[str, list[str]] | None:
+        for target in target_tables:
+            mapped_columns = {
+                str(column.get("source_column", "")): str(column.get("name", ""))
+                for column in target.get("columns", [])
+                if str(column.get("source_table", "")) == source_table
+            }
+            if not all(column in mapped_columns for column in source_columns):
+                continue
+            target_columns = [mapped_columns[column] for column in source_columns]
+            if target_columns == target.get("primary_key") or target_columns in target.get("uniques", []):
+                return str(target.get("name", "")), target_columns
+        return None
 
     def _schema_summary(self, schema: SchemaSnapshot) -> list[dict]:
         return [
@@ -362,6 +908,9 @@ class SchemaTransformer:
         self,
         schema: SchemaSnapshot,
         first_normal_form_findings: list[dict],
+        *,
+        global_catalog: dict | None = None,
+        chunk_scope: list[str] | None = None,
     ) -> list[dict[str, str]]:
         schema_payload = {
             "database": schema.database,
@@ -399,6 +948,20 @@ class SchemaTransformer:
             "target_tables arrays. Return one complete RFC 8259 JSON object only: no markdown fences, comments, "
             "trailing commas, placeholders, or text outside the JSON object."
         )
+        chunk_rules = (
+            "15. This is a bounded schema chunk. Analyze only the fully described tables in chunk_scope. "
+            "The global catalog is relationship context only; do not propose target columns from catalog-only tables. "
+            "Possible associations are unverified name/type matches, not keys, foreign keys, or functional-dependency evidence. "
+            "If recommending a decomposition, return a complete target representation of every table in chunk_scope.\n\n"
+            if global_catalog is not None
+            else ""
+        )
+        catalog_context = (
+            f"Global relationship catalog:\n{json.dumps(global_catalog, ensure_ascii=True, indent=2)}\n\n"
+            f"Chunk scope:\n{json.dumps(chunk_scope or [], ensure_ascii=True, indent=2)}\n\n"
+            if global_catalog is not None
+            else ""
+        )
         user_prompt = (
             "Analyze the PostgreSQL schema package below. "
             "If the schema appears already in 1NF/3NF or there is not enough evidence, say so. "
@@ -425,7 +988,8 @@ class SchemaTransformer:
             "14. Treat deterministic 1NF findings as evidence that a column may contain repeated values inside a single cell. "
             "For delimited multi-value columns, prefer a child relation with the parent key plus one extracted value per row. "
             "When a candidate reference is supplied, use it as a likely foreign-key target if type-compatible.\n\n"
-            "Return JSON with this shape:\n"
+            + chunk_rules
+            + "Return JSON with this shape:\n"
             "{\n"
             '  "assessment": {\n'
             '    "status": "appears_3nf|candidate_normalization|insufficient_evidence",\n'
@@ -467,18 +1031,40 @@ class SchemaTransformer:
             "  ],\n"
             '  "decomposition_summary": "e.g. normalized from 2 tables to 4 tables"\n'
             "}\n\n"
-            f"Schema package:\n{json.dumps(schema_payload, ensure_ascii=True, indent=2)}\n\n"
-            f"Deterministic 1NF findings from sampled data:\n{json.dumps(first_normal_form_findings, ensure_ascii=True, indent=2)}"
+            + catalog_context
+            + f"Schema package:\n{json.dumps(schema_payload, ensure_ascii=True, indent=2)}\n\n"
+            + f"Deterministic 1NF findings from sampled data:\n{json.dumps(first_normal_form_findings, ensure_ascii=True, indent=2)}"
         )
         return [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
 
-    def _build_fd_discovery_messages(self, schema: SchemaSnapshot, target_tables: list[dict]) -> list[dict[str, str]]:
+    def _build_fd_discovery_messages(
+        self,
+        schema: SchemaSnapshot,
+        target_tables: list[dict],
+        *,
+        source_catalog: dict | None = None,
+        target_catalog: list[dict] | None = None,
+        chunk_scope: list[str] | None = None,
+    ) -> list[dict[str, str]]:
         system_prompt = (
             "You discover candidate functional dependencies for database normalization. "
             "Use semantic reasoning conservatively. Return JSON only and do not include markdown fences."
+        )
+        chunk_rules = (
+            "6. This is a table-atomic FD-discovery chunk. Propose dependencies only for the table in chunk_scope. "
+            "Catalog-only tables and unverified associations provide context, not dependency or uniqueness evidence.\n\n"
+            if source_catalog is not None
+            else ""
+        )
+        catalog_context = (
+            f"Global source relationship catalog:\n{json.dumps(source_catalog, ensure_ascii=True, indent=2)}\n\n"
+            f"Global 1NF target catalog:\n{json.dumps(target_catalog or [], ensure_ascii=True, indent=2)}\n\n"
+            f"Chunk scope:\n{json.dumps(chunk_scope or [], ensure_ascii=True, indent=2)}\n\n"
+            if source_catalog is not None
+            else f"Original source schema:\n{json.dumps(self._schema_summary(schema), ensure_ascii=True, indent=2)}\n\n"
         )
         user_prompt = (
             "Given the original PostgreSQL schema and the current 1NF target tables, propose candidate functional "
@@ -492,7 +1078,8 @@ class SchemaTransformer:
             "or natural key -> non-key attributes.\n"
             "4. Mark confidence high, medium, or low and explain briefly.\n"
             "5. These are candidates for human approval, not proofs.\n\n"
-            "Return JSON with this shape:\n"
+            + chunk_rules
+            + "Return JSON with this shape:\n"
             "{\n"
             '  "status": "candidate_normalization|appears_3nf|insufficient_evidence",\n'
             '  "summary": "short summary",\n'
@@ -508,8 +1095,8 @@ class SchemaTransformer:
             "    }\n"
             "  ]\n"
             "}\n\n"
-            f"Original source schema:\n{json.dumps(self._schema_summary(schema), ensure_ascii=True, indent=2)}\n\n"
-            f"Current 1NF target tables:\n{json.dumps(target_tables, ensure_ascii=True, indent=2)}"
+            + catalog_context
+            + f"Current 1NF target tables:\n{json.dumps(target_tables, ensure_ascii=True, indent=2)}"
         )
         return [
             {"role": "system", "content": system_prompt},

@@ -6,6 +6,16 @@ api_key = ""
 api_key_file = "secrets/openai_api_key"
 timeout_seconds = 180
 
+[schema_chunking]
+# The full prompt is used when it fits. Larger schemas are grouped into
+# relationship-aware chunks, but a single table is never split across prompts.
+enabled = true
+context_window_tokens = 32768
+reserved_output_tokens = 8000
+safety_margin_tokens = 2048
+# Conservative estimator used for OpenAI-compatible models without a local tokenizer.
+estimated_characters_per_token = 3.0
+
 [postgres]
 host = "127.0.0.1"
 port = 5432

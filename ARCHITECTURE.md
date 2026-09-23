@@ -73,6 +73,17 @@ dependencies, DBOps checks candidates against current source data when the
 columns map to one source table, and the user approves or rejects each FD. The
 final 3NF target schema is synthesized deterministically from approved FDs.
 
+Normalization prompts are token-budgeted. IlvesBench sends the complete schema
+when it fits the configured context budget. Otherwise, it groups whole tables
+into relationship-aware chunks and includes a compact global catalog of declared
+relationships and unverified same-name/type associations in every chunk. Tables
+are atomic: IlvesBench never divides one table's columns across LLM requests. If
+one table plus the required prompt and relationship context does not fit, the
+workflow reports `requires_human_schema_partitioning` and produces no automatic
+target DDL from the incomplete analysis. Functional-dependency discovery uses
+the same boundary and falls back to one complete post-1NF target table per
+request when a combined request is too large.
+
 Index recommendation is also staged. The Benchmarker builds an LLM prompt from
 the workload queries, target database structure, and current PostgreSQL indexes.
 Large workloads and index sets are split into batches, with prior
