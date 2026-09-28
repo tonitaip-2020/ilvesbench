@@ -7,7 +7,7 @@
 - Target name stored in the original run artifacts: `dvdrental_ilvesbench_llama32_3b` (renamed after evaluation)
 - Model: `ministral-3:8b`, served locally through Ollama
 - IlvesBench run ID: `run-33f2d9df9cab`
-- Workload: 10 queries from `evaluation/dvdrental/workload.sql`
+- Query set: 10 queries from `evaluation/dvdrental/queries.sql`
 - Prompt condition: corrected normalization, migration, and rewrite prompts
 - Optional summary tables: all eight candidates rejected so that rewrites were evaluated against the normalized base tables
 

@@ -4,7 +4,7 @@ This directory records the IlvesBench mixed-workload evaluation performed on a r
 
 ## Evaluation scope
 
-The workload in workload.sql contains ten statements: six SELECT queries, one INSERT, two UPDATE statements, and one DELETE. The evaluated models were Ministral 3 8B Instruct and Gemma 4 26B.
+The query set in queries.sql contains ten statements: six SELECT queries, one INSERT, two UPDATE statements, and one DELETE. The evaluated models were Ministral 3 8B Instruct and Gemma 4 26B.
 
 For each model, IlvesBench attempted schema normalization, data migration, and workload rewriting. Read-query validation compared column metadata, row counts, values, and ordered results between the source and target. Each data-changing statement was executed independently inside a transaction; affected-row counts and the complete post-operation trip-table state were compared before both transactions were rolled back.
 
@@ -28,7 +28,7 @@ Ministral's original ten-statement rewrite request timed out. The controlled ret
 
 ## Reproduction notes
 
-Create a source database named nyc_yellow_march_2026_5000 with the tables public.yellow_taxi_trips and public.taxi_zones. Populate it with the documented 5,000-row sample and 265 taxi zones, then create one empty target database per model. Run IlvesBench with workload.sql and the model configuration under test. Do not commit provider API keys; store them outside Git and reference them through the local configuration.
+Create a source database named nyc_yellow_march_2026_5000 with the tables public.yellow_taxi_trips and public.taxi_zones. Populate it with the documented 5,000-row sample and 265 taxi zones, then create one empty target database per model. Run IlvesBench with queries.sql and the model configuration under test. Do not commit provider API keys; store them outside Git and reference them through the local configuration.
 
 The final validation must leave the source and both targets at 5,000 trip rows because every DML transaction is rolled back. The observed equivalence applies to this database state and workload; it is empirical evidence rather than a proof for every possible database state.
 

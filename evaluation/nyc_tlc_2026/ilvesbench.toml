@@ -22,7 +22,7 @@ path = "../../data/postgresql.log"
 max_lines = 5000
 
 [workload]
-path = "workload.sql"
+path = "queries.sql"
 
 [postgresql_conf]
 path = "../../postgres-config/postgresql.conf"

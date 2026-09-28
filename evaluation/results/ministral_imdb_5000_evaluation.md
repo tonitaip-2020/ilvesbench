@@ -103,7 +103,7 @@ The 100% rewrite score does not establish formal equivalence for all possible da
 ## Reproducibility artifacts
 
 - Configuration: `imdb_5000_ministral_corrected.toml`
-- Workload: `imdb_5000_workload.sql`
+- Query set: `evaluation/imdb_5000/queries.sql`
 - Run state: `imdb_5000_ministral_corrected_eval/run.sqlite3`
 - Raw model requests and responses: `imdb_5000_ministral_corrected_eval/artifacts/run-c42b23f1bcd9/logs/llm/`
 - Migration-count validator: `validate_imdb_migration_counts.py`

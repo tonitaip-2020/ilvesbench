@@ -73,7 +73,7 @@ This must be reported as a separate experimental condition rather than replacing
 ## Reproducibility artifacts
 
 - Corrected configuration: `yellow_5000_ministral_corrected.toml`
-- Shared workload: `yellow_5000_workload.sql`
+- Shared query set: `evaluation/nyc_yellow_5000/queries.sql`
 - Run database: `yellow_5000_ministral_corrected_eval/run.sqlite3`
 - Run artifacts: `yellow_5000_ministral_corrected_eval/artifacts/run-06b0ebfc8744/`
 - Rewrite result: `yellow_5000_ministral_corrected_eval/artifacts/run-06b0ebfc8744/yellow_5000_rewrite_result.json`
